@@ -1,0 +1,341 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    background-color: var(--vmax-base);
+    color: var(--color-zinc-300);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: var(--vmax-base);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--vmax-line);
+    border-radius: 9999px;
+  }
+}
+
+.vmax-shell {
+  --vmax-accent: #a7f3d0;
+  --vmax-line: #272a29;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: radial-gradient(ellipse at 50% 0%, #15221d 0%, #0a0c0b 55%, #09090b 100%);
+}
+
+/*
+ * Android MediaCodec renders into a SurfaceView composited below the WebView.
+ * While streaming, every layer between the page and that surface must be
+ * transparent; the activity paints the window black and letterboxes the video.
+ */
+html.vmax-native-video,
+html.vmax-native-video body,
+html.vmax-native-video #root {
+  background: transparent;
+}
+
+html.vmax-native-video .vmax-stream-page,
+html.vmax-native-video .vmax-stream {
+  background: transparent;
+}
+
+.vmax-lobby {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: clamp(16px, 5vh, 54px) max(16px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+}
+
+.vmax-panel {
+  width: 100%;
+  max-width: 610px;
+  margin-inline: auto;
+  display: grid;
+  gap: 20px;
+  padding: clamp(16px, 4vw, 30px);
+  border: 1px solid var(--vmax-line);
+  border-radius: 22px;
+  background: #111413;
+  box-shadow: 0 18px 48px #0005;
+}
+
+.vmax-host-panel { max-width: 660px; }
+.vmax-intro { display: flex; min-width: 0; align-items: center; gap: 13px; }
+.vmax-intro > svg { flex-shrink: 0; }
+.vmax-intro h1 { color: #fafafa; font-size: clamp(1.25rem, 4vw, 1.65rem); line-height: 1.15; font-weight: 650; letter-spacing: -.025em; }
+.vmax-intro p, .vmax-status { margin-top: 4px; color: #a1a1aa; font-size: .8rem; }
+.vmax-switch, .vmax-host-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.vmax-switch { padding: 4px; border-radius: 12px; border: 1px solid var(--vmax-line); background: var(--vmax-base); }
+
+.vmax-switch button, .vmax-primary, .vmax-secondary, .vmax-tile, .vmax-device {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: .84rem;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.vmax-switch button { color: #a1a1aa; }
+.vmax-switch button[aria-pressed="true"] { color: #ecfdf5; background: #26332c; }
+.vmax-secondary, .vmax-tile, .vmax-device { border: 1px solid var(--vmax-control-border); background: var(--vmax-card); color: #f4f4f5; }
+.vmax-secondary:hover, .vmax-tile:hover, .vmax-device:hover { border-color: #51705e; }
+.vmax-primary, .vmax-tile-primary { background: var(--vmax-accent); color: #092218; border-color: transparent; }
+.vmax-primary:hover, .vmax-tile-primary:hover { background: #c1fae2; }
+.vmax-panel :is(button, input):disabled { opacity: .72; cursor: default; }
+.vmax-panel :is(button, input, summary, select):focus-visible { outline: 2px solid var(--vmax-accent); outline-offset: 2px; }
+.vmax-tile, .vmax-device { justify-content: flex-start; text-align: left; padding: 12px; }
+.vmax-tile { min-height: 72px; }
+.vmax-tile > span, .vmax-device > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.vmax-tile > svg, .vmax-device > svg { flex: none; }
+.vmax-tile small, .vmax-device small { display: block; margin-top: 3px; font-size: .71rem; font-weight: 450; opacity: .78; }
+.vmax-form { display: grid; gap: 10px; min-width: 0; }
+.vmax-form label, .vmax-form legend { color: #d4d4d8; font-size: .78rem; font-weight: 550; }
+.vmax-form label svg { display: inline; vertical-align: middle; }
+.vmax-field-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.vmax-invite-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+.vmax-qr-scanner {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(400px, calc(100vw - 32px));
+  max-height: calc(100dvh - 24px);
+  padding: 16px;
+  border: 1px solid var(--vmax-line);
+  border-radius: 16px;
+  background: var(--vmax-surface);
+  color: #fafafa;
+  overflow: auto;
+}
+.vmax-qr-scanner::backdrop { background: rgb(0 0 0 / 72%); }
+.vmax-qr-scanner header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.vmax-qr-scanner h2 { font-size: 1rem; font-weight: 650; }
+.vmax-qr-scanner video { width: 100%; max-height: 48dvh; margin-top: 8px; background: #000; border-radius: 10px; }
+.vmax-qr-scanner p { margin: 10px 0; color: #d4d4d8; font-size: .85rem; }
+.vmax-qr-scanner label { cursor: pointer; }
+.vmax-qr-scanner label:focus-within { outline: 2px solid var(--vmax-accent); }
+.vmax-form input:not([type="checkbox"]):not([type="range"]), .vmax-form select {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--vmax-line);
+  border-radius: 10px;
+  color: #fafafa;
+  background: var(--vmax-base);
+  font-size: 1rem;
+}
+.vmax-form select { width: auto; font-size: .85rem; }
+.vmax-form input[type="range"], .vmax-form input[type="checkbox"] { accent-color: var(--vmax-accent); }
+.vmax-inline, .vmax-chip-row, .vmax-session-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.vmax-inline, .vmax-session-head { justify-content: space-between; }
+.vmax-inline { font-size: .8rem; }
+.vmax-error { padding: 10px 12px; border-radius: 10px; border: 1px solid #613a35; background: #2a1b18; color: #fecaca; overflow-wrap: anywhere; font-size: .82rem; }
+.vmax-disclosure { border-top: 1px solid var(--vmax-line); }
+.vmax-disclosure summary { display: flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; color: #b9c5bd; font-size: .8rem; }
+.vmax-disclosure summary > svg:last-child { margin-left: auto; }
+.vmax-disclosure[open] summary > svg:last-child { rotate: 180deg; }
+.vmax-disclosure > div { padding-top: 4px; }
+.vmax-symbol { display: grid; place-items: center; width: 42px; height: 42px; flex: none; border-radius: 12px; color: var(--vmax-accent); background: var(--vmax-card); }
+.vmax-invite { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 16px; }
+.vmax-qr { padding: 9px; background: #fff; border-radius: 12px; }
+.vmax-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.vmax-metrics div { padding: 9px; background: var(--vmax-base); border-radius: 10px; min-width: 0; }
+.vmax-metrics dt { color: #a1a1aa; font-size: .72rem; }
+.vmax-metrics dd { color: #fafafa; font-weight: 650; overflow-wrap: anywhere; }
+.vmax-logs { max-height: 11rem; overflow-y: auto; overflow-wrap: anywhere; font: .72rem ui-monospace, monospace; }
+
+@media (max-width: 540px) {
+  .vmax-panel { gap: 15px; border-radius: 16px; }
+  .vmax-lobby { padding-top: 14px; }
+  .vmax-host-actions { grid-template-columns: minmax(0, 1fr); }
+  .vmax-invite { grid-template-columns: minmax(0, 1fr); }
+  .vmax-qr { justify-self: start; }
+}
+
+@media (max-height: 440px) and (orientation: landscape) {
+  .vmax-lobby { padding-block: 8px 12px; }
+  .vmax-panel { padding: 12px 16px; gap: 10px; }
+  .vmax-intro h1 { font-size: 1.25rem; }
+  .vmax-form { gap: 7px; }
+}
+:root {
+  --vmax-accent: #1be4f4;
+  --vmax-accent-text: #002327;
+  --vmax-line: #354952;
+  --vmax-base: #081619;
+  --vmax-surface: #10191f;
+  --vmax-card: #152129;
+  --vmax-glow: #142932;
+  --vmax-warm: #ff800d;
+}
+:root[data-theme="blue"] {
+  --vmax-accent: #348dff;
+  --vmax-accent-text: #071122;
+  --vmax-line: #3e5072;
+  --vmax-base: #0b1326;
+  --vmax-surface: #111923;
+  --vmax-card: #192432;
+  --vmax-glow: #122842;
+  --vmax-warm: #67a6ff;
+}
+:root[data-theme="mono"] {
+  --vmax-accent: #e1e4eb;
+  --vmax-accent-text: #15161a;
+  --vmax-line: #494951;
+  --vmax-base: #141417;
+  --vmax-surface: #15161a;
+  --vmax-card: #202126;
+  --vmax-glow: #25262c;
+  --vmax-warm: #acb0b8;
+}
+.vmax-shell {
+  --vmax-accent: inherit;
+  --vmax-line: inherit;
+  background: radial-gradient(ellipse at 70% 0%, var(--vmax-glow), var(--vmax-base) 72%);
+}
+.vmax-panel { background: var(--vmax-surface); }
+.vmax-primary, .vmax-tile.vmax-tile-primary { background: var(--vmax-accent); color: var(--vmax-accent-text); }
+.vmax-primary:hover, .vmax-tile.vmax-tile-primary:hover { background: color-mix(in srgb, var(--vmax-accent), white 18%); }
+.vmax-secondary, .vmax-tile, .vmax-device { background: var(--vmax-card); }
+.vmax-secondary:hover, .vmax-tile:hover, .vmax-device:hover { border-color: var(--vmax-accent); }
+.vmax-switch button[aria-pressed="true"], .vmax-nav button[aria-pressed="true"] {
+  color: var(--vmax-accent);
+  background: color-mix(in srgb, var(--vmax-accent) 12%, var(--vmax-surface));
+}
+.vmax-mark { object-fit: contain; flex: none; }
+.vmax-workspace { display: grid; grid-template-columns: 176px minmax(0, 1fr); flex: 1; min-height: 0; }
+.vmax-nav { display: flex; flex-direction: column; gap: 8px; padding: 20px 12px; border-right: 1px solid var(--vmax-line); background: var(--vmax-surface); }
+.vmax-nav button { display: flex; align-items: center; gap: 11px; padding: 12px; border-radius: 10px; text-align: left; }
+.vmax-workspace-content .vmax-panel { max-width: 1040px; }
+.vmax-workspace-content { min-width: 0; }
+.vmax-home { display: grid; gap: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--vmax-line); }
+.vmax-brand { display: flex; align-items: center; gap: 18px; }
+.vmax-brand h1 { color: white; font-weight: 750; font-size: clamp(1.35rem, 5vw, 3.5rem); line-height: 1.05; }
+.vmax-brand p, .vmax-computer small { display: block; color: #a9b6c1; margin-top: 5px; font-size: .82rem; }
+.vmax-home-actions { display: grid; grid-template-columns: repeat(auto-fit,minmax(138px,1fr)); gap: 10px; }
+.vmax-home-actions .vmax-tile { border-left-color: var(--vmax-warm); }
+.vmax-home-actions .vmax-tile svg { color: var(--vmax-accent); }
+.vmax-computer { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 8px; background: var(--vmax-card); border: 1px solid var(--vmax-line); padding: 10px; border-radius: 12px; }
+.vmax-computer strong { overflow-wrap: anywhere; }
+.vmax-computer > svg { color: var(--vmax-accent); }
+.vmax-computer button { padding-inline: 9px; }
+[role="dialog"] input[type="range"] { accent-color: var(--vmax-accent); }
+@media (max-width: 760px), (pointer: coarse) {
+  .vmax-workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0,1fr) auto; }
+  .vmax-nav { grid-row: 2; flex-direction: row; gap: 3px; min-width: 0; padding: 6px max(4px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(4px,env(safe-area-inset-left)); border-right: 0; border-top: 1px solid var(--vmax-line); }
+  .vmax-nav button { flex: 1 1 0; min-width: 0; justify-content: center; gap: 3px; flex-direction: column; padding: 5px 1px; font-size: clamp(.6rem, 2.55vw, .76rem); overflow-wrap: anywhere; text-align: center; }
+  .vmax-workspace-content { grid-row: 1; padding: 12px max(12px,env(safe-area-inset-right)) 12px max(12px,env(safe-area-inset-left)); }
+  .vmax-home { gap: 10px; }
+  .vmax-home-actions { grid-template-columns: repeat(auto-fit,minmax(100px,1fr)); }
+  .vmax-home-actions .vmax-tile { min-width: 0; font-size: .76rem; padding-inline: 8px; }
+}
+@media (max-width: 350px) {
+  .vmax-invite-row { grid-template-columns: 1fr 1fr; }
+  .vmax-invite-row input { grid-column: 1 / -1; }
+  .vmax-computer { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .vmax-computer .vmax-primary { grid-column: 1 / -1; }
+}
+
+:root {
+  color-scheme: dark;
+  --vmax-control-border: color-mix(in srgb, var(--vmax-line), #a7b5c6 30%);
+  --color-zinc-950: var(--vmax-base);
+  --color-zinc-900: var(--vmax-surface);
+  --color-zinc-800: var(--vmax-card);
+  --color-zinc-700: var(--vmax-control-border);
+  --color-zinc-600: var(--vmax-control-border);
+  --color-zinc-500: #a0a9b7;
+  --color-zinc-400: #bac4d1;
+}
+:where(button, input, select, summary):focus-visible {
+  outline: 2px solid var(--vmax-accent);
+  outline-offset: 2px;
+}
+input:is([type="range"], [type="checkbox"]), input[type="radio"] { accent-color: var(--vmax-accent); }
+.vmax-nav button { min-height: 44px; color: #f1f4fa; border: 1px solid var(--vmax-control-border); background: var(--vmax-card); }
+.vmax-nav button[aria-pressed="true"], .vmax-active-tab, .vmax-theme-picker button[aria-pressed="true"] {
+  color: var(--vmax-accent);
+  border: 1px solid var(--vmax-accent);
+  background: color-mix(in srgb, var(--vmax-accent) 13%, var(--vmax-surface));
+}
+.vmax-theme-picker { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 9px; }
+.vmax-theme-picker button { justify-content: flex-start; }
+.vmax-theme-swatch { width: 16px; height: 16px; flex: none; border-radius: 50%; background: var(--vmax-theme-preview); }
+[data-theme-choice="neon"] { --vmax-theme-preview: #1be4f4; }
+[data-theme-choice="blue"] { --vmax-theme-preview: #348dff; }
+[data-theme-choice="mono"] { --vmax-theme-preview: #e1e4eb; }
+[data-stream-controls] button { border-color: var(--vmax-control-border); }
+[data-stream-controls] button[aria-label="Disconnect"] { color: #ffe3e6; border-color: #b8606b; }
+@media (max-height: 540px) and (orientation: landscape) {
+  .vmax-settings-overlay {
+    padding: max(6px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right))
+      max(6px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));
+  }
+  .vmax-settings-panel { height: 100%; max-height: 100%; }
+  .vmax-settings-header, .vmax-settings-footer { padding-block: 4px; }
+  .vmax-settings-header button { width: 44px; height: 44px; }
+  .vmax-settings-body { flex-direction: row; }
+  .vmax-settings-nav { width: clamp(116px, 26vw, 164px); overflow-y: auto; overscroll-behavior: contain; padding: 6px; border-right-width: 1px; border-bottom-width: 0; }
+  .vmax-settings-nav nav { grid-template-columns: minmax(0, 1fr); }
+  .vmax-settings-content { padding: 10px; }
+}
+
+/* Account controls remain within the workspace scroll area at all sizes. */
+.vmax-account-panel { margin-block: 0 14px; min-width: 0; overflow-wrap: anywhere; }
+.vmax-account-panel input:not([type="checkbox"]) { min-width: 0; max-width: 100%; }
+@media (max-width: 760px), (pointer: coarse) {
+  .vmax-nav button { min-height: 44px; }
+  .vmax-nav button svg { width: 17px; height: 17px; flex: none; }
+  .vmax-account-panel { padding: 12px; }
+  .vmax-account-panel button { min-height: 40px; }
+}
+@media (max-height: 460px) and (orientation: landscape) {
+  .vmax-workspace-content { padding-block: 8px; }
+  .vmax-nav button { flex-direction: row; }
+}
+
+.vmax-workspace { grid-template-columns: 190px minmax(0, 1fr); }
+.vmax-workspace-content { padding: clamp(20px, 4vw, 56px); }
+.vmax-workspace-content .vmax-panel {
+  max-width: 880px; margin-inline: auto; padding: 0; border: 0; box-shadow: none;
+  background: transparent; gap: 16px; align-content: start;
+}
+.vmax-home {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 6px; padding-bottom: 18px;
+}
+.vmax-brand h1 { font-size: clamp(1.55rem, 4vw, 2.2rem); }
+.vmax-workspace .vmax-nav { padding-top: 22px; }
+.vmax-form { min-width: 0; }
+.vmax-account-panel { margin-block: 0; }
+.vmax-account-panel input:not([type="checkbox"]) {
+  padding: 8px 10px; min-height: 42px; border: 1px solid var(--vmax-line);
+  border-radius: 9px; background: var(--vmax-card);
+}
+@media (max-width: 760px), (pointer: coarse) {
+  .vmax-workspace { grid-template-columns: minmax(0,1fr); }
+  .vmax-workspace .vmax-nav { padding-top: 5px; }
+  .vmax-workspace-content { padding: 16px max(14px,env(safe-area-inset-right)) 14px max(14px,env(safe-area-inset-left)); }
+  .vmax-workspace-content .vmax-panel { gap: 12px; }
+  .vmax-home { padding-bottom: 12px; }
+}

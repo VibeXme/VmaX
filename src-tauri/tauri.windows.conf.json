@@ -1,0 +1,15 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "VmaX — Low-Latency P2P Streaming",
+        "width": 1200,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 680,
+        "decorations": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --autoplay-policy=no-user-gesture-required --disable-backgrounding-occluded-windows --disable-renderer-backgrounding"
+      }
+    ]
+  }
+}
