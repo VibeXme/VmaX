@@ -372,7 +372,9 @@ impl JitterConsumer {
                 continue;
             }
             let frame = &queued.frame;
-            let gap = self.last_emitted.is_some_and(|last| last.wrapping_add(1) != frame.frame_id);
+            let gap = self
+                .last_emitted
+                .is_some_and(|last| last.wrapping_add(1) != frame.frame_id);
             if !frame.is_keyframe && (gap || self.awaiting_keyframe) {
                 if !self.awaiting_keyframe || self.last_emitted.is_none() {
                     self.needs_keyframe = true;
@@ -526,7 +528,10 @@ mod tests {
     #[test]
     fn clean_lan_holds_only_one_millisecond() {
         let (producer, _consumer) = JitterProducer::new(Instant::now(), 8);
-        assert_eq!(producer.estimator.target_hold_us(), MIN_HOLD.as_micros() as u32);
+        assert_eq!(
+            producer.estimator.target_hold_us(),
+            MIN_HOLD.as_micros() as u32
+        );
     }
 
     #[test]

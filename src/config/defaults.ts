@@ -173,7 +173,10 @@ function loadSavedConfig(): VmaXConfig {
         bitrateMbps: asClampedNumber(v.bitrateMbps, 1, MAX_STREAM_BITRATE_MBPS, DEFAULT_VMAX_CONFIG.video.bitrateMbps),
         encoder: asEncoder(v.encoder, DEFAULT_VMAX_CONFIG.video.encoder),
         chroma: v.chroma === "444" ? "444" : "420",
-        codec: v.codec === "h264" || v.codec === "hevc" || v.codec === "hevc_main10" ? v.codec : "auto",
+        codec:
+          v.codec === "h264" || v.codec === "hevc" || v.codec === "hevc_main10" || v.codec === "av1"
+            ? v.codec
+            : "auto",
         framePacing: v.framePacing === "motion" || v.framePacing === "detail" ? v.framePacing : "balanced",
         sharpness: Math.round(asClampedNumber(v.sharpness, 0, 100, DEFAULT_VMAX_CONFIG.video.sharpness)),
         viewerSharpness: Math.round(asClampedNumber(v.viewerSharpness, 0, 100, DEFAULT_VMAX_CONFIG.video.viewerSharpness)),

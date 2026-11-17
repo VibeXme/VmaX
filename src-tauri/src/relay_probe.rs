@@ -1,5 +1,8 @@
 use crate::signaling::{generate_room_code, signal_as_client, signal_as_host};
-use std::{io, time::{Duration, Instant}};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use tokio::{net::UdpSocket, sync::oneshot, time::timeout};
 
 const HOST_MARKER: &[u8] = b"vmax-check/host";

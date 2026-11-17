@@ -24,6 +24,10 @@
 //! [`AdaptiveBitrateController::on_ack`] and applies
 //! [`AdaptiveBitrateController::nvenc_plan`] through
 //! `encoder.set_bitrate_bps(plan.average_bit_rate)`.
+//!
+//! NOTE: this controller is not wired into the live session. `network.rs` drives
+//! [`crate::congestion::GccController`] with the GC-style `FeedbackPacket`; the
+//! ramp constants in this file have no runtime effect.
 
 use bytemuck::{Pod, Zeroable};
 use std::time::{Duration, Instant};
@@ -474,7 +478,10 @@ mod tests {
         let mut ctrl = AdaptiveBitrateController::new(20_000_000, 80_000_000, 60);
         let mut target = ctrl.target_bps();
         for i in 0..4u64 {
-            let (next, action) = ctrl.on_ack(&ack(i * 16_000, i * 21_000, 0), now + Duration::from_millis(i * 16));
+            let (next, action) = ctrl.on_ack(
+                &ack(i * 16_000, i * 21_000, 0),
+                now + Duration::from_millis(i * 16),
+            );
             target = next;
             if i == 3 {
                 assert_eq!(action, RateAction::Reconfigure);
@@ -494,7 +501,10 @@ mod tests {
                 // Arrival slips further behind every sample: sustained queue
                 // growth with zero loss.
                 let recv = base + 40_000 + base / 2;
-                ctrl.on_ack(&ack(base, recv, 0), now + Duration::from_millis(base / 1000));
+                ctrl.on_ack(
+                    &ack(base, recv, 0),
+                    now + Duration::from_millis(base / 1000),
+                );
             }
         }
         assert_eq!(ctrl.target_bps(), MIN_TARGET_BPS);

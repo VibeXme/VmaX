@@ -10,6 +10,7 @@ pub mod commands;
 pub mod congestion;
 pub mod connections;
 pub mod connectivity;
+pub mod cursor;
 pub mod encoder;
 pub mod encoder_quality;
 pub mod encoder_recovery;
@@ -22,8 +23,11 @@ pub mod internet;
 pub mod invite;
 pub mod jitter_buffer;
 pub mod nat_mobility;
+pub mod native_client;
+pub mod native_d3d11;
 pub mod network;
 pub mod nvenc;
+pub mod opus_audio;
 pub mod pacer;
 pub mod pacing;
 pub mod presence;
@@ -318,8 +322,6 @@ pub fn run() {
             commands::send_input_event,
             commands::set_fullscreen_keyboard_capture,
             commands::send_remote_text,
-            set_remote_keyboard,
-            set_stream_immersive,
             commands::set_stream_input_paused,
             commands::set_host_only_input,
             commands::set_guest_input_permissions,
@@ -329,6 +331,7 @@ pub fn run() {
             commands::set_stream_bitrate_limit,
             commands::reconnect_stream_gamepad,
             commands::native_video_state,
+            commands::native_d3d11_backend_state,
             commands::report_client_decode_latency,
             commands::set_constant_fps_mode,
             commands::update_runtime_audio_denoise,
@@ -336,6 +339,12 @@ pub fn run() {
             commands::graphics_backends,
             commands::set_haptics_enabled,
             commands::get_haptics_settings,
+            commands::init_native_client_renderer,
+            commands::present_native_frame,
+            commands::start_host_opus_audio,
+            commands::start_client_opus_audio,
+            commands::push_opus_audio_packet,
+            commands::get_opus_plc_stats,
         ])
         .build(tauri::generate_context!());
 

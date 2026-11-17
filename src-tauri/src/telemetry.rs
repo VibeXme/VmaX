@@ -143,7 +143,11 @@ impl DecodeProbe {
     pub fn finish(&mut self, frame_id: u64, now: Instant) -> Option<u32> {
         if let Some(pos) = self.pending.iter().position(|(id, _)| *id == frame_id) {
             let (_, start) = self.pending.remove(pos)?;
-            return Some(now.saturating_duration_since(start).as_micros().min(u128::from(u32::MAX)) as u32);
+            return Some(
+                now.saturating_duration_since(start)
+                    .as_micros()
+                    .min(u128::from(u32::MAX)) as u32,
+            );
         }
         None
     }
@@ -177,9 +181,11 @@ impl BitrateCounter {
 
     pub fn add(&mut self, bytes: usize, now: Instant) {
         self.ready = now.saturating_duration_since(self.started) >= self.window;
-        while self.buckets.front().is_some_and(|(stamp, _)| {
-            now.saturating_duration_since(*stamp) > self.window
-        }) {
+        while self
+            .buckets
+            .front()
+            .is_some_and(|(stamp, _)| now.saturating_duration_since(*stamp) > self.window)
+        {
             if let Some((_, expired)) = self.buckets.pop_front() {
                 self.bytes -= expired;
             }

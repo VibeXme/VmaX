@@ -165,13 +165,7 @@ fn mark_ipv6_traffic_class(socket: &Socket, value: u32) -> io::Result<()> {
     const IPV6_TCLASS: i32 = 39;
 
     unsafe extern "system" {
-        fn setsockopt(
-            s: usize,
-            level: i32,
-            optname: i32,
-            optval: *const i8,
-            optlen: i32,
-        ) -> i32;
+        fn setsockopt(s: usize, level: i32, optname: i32, optval: *const i8, optlen: i32) -> i32;
     }
 
     let raw = socket.as_raw_socket() as usize;
@@ -251,11 +245,7 @@ pub fn local_host_candidates() -> Vec<SocketAddr> {
 
 /// Synchronous STUN binding request for one server.  Returns the
 /// server-reflexive address or `None` on timeout.
-pub fn stun_reflexive(
-    socket: &UdpSocket,
-    server: &str,
-    timeout: Duration,
-) -> Option<SocketAddr> {
+pub fn stun_reflexive(socket: &UdpSocket, server: &str, timeout: Duration) -> Option<SocketAddr> {
     let tx_id: [u8; 12] = rand::random();
     let request = crate::stun::build_binding_request(tx_id);
     let mut last = None;
@@ -540,7 +530,12 @@ impl UpnpMapper {
     }
 
     /// Create or refresh a UDP mapping.  Returns the external port.
-    pub fn map_udp(&self, local_ip: Ipv4Addr, internal_port: u16, external_port: u16) -> Option<u16> {
+    pub fn map_udp(
+        &self,
+        local_ip: Ipv4Addr,
+        internal_port: u16,
+        external_port: u16,
+    ) -> Option<u16> {
         let body = format!(
             r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -560,8 +555,13 @@ impl UpnpMapper {
             ip = local_ip,
             lease = 3600,
         );
-        http_soap(&self.control_url, &self.service_type, "AddPortMapping", &body)
-            .then_some(external_port)
+        http_soap(
+            &self.control_url,
+            &self.service_type,
+            "AddPortMapping",
+            &body,
+        )
+        .then_some(external_port)
     }
 
     pub fn unmap_udp(&self, external_port: u16) -> bool {
@@ -597,10 +597,7 @@ fn http_get(url: &str) -> Option<String> {
         Some(index) => (&rest[..index], &rest[index..]),
         None => (rest, "/"),
     };
-    let addr = authority
-        .to_socket_addrs_fallback()
-        .into_iter()
-        .next()?;
+    let addr = authority.to_socket_addrs_fallback().into_iter().next()?;
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(800)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     write!(
@@ -743,10 +740,7 @@ impl WanSessionPlan {
                             .iter()
                             .find_map(|s| stun_reflexive(socket, s, Duration::from_millis(600))),
                     ) {
-                        candidates.push(
-                            SocketAddr::new(wan_ip.ip(), port),
-                            CandidateKind::Upnp,
-                        );
+                        candidates.push(SocketAddr::new(wan_ip.ip(), port), CandidateKind::Upnp);
                     }
                 }
             }
@@ -786,8 +780,14 @@ mod tests {
     #[test]
     fn candidates_round_trip_through_signaling() {
         let mut set = CandidateSet::default();
-        set.push("203.0.113.7:40000".parse().expect("v4"), CandidateKind::ServerReflexive);
-        set.push("[2001:db8::1]:40000".parse().expect("v6"), CandidateKind::Host);
+        set.push(
+            "203.0.113.7:40000".parse().expect("v4"),
+            CandidateKind::ServerReflexive,
+        );
+        set.push(
+            "[2001:db8::1]:40000".parse().expect("v6"),
+            CandidateKind::Host,
+        );
         let json = set.to_signaling();
         let back = CandidateSet::from_signaling(&json).expect("decode");
         assert_eq!(back, set);
@@ -798,10 +798,19 @@ mod tests {
     fn duplicate_and_unspecified_candidates_are_dropped() {
         let mut set = CandidateSet::default();
         set.push("0.0.0.0:1234".parse().expect("v4"), CandidateKind::Host);
-        set.push("198.51.100.4:5000".parse().expect("v4"), CandidateKind::Host);
-        set.push("198.51.100.4:5000".parse().expect("v4"), CandidateKind::Host);
+        set.push(
+            "198.51.100.4:5000".parse().expect("v4"),
+            CandidateKind::Host,
+        );
+        set.push(
+            "198.51.100.4:5000".parse().expect("v4"),
+            CandidateKind::Host,
+        );
         // IPv4-mapped form is the same peer.
-        set.push("[::ffff:198.51.100.4]:5000".parse().expect("v6"), CandidateKind::Host);
+        set.push(
+            "[::ffff:198.51.100.4]:5000".parse().expect("v6"),
+            CandidateKind::Host,
+        );
         assert_eq!(set.candidates.len(), 1);
     }
 
@@ -817,7 +826,10 @@ mod tests {
     fn punch_between_two_loopback_peers_confirms_directly() {
         let host = Arc::new(bind_dual_stack(0).expect("host"));
         let client = Arc::new(bind_dual_stack(0).expect("client"));
-        let host_addr = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, host.local_addr().expect("addr").port()));
+        let host_addr = SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            host.local_addr().expect("addr").port(),
+        ));
         let client_addr = canonical(client.local_addr().expect("addr"));
 
         let host_socket = Arc::clone(&host);
@@ -827,7 +839,8 @@ mod tests {
             while Instant::now() < deadline {
                 if let Ok((len, from)) = host_socket.recv_from(&mut buf) {
                     if HolePuncher::is_punch(&buf[..len]) {
-                        let _ = host_socket.send_to(&HolePuncher::punch_payload(host_addr.port()), from);
+                        let _ = host_socket
+                            .send_to(&HolePuncher::punch_payload(host_addr.port()), from);
                         return true;
                     }
                 }
@@ -846,10 +859,7 @@ mod tests {
     #[test]
     fn empty_peer_list_falls_back_to_relay() {
         let socket = Arc::new(bind_dual_stack(0).expect("socket"));
-        assert_eq!(
-            HolePuncher::new(socket).run(&[]),
-            WanPath::Relay
-        );
+        assert_eq!(HolePuncher::new(socket).run(&[]), WanPath::Relay);
     }
 
     #[test]
@@ -867,13 +877,16 @@ mod tests {
             <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
             <controlURL>/ctl/IPConn</controlURL>
             </service></serviceList></device></root>"#;
-        let index = html.find("urn:schemas-upnp-org:service:WANIPConnection:1").expect("service");
+        let index = html
+            .find("urn:schemas-upnp-org:service:WANIPConnection:1")
+            .expect("service");
         let tail = &html[index..];
         let control = tail
             .find("<controlURL>")
             .and_then(|start| {
                 let rest = &tail[start + "<controlURL>".len()..];
-                rest.find("</controlURL>").map(|end| rest[..end].trim().to_string())
+                rest.find("</controlURL>")
+                    .map(|end| rest[..end].trim().to_string())
             })
             .unwrap_or_default();
         assert_eq!(control, "/ctl/IPConn");

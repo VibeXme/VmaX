@@ -73,7 +73,9 @@ impl DeviceIdentity {
         };
         match crate::connections::create_json(path, &identity) {
             Ok(()) => Ok(identity),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Self::load_or_create(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Self::load_or_create(path)
+            }
             Err(error) => Err(error.to_string()),
         }
     }
@@ -237,7 +239,11 @@ fn persistent_device_verifies_only_the_original_request() {
     let loaded = DeviceIdentity::load_or_create(&path).unwrap();
     assert_eq!(loaded.device_id, identity.device_id);
     assert!(verify(&loaded.public_key, proof, &signature));
-    assert!(!verify(&loaded.public_key, b"substituted QUIC fingerprint", &signature));
+    assert!(!verify(
+        &loaded.public_key,
+        b"substituted QUIC fingerprint",
+        &signature
+    ));
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_file(dir.join("device-identity-ed25519.json.lock")).unwrap();
     std::fs::remove_dir(dir).unwrap();

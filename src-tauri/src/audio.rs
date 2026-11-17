@@ -22,6 +22,7 @@ const PLAYBACK_MAX_BUFFER_MS: usize = 95;
 struct PlaybackBuffer {
     samples: VecDeque<f32>,
     last_seq: Option<u32>,
+    channels: usize,
     pending: Vec<(u32, Vec<f32>)>,
     max_samples: usize,
     callback_len: usize,
@@ -36,6 +37,7 @@ impl PlaybackBuffer {
         Self {
             samples: VecDeque::with_capacity(16_384),
             last_seq: None,
+            channels: 2,
             pending: Vec::with_capacity(16),
             max_samples: 0,
             callback_len: 0,
@@ -107,12 +109,30 @@ impl PlaybackBuffer {
                     missing = distance - 1,
                     previous, seq, "audio packets missed playout deadline"
                 );
-                self.samples.extend(std::iter::repeat_n(
-                    0.0,
-                    (distance as usize - 1).min(4) * samples.len(),
-                ));
+                self.conceal_gap((distance as usize - 1).min(4), &samples);
             }
             self.append(seq, samples);
+        }
+    }
+
+    /// Bridge a short loss from the last emitted sample into the next packet.
+    /// This removes the hard zero-fill edge that causes audible clipping.
+    fn conceal_gap(&mut self, missing_packets: usize, next_packet: &[f32]) {
+        let channels = self.channels.max(1);
+        let frame_count = next_packet.len() / channels;
+        if frame_count == 0 {
+            return;
+        }
+        for packet_index in 0..missing_packets {
+            let blend = (packet_index + 1) as f32 / (missing_packets + 1) as f32;
+            for frame in 0..frame_count {
+                let frame_blend = blend * (frame + 1) as f32 / frame_count as f32;
+                for channel in 0..channels {
+                    let from = self.last_frame.get(channel).copied().unwrap_or(0.0);
+                    let to = next_packet[frame * channels + channel];
+                    self.samples.push_back(from + (to - from) * frame_blend);
+                }
+            }
         }
     }
 
@@ -254,6 +274,7 @@ impl AudioPlaybackHandle {
         let Ok(mut guard) = self.ring.lock() else {
             return;
         };
+        guard.channels = target_ch;
         let configured =
             (self.target_rate as usize * PLAYBACK_MAX_BUFFER_MS / 1_000).max(1) * target_ch;
         guard.push(pkt.header.seq, resampled, configured);

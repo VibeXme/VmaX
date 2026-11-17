@@ -169,7 +169,103 @@ pub struct BitrateDecision {
     pub min_rtt_ms: f64,
     pub loss_pct: f64,
     pub reason: String,
+    /// The controller's own verdict that this target is worth an encoder round
+    /// trip. `RateLatch` narrows it further before the value reaches NVENC, so
+    /// a caller that has a latch only needs this as a hint.
     pub encoder_reconfigure_recommended: bool,
+}
+
+/// Minimum spacing between two encoder rate changes.
+///
+/// `nvEncReconfigureEncoder` is accepted on any frame, but every call rebuilds
+/// the rate-control state and re-seeds the VBV, so a controller that nudges the
+/// target on each 100 ms tick keeps the encoder in a permanent transient. About
+/// seven changes per second is still instantaneous to a viewer.
+pub const RATE_LATCH_MIN_INTERVAL: Duration = Duration::from_millis(150);
+
+/// A drop this large is urgent: the pacer has already reduced the wire rate, so
+/// the encoder must follow at once or the queue in front of the network grows.
+/// It bypasses the minimum interval.
+pub const RATE_LATCH_URGENT_DROP_PERCENT: u32 = 10;
+
+/// A smaller drop still waits for the interval, but is never ignored.
+pub const RATE_LATCH_DROP_PERCENT: u32 = 2;
+
+/// A rise is invisible to a viewer below this, so it is not worth a round trip
+/// on its own. Recovery from a cut moves far more than this per tick.
+pub const RATE_LATCH_RISE_PERCENT: u32 = 5;
+
+/// A change still pending after this long is applied regardless of the rules
+/// above, so a deferred rise can never be lost.
+pub const RATE_LATCH_CATCH_UP: Duration = Duration::from_secs(1);
+
+/// Decides when a congestion-control target is worth pushing into the encoder.
+///
+/// The asymmetry is deliberate: delaying a decrease grows the transport queue,
+/// while delaying an increase costs nothing. Cut detection therefore stays
+/// instantaneous and every other change is coalesced.
+#[derive(Debug, Clone)]
+pub struct RateLatch {
+    applied_bps: u32,
+    applied_at: Option<Instant>,
+}
+
+impl Default for RateLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RateLatch {
+    pub fn new() -> Self {
+        Self {
+            applied_bps: 0,
+            applied_at: None,
+        }
+    }
+
+    pub fn applied_bps(&self) -> u32 {
+        self.applied_bps
+    }
+
+    /// Records that the encoder accepted `bps`. Call only after the encoder
+    /// confirms; a rejected change must be retried.
+    pub fn note_applied(&mut self, bps: u32, now: Instant) {
+        self.applied_bps = bps;
+        self.applied_at = Some(now);
+    }
+
+    /// True when `target_bps` should be handed to the encoder now.
+    pub fn should_apply(&self, target_bps: u32, recommended: bool, now: Instant) -> bool {
+        if target_bps == 0 {
+            return false;
+        }
+        let Some(applied_at) = self.applied_at else {
+            return true;
+        };
+        if target_bps == self.applied_bps {
+            return false;
+        }
+        let base = u64::from(self.applied_bps.max(1));
+        let change_percent =
+            ((u64::from(target_bps).abs_diff(u64::from(self.applied_bps)) * 100) / base) as u32;
+        let dropping = target_bps < self.applied_bps;
+        let waited = now.saturating_duration_since(applied_at);
+        if dropping {
+            if change_percent >= RATE_LATCH_URGENT_DROP_PERCENT {
+                return true;
+            }
+            if change_percent >= RATE_LATCH_DROP_PERCENT {
+                return waited >= RATE_LATCH_MIN_INTERVAL;
+            }
+        } else if recommended
+            && change_percent >= RATE_LATCH_RISE_PERCENT
+            && waited >= RATE_LATCH_MIN_INTERVAL
+        {
+            return true;
+        }
+        waited >= RATE_LATCH_CATCH_UP && change_percent >= 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -612,5 +708,87 @@ mod tests {
             assert!(d.target_bitrate_bps >= MIN_VIDEO_BITRATE_BPS);
         }
         assert_eq!(ctrl.current_bitrate_bps(), MIN_VIDEO_BITRATE_BPS);
+    }
+
+    /// 20 Mbps applied, then `target` evaluated `after_ms` later.
+    fn latch_case(target: u32, recommended: bool, after_ms: u64) -> bool {
+        let origin = Instant::now();
+        let mut latch = RateLatch::new();
+        latch.note_applied(20_000_000, origin);
+        latch.should_apply(
+            target,
+            recommended,
+            origin + Duration::from_millis(after_ms),
+        )
+    }
+
+    #[test]
+    fn the_first_target_is_always_applied() {
+        let latch = RateLatch::new();
+        assert!(latch.should_apply(20_000_000, false, Instant::now()));
+        assert!(!latch.should_apply(0, true, Instant::now()));
+    }
+
+    #[test]
+    fn an_unchanged_target_is_never_resent() {
+        assert!(!latch_case(20_000_000, true, 10_000));
+    }
+
+    #[test]
+    fn a_cut_is_applied_without_waiting_for_the_interval() {
+        // 15 % down, one millisecond after the last change: the wire rate has
+        // already dropped, so waiting would only build a pacer queue.
+        assert!(latch_case(17_000_000, true, 1));
+        // A 10 % cut is the urgent boundary.
+        assert!(latch_case(18_000_000, false, 0));
+    }
+
+    #[test]
+    fn a_small_trim_still_waits_for_the_interval() {
+        assert!(!latch_case(19_000_000, true, 50));
+        assert!(latch_case(19_000_000, true, 200));
+    }
+
+    #[test]
+    fn rises_are_coalesced_to_one_per_interval() {
+        // 10 % up and endorsed, but inside the minimum interval.
+        assert!(!latch_case(22_000_000, true, 100));
+        assert!(latch_case(22_000_000, true, 200));
+    }
+
+    #[test]
+    fn a_rise_the_controller_did_not_endorse_waits_for_the_catch_up() {
+        // The controller applied its own 2.5 % deadband and said this move is
+        // not worth a round trip; the latch defers it rather than drops it.
+        assert!(!latch_case(22_000_000, false, 500));
+        assert!(latch_case(22_000_000, false, 1_100));
+    }
+
+    #[test]
+    fn a_tiny_rise_is_not_worth_a_reconfigure() {
+        // 4.5 % up: invisible to a viewer, so it waits for the catch-up window
+        // instead of costing an encoder round trip on its own.
+        assert!(!latch_case(20_900_000, true, 500));
+        assert!(latch_case(20_900_000, true, 1_100));
+    }
+
+    #[test]
+    fn a_deferred_change_cannot_be_lost() {
+        // 3 % pending for a second: applied even with no endorsement.
+        assert!(!latch_case(20_600_000, false, 900));
+        assert!(latch_case(20_600_000, false, 1_050));
+    }
+
+    #[test]
+    fn a_rejected_change_is_retried() {
+        let origin = Instant::now();
+        let mut latch = RateLatch::new();
+        latch.note_applied(20_000_000, origin);
+        // Nothing was noted after the refusal, so the same target is offered
+        // again on the next tick instead of being silently forgotten.
+        assert!(latch.should_apply(24_000_000, true, origin + Duration::from_millis(200)));
+        assert!(latch.should_apply(24_000_000, true, origin + Duration::from_millis(400)));
+        latch.note_applied(24_000_000, origin + Duration::from_millis(400));
+        assert!(!latch.should_apply(24_000_000, true, origin + Duration::from_millis(500)));
     }
 }

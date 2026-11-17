@@ -185,7 +185,7 @@ export interface StreamVideoSettings {
   /** Use the whole configured bitrate; ignore congestion back-off. */
   unlimitedBitrate: boolean;
   nvenc: NvencSettings;
-  codec: "auto" | "h264" | "hevc" | "hevc_main10";
+  codec: "auto" | "h264" | "hevc" | "hevc_main10" | "av1";
   chroma: "420" | "444";
 }
 

@@ -109,9 +109,165 @@ fn gop_for(fps: u32) -> u32 {
     (fps.max(1) * GOP_SECONDS).clamp(MIN_GOP, MAX_GOP)
 }
 
+/// Which low-latency requests a Media Foundation encoder accepted.
+///
+/// Vendor MFTs advertise `ICodecAPI` support they do not implement, so every
+/// request on that path is best-effort. Recording the outcome is the only way
+/// to explain a host that is a frame behind: a refused low-latency mode or a
+/// rejected B-frame count silently costs reorder delay, and the encoder then
+/// looks slow for no visible reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MftLatencyReport {
+    /// Whether the transform is a hardware encoder. Decides whether a zero
+    /// B-frame count is requested at all.
+    pub hardware: bool,
+    /// `MF_LOW_LATENCY` on the transform attributes.
+    pub low_latency_attribute: bool,
+    /// `CODECAPI_AVLowLatencyMode`.
+    pub low_latency_mode: bool,
+    /// `CODECAPI_AVEncMPVDefaultBPictureCount = 0`.
+    pub no_b_frames: bool,
+    /// A rate-control mode was accepted (peak-constrained VBR or CBR fallback).
+    pub rate_control: bool,
+}
+
+impl MftLatencyReport {
+    /// The requests made on this path, in report order.
+    ///
+    /// The B-frame request is only made for hardware encoders. Microsoft's
+    /// software encoder already defaults to zero B-frames, and a third-party
+    /// software MFT that supports them should keep them: a CPU encoder is
+    /// short of bits, not short of 16 ms, so stripping reorder delay there
+    /// trades away compression for latency it cannot get back. Counting a
+    /// request that was never made would also make the label claim a refusal
+    /// that did not happen.
+    fn entries(&self) -> Vec<(&'static str, bool)> {
+        let mut entries = vec![
+            ("MF_LOW_LATENCY", self.low_latency_attribute),
+            ("low-latency mode", self.low_latency_mode),
+            ("rate control", self.rate_control),
+        ];
+        if self.hardware {
+            entries.push(("zero B-frames", self.no_b_frames));
+        }
+        entries
+    }
+
+    /// Number of requests that apply to this path.
+    pub fn total(&self) -> usize {
+        self.entries().len()
+    }
+
+    /// How many of them the encoder accepted.
+    pub fn accepted(&self) -> usize {
+        self.entries()
+            .into_iter()
+            .filter(|(_, accepted)| *accepted)
+            .count()
+    }
+
+    /// The requests the encoder refused, in report order.
+    pub fn rejected(&self) -> Vec<&'static str> {
+        self.entries()
+            .into_iter()
+            .filter(|(_, accepted)| !*accepted)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// True when every request on this path was accepted.
+    pub fn is_complete(&self) -> bool {
+        self.entries().into_iter().all(|(_, accepted)| accepted)
+    }
+
+    /// Compact description for the pipeline label, e.g. `low-latency 4/4` or
+    /// `low-latency 2/4 (low-latency mode, zero B-frames rejected)`.
+    pub fn label(&self) -> String {
+        let rejected = self.rejected();
+        let total = self.total();
+        if rejected.is_empty() {
+            format!("low-latency {total}/{total}")
+        } else {
+            format!(
+                "low-latency {}/{total} ({} rejected)",
+                self.accepted(),
+                rejected.join(", ")
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fully_applied_latency_report_needs_no_caveat() {
+        let report = MftLatencyReport {
+            hardware: true,
+            low_latency_attribute: true,
+            low_latency_mode: true,
+            no_b_frames: true,
+            rate_control: true,
+        };
+        assert_eq!(report.total(), 4);
+        assert_eq!(report.accepted(), report.total());
+        assert!(report.is_complete());
+        assert_eq!(report.label(), "low-latency 4/4");
+    }
+
+    #[test]
+    fn refused_requests_are_named_in_the_label_and_the_log_list() {
+        // An encoder that ignores both the low-latency mode and the B-frame
+        // count is the exact case that used to be invisible.
+        let report = MftLatencyReport {
+            hardware: true,
+            low_latency_attribute: true,
+            low_latency_mode: false,
+            no_b_frames: false,
+            rate_control: true,
+        };
+        assert_eq!(report.accepted(), 2);
+        assert_eq!(report.total(), 4);
+        assert!(!report.is_complete());
+        assert_eq!(report.rejected(), vec!["low-latency mode", "zero B-frames"]);
+        assert_eq!(
+            report.label(),
+            "low-latency 2/4 (low-latency mode, zero B-frames rejected)"
+        );
+    }
+
+    #[test]
+    fn a_missing_codec_api_reports_only_the_transform_attribute() {
+        // `ICodecAPI` absent: nothing but MF_LOW_LATENCY could be requested.
+        let report = MftLatencyReport {
+            hardware: true,
+            low_latency_attribute: true,
+            ..MftLatencyReport::default()
+        };
+        assert_eq!(report.accepted(), 1);
+        assert_eq!(report.total(), 4);
+        assert_eq!(report.rejected().len(), 3);
+        assert!(report.label().contains("low-latency 1/4"));
+    }
+
+    #[test]
+    fn the_software_fallback_is_never_judged_on_b_frames() {
+        // No B-frame request is made on software, so a false `no_b_frames`
+        // must not read as a refusal: 3/3, not 3/4 with a phantom failure.
+        let report = MftLatencyReport {
+            hardware: false,
+            low_latency_attribute: true,
+            low_latency_mode: true,
+            no_b_frames: false,
+            rate_control: true,
+        };
+        assert_eq!(report.total(), 3);
+        assert_eq!(report.accepted(), 3);
+        assert!(report.is_complete());
+        assert!(report.rejected().is_empty());
+        assert_eq!(report.label(), "low-latency 3/3");
+    }
 
     #[test]
     fn stream_plan_is_peak_constrained_vbr_not_cbr() {

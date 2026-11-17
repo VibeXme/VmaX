@@ -42,8 +42,8 @@
 //! tighter 2..14 ms window and can be substituted one-for-one.
 
 use crate::jitter_buffer::{BufferedFrame, SpscRing};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// `NVENC_INFINITE_GOPLENGTH`.  Any periodic IDR is a latency spike we refuse
@@ -183,10 +183,8 @@ impl P95Jitter {
     /// pipeline; the multiplier covers one reordering event.
     fn target_hold_us(&self) -> u32 {
         let p95 = self.p95_us() as f32;
-        ((MIN_HOLD.as_micros() as f32 + p95 * 1.2) as u32).clamp(
-            MIN_HOLD.as_micros() as u32,
-            MAX_HOLD.as_micros() as u32,
-        )
+        ((MIN_HOLD.as_micros() as f32 + p95 * 1.2) as u32)
+            .clamp(MIN_HOLD.as_micros() as u32, MAX_HOLD.as_micros() as u32)
     }
 
     fn reset(&mut self) {
@@ -386,12 +384,13 @@ mod tests {
         let mut buffer = MicroJitterBuffer::new(Instant::now(), 8);
         for i in 0..120u64 {
             let jitter = if i % 2 == 0 { 0 } else { 60_000 };
-            buffer
-                .estimator
-                .observe(i * 16_667, i * 16_667 + jitter);
+            buffer.estimator.observe(i * 16_667, i * 16_667 + jitter);
         }
         assert!(buffer.estimator.p95_us() >= 30_000);
-        assert_eq!(buffer.estimator.target_hold_us(), MAX_HOLD.as_micros() as u32);
+        assert_eq!(
+            buffer.estimator.target_hold_us(),
+            MAX_HOLD.as_micros() as u32
+        );
     }
 
     #[test]
@@ -419,11 +418,18 @@ mod tests {
         let t0 = Instant::now();
         let mut buffer = MicroJitterBuffer::new(t0, 8);
         assert!(buffer.push(frame(500, t0)));
-        assert_eq!(buffer.next(t0 + Duration::from_millis(20)).map(|f| f.frame_id), Some(500));
+        assert_eq!(
+            buffer
+                .next(t0 + Duration::from_millis(20))
+                .map(|f| f.frame_id),
+            Some(500)
+        );
         buffer.reset_stream();
         assert!(buffer.push(frame(1, t0 + Duration::from_millis(25))));
         assert_eq!(
-            buffer.next(t0 + Duration::from_millis(45)).map(|f| f.frame_id),
+            buffer
+                .next(t0 + Duration::from_millis(45))
+                .map(|f| f.frame_id),
             Some(1)
         );
     }

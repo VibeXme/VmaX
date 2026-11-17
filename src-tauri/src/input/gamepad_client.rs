@@ -188,7 +188,11 @@ fn report_due(
     // After focus loss/disconnect, repeat release snapshots in case the first
     // datagram is lost. Never create a controller for a client that has none.
     let report = reading.or_else(|| previous.map(|_| NEUTRAL))?;
-    let cadence = if reading.is_some() && report != NEUTRAL { POLL_INTERVAL } else { REPORT_INTERVAL };
+    let cadence = if reading.is_some() && report != NEUTRAL {
+        POLL_INTERVAL
+    } else {
+        REPORT_INTERVAL
+    };
     if previous.is_some_and(|(old, sent)| old == report && now - sent < cadence) {
         None
     } else {

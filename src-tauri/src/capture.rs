@@ -256,13 +256,13 @@ pub mod win {
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
         DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_MODE_ROTATION,
-        DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270,
-        DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+        DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
+        DXGI_MODE_ROTATION_ROTATE270, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-        DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1,
-        IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+        DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1,
+        IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     };
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
@@ -529,6 +529,15 @@ pub mod win {
         refinement_requested: bool,
         /// Remaining progressive refinement frames after desktop motion stops
         refinement_frames_left: u8,
+        /// Mouse pointer bitmap, captured separately by Desktop Duplication.
+        pointer_shape: Option<crate::cursor::PointerShape>,
+        /// Pointer position in desktop (native) pixels.
+        pointer_position: (i32, i32),
+        pointer_visible: bool,
+        /// Whether the pointer is drawn into the streamed frame. Off means the
+        /// client draws its own pointer from local input, which is lower
+        /// latency but cannot follow host-side state.
+        pointer_overlay: bool,
     }
 
     unsafe impl Send for DxgiCapturer {}
@@ -862,6 +871,10 @@ pub mod win {
                 static_screen: false,
                 refinement_requested: false,
                 refinement_frames_left: 2,
+                pointer_shape: None,
+                pointer_position: (0, 0),
+                pointer_visible: false,
+                pointer_overlay: true,
             })
         }
 
@@ -887,6 +900,99 @@ pub mod win {
             if let Some(scaler) = self.scaler.as_mut() {
                 scaler.set_sharpness(level);
             }
+        }
+
+        /// Draw (or stop drawing) the mouse pointer into captured frames.
+        ///
+        /// Desktop Duplication never includes the pointer in the desktop image,
+        /// so without this the stream shows a cursor-less desktop while every
+        /// mouse move still pays for a full encode. Turning it off is only
+        /// correct when the client paints its own pointer.
+        pub fn set_pointer_overlay(&mut self, enabled: bool) {
+            self.pointer_overlay = enabled;
+        }
+
+        /// True when the current frame needs re-encoding purely because the
+        /// pointer moved: the desktop itself did not change.
+        pub fn pointer_moved(&self) -> bool {
+            self.pointer_overlay && self.pointer_visible
+        }
+
+        /// Refresh the pointer bitmap and position from the acquired frame.
+        ///
+        /// Must run while the frame is still held: `GetFramePointerShape` is
+        /// only valid between `AcquireNextFrame` and `ReleaseFrame`.
+        fn update_pointer(
+            &mut self,
+            dupl: &IDXGIOutputDuplication,
+            info: &DXGI_OUTDUPL_FRAME_INFO,
+        ) {
+            if info.LastMouseUpdateTime == 0 && info.PointerShapeBufferSize == 0 {
+                return;
+            }
+            self.pointer_position = (
+                info.PointerPosition.Position.x,
+                info.PointerPosition.Position.y,
+            );
+            self.pointer_visible = info.PointerPosition.Visible.as_bool();
+
+            let size = info.PointerShapeBufferSize;
+            if size == 0 {
+                // Position-only update: the bitmap is unchanged.
+                return;
+            }
+            let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            let mut pixels = vec![0u8; size as usize];
+            let mut required = size;
+            let result = unsafe {
+                dupl.GetFramePointerShape(
+                    size,
+                    pixels.as_mut_ptr().cast(),
+                    &mut required,
+                    &mut shape_info,
+                )
+            };
+            if result.is_err() {
+                // Some drivers report a stale size; ask again for the real one.
+                required = 0;
+                if unsafe {
+                    dupl.GetFramePointerShape(
+                        0,
+                        core::ptr::null_mut(),
+                        &mut required,
+                        &mut shape_info,
+                    )
+                }
+                .is_err()
+                    || required == 0
+                {
+                    return;
+                }
+                pixels = vec![0u8; required as usize];
+                if unsafe {
+                    dupl.GetFramePointerShape(
+                        required,
+                        pixels.as_mut_ptr().cast(),
+                        &mut required,
+                        &mut shape_info,
+                    )
+                }
+                .is_err()
+                {
+                    return;
+                }
+            }
+            pixels.truncate((required as usize).min(pixels.len()));
+            let shape = crate::cursor::PointerShape {
+                kind: shape_info.Type,
+                width: shape_info.Width,
+                height: shape_info.Height,
+                pitch: shape_info.Pitch,
+                hotspot_x: shape_info.HotSpot.x,
+                hotspot_y: shape_info.HotSpot.y,
+                pixels,
+            };
+            self.pointer_shape = shape.is_drawable().then_some(shape);
         }
 
         pub fn waiting_for_desktop(&self) -> bool {
@@ -916,7 +1022,11 @@ pub mod win {
             false
         }
 
-        pub fn capture_frame(&mut self, timeout_ms: u32, force_frame: bool) -> Result<bool, String> {
+        pub fn capture_frame(
+            &mut self,
+            timeout_ms: u32,
+            force_frame: bool,
+        ) -> Result<bool, String> {
             if self.duplication.is_none() && !self.reacquire_duplication(Duration::ZERO) {
                 return if self.needs_recovery() {
                     Err("Desktop capture device was removed".into())
@@ -936,6 +1046,7 @@ pub mod win {
             match res {
                 Ok(()) => {
                     let _guard = FrameReleaseGuard(&dupl);
+                    self.update_pointer(&dupl, &frame_info);
                     let desktop_changed = frame_info.AccumulatedFrames > 0
                         || frame_info.TotalMetadataBufferSize > 0
                         || frame_info.LastPresentTime != 0
@@ -944,7 +1055,12 @@ pub mod win {
                         return Ok(self.should_emit_static_frame(force_frame));
                     };
                     if !desktop_changed {
-                        if frame_info.LastMouseUpdateTime != 0 {
+                        // A pointer move only deserves a frame when the pointer
+                        // is part of the picture. Without the overlay the new
+                        // frame would be byte-identical to the last one, so the
+                        // encode — a full 1080p encode per mouse move — is pure
+                        // waste on a host that is already the bottleneck.
+                        if frame_info.LastMouseUpdateTime != 0 && self.pointer_moved() {
                             self.static_screen = false;
                             return Ok(self.has_valid_frame);
                         }
@@ -1161,6 +1277,31 @@ pub mod win {
             }
             unsafe {
                 self.context.Unmap(staging, 0);
+            }
+
+            // Desktop Duplication leaves the pointer out of the desktop image,
+            // so it is composited here — after the frame was scaled to stream
+            // size, and with the pointer position scaled by the same factor so
+            // it lands where the user's cursor actually is.
+            //
+            // A rotated output is skipped: the frame has already been rotated
+            // in the CPU fallback and the pointer would need the same
+            // transform to line up.
+            if self.pointer_overlay
+                && self.pointer_visible
+                && self.rotation == DXGI_MODE_ROTATION_IDENTITY
+                && let Some(shape) = self.pointer_shape.as_ref()
+            {
+                crate::cursor::composite(
+                    dst,
+                    self.encode_width,
+                    self.encode_height,
+                    self.pointer_position.0,
+                    self.pointer_position.1,
+                    self.native_width,
+                    self.native_height,
+                    shape,
+                );
             }
             Ok(())
         }

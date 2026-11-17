@@ -132,9 +132,9 @@ impl FrameCadence {
         self.late_slots = self.late_slots.saturating_add(1);
         let lateness = now.saturating_duration_since(self.next_deadline);
         if lateness >= self.interval {
-            self.skipped_slots =
-                self.skipped_slots
-                    .saturating_add((lateness.as_nanos() / self.interval.as_nanos().max(1)) as u64);
+            self.skipped_slots = self
+                .skipped_slots
+                .saturating_add((lateness.as_nanos() / self.interval.as_nanos().max(1)) as u64);
         }
         self.next_deadline = now + self.interval;
         None
@@ -197,7 +197,10 @@ mod tests {
         }
         assert_eq!(cadence.capture_wait_ms(start), 0);
         // Even a late slot must not block the capture thread.
-        assert_eq!(cadence.capture_wait_ms(start + Duration::from_millis(100)), 0);
+        assert_eq!(
+            cadence.capture_wait_ms(start + Duration::from_millis(100)),
+            0
+        );
     }
 
     #[test]

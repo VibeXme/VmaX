@@ -41,6 +41,7 @@ local.properties
 *.msi
 *.dmg
 *.AppImage
+*.zip
 
 # Agent / tooling scratch directories
 graphify-out

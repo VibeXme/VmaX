@@ -200,7 +200,8 @@ mod android {
 
 #[cfg(target_os = "android")]
 pub use android::{
-    deliver as deliver_android, gamepad as android_gamepad, hevc as android_hevc, main10 as android_main10, refresh_hz as android_refresh_hz,
+    deliver as deliver_android, gamepad as android_gamepad, hevc as android_hevc,
+    main10 as android_main10, refresh_hz as android_refresh_hz,
 };
 
 #[cfg(test)]

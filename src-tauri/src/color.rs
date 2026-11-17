@@ -51,7 +51,11 @@ fn left_sited_chroma_rgb(bgra: &[u8], width: usize, x: usize, y: usize) -> [f32;
     let mut rgb = [0.0; 3];
     let mut weight_sum = 0.0;
     for row in [y, y + 1] {
-        for (col, weight) in [(x.saturating_sub(1), 1.0), (x, 2.0), ((x + 1).min(width - 1), 1.0)] {
+        for (col, weight) in [
+            (x.saturating_sub(1), 1.0),
+            (x, 2.0),
+            ((x + 1).min(width - 1), 1.0),
+        ] {
             let idx = (row * width + col) * 4;
             if let Some(pixel) = bgra.get(idx..idx + 4) {
                 rgb[0] += f32::from(pixel[2]) * weight;
@@ -108,7 +112,8 @@ pub fn bgra_to_p010_bt709(bgra: &[u8], width: usize, height: usize, out: &mut Ve
         for x in 0..w {
             let idx = (y * width + x) * 4;
             if let Some(pixel) = bgra.get(idx..idx + 4) {
-                let y_value = LUMA_R * f32::from(pixel[2]) + LUMA_G * f32::from(pixel[1])
+                let y_value = LUMA_R * f32::from(pixel[2])
+                    + LUMA_G * f32::from(pixel[1])
                     + LUMA_B * f32::from(pixel[0]);
                 let dst = (y * w + x) * 2;
                 y_plane[dst..dst + 2].copy_from_slice(&pack(y_value / 255.0));

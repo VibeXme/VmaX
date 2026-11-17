@@ -1,4 +1,4 @@
-# VmaX engineering audit and release validation
+﻿# VmaX engineering audit and release validation
 
 ## Architecture found
 
@@ -70,8 +70,8 @@ This release keeps the existing native Windows capture and encoder stack. It cha
 - Built both release packages. Android Gradle release lint and assembly passed. Verified the APK signature, ARM64 library and final frontend bundle. No handset was attached for playback testing.
 - 26 core tests passed, including QUIC, raw UDP, reliable input, synthetic audio packets, stale video rejection and relay fallback. The standalone signaling server passed 10 tests.
 - A public relay test joined an authenticated QUIC session and delivered an encrypted synthetic video frame through the tunnel. This did not measure sustained relay playback.
-- The final Windows EXE opened from an empty directory with the final frontend. Two Windows instances on one PC rendered HEVC at 1920×1080 with about 55 FPS over a 12-second sample, 0.52 ms measured transport RTT and zero reported network reassembly drops. This is a loopback-scale network measurement, not end-to-end gameplay latency.
-- In a separate test, the client reported HEVC unavailable and negotiated H.264. It rendered 1920×1080 at about 55 FPS. Gaming-mode disconnect passed with a touch joystick held in both tests. Touch was emulated.
+- The final Windows EXE opened from an empty directory with the final frontend. Two Windows instances on one PC rendered HEVC at 1920Ã—1080 with about 55 FPS over a 12-second sample, 0.52 ms measured transport RTT and zero reported network reassembly drops. This is a loopback-scale network measurement, not end-to-end gameplay latency.
+- In a separate test, the client reported HEVC unavailable and negotiated H.264. It rendered 1920Ã—1080 at about 55 FPS. Gaming-mode disconnect passed with a touch joystick held in both tests. Touch was emulated.
 
 ## Tests requiring real devices
 
@@ -93,6 +93,12 @@ This release keeps the existing native Windows capture and encoder stack. It cha
 4. Add authenticated session resumption for brief outages and network changes. Saved peer reconnection exists, but active sessions do not yet migrate seamlessly between direct and relay paths.
 5. Feed measured decoder backlog, jitter and delivery rate into adaptive bitrate and test adaptive FEC. Add capture/presentation latency, audio underrun and send rate metrics without estimating unavailable values.
 
+**Trap to avoid:** `src-tauri/src/adaptive_bitrate.rs` is a standalone, tested
+reference implementation and is **not wired into a session**. The live controller
+is `GccController` in `src-tauri/src/congestion.rs`, fed by the GC-style
+`FeedbackPacket`. The ramp constants in `adaptive_bitrate.rs` have no runtime
+effect; a latency or recovery fix belongs in `congestion.rs`.
+
 ## Important modified files
 
 - `src-tauri/src/network.rs`, `internet.rs`, `commands.rs` and `input.rs` for routes, queue age, audio selection and input ordering.
@@ -105,8 +111,8 @@ This release keeps the existing native Windows capture and encoder stack. It cha
 
 ## Smoothness and compatibility pass
 
-Goal: a stream that *feels* native — a steady 60 FPS cadence on any device and
-any working connection — instead of a high average frame rate with judder.
+Goal: a stream that *feels* native â€” a steady 60 FPS cadence on any device and
+any working connection â€” instead of a high average frame rate with judder.
 
 ### Host cadence
 
@@ -209,3 +215,88 @@ detail.
   handset. The encoder label in the stream details panel reports which path was
   selected; the new policy is the only difference in the non-NVENC output.
 
+## Pointer pass
+
+Desktop Duplication returns the desktop image **without** the mouse pointer and
+reports it separately, expecting the capturer to draw it. No code in the host
+ever did, so a VmaX stream contained no pointer at all â€” while the viewer hides
+its own cursor whenever "Hardware Cursor" is on. Two consequences:
+
+- the remote desktop had a cursor-less picture, and
+- every mouse move still returned "frame available", so the host ran a full
+  1080p encode of a byte-identical frame for each move.
+
+New `src-tauri/src/cursor.rs` holds the compositing rules, unit-tested on every
+platform, and `capture.rs` feeds it from `DXGI_OUTDUPL_FRAME_INFO`:
+
+- The bitmap is re-read only when `PointerShapeBufferSize` says it changed, and
+  is blended into the BGRA frame inside `read_bgra_into`, so **all three encoder
+  paths** (NVENC, hardware Media Foundation, software) get it from one place.
+- The pointer position is scaled by the same factor as the frame, so the hotspot
+  lands on the true cursor location at any capture resolution.
+- `SHAPE_COLOR`, `SHAPE_MASKED_COLOR` (alpha 0 inverts the desktop, as
+  documented) and `SHAPE_MONOCHROME` (stacked AND/XOR bit masks) are all handled.
+- Off-screen and partially off-screen pointers clip instead of wrapping, which
+  is what a pointer parked on a second monitor produces.
+- Rotated outputs skip compositing rather than draw at the wrong coordinates.
+- With the overlay off, a mouse-only update no longer counts as a frame, so the
+  wasted encode disappears.
+
+"Hardware Cursor" keeps its meaning on both sides: on, the host draws the
+pointer into the video; off, the viewer paints its own from local input.
+
+
+
+## Congestion recovery pass
+
+The live bitrate controller (`GccController`) added a flat **40 kbps per 100 ms**
+when the path was clean, which is 400 kbps/s regardless of the stream rate. At
+20 Mbps one 25% cut - a single Wi-Fi retransmit burst, one browser download
+starting, one microwave oven - needed **12.5 seconds** to undo. At 50 Mbps it
+needed 31. That is the "quality drop" that does not go away.
+
+It was worse than slow. A decrease did not clear the delay samples that caused
+it, so as soon as the 300 ms cooldown expired the same evidence triggered
+another 25% cut, and another. Three of those leave the picture at 42% of a rate
+the link had already recovered to.
+
+### Changes
+
+- **Remembered ceiling.** The controller stores the rate in effect when the path
+  last pushed back. Recovery climbs to it multiplicatively (about 8% per 100 ms:
+  a 25% cut is undone in roughly 400 ms), then probes above it at about 4% per
+  second. The fast zone is where the path has proven itself; the slow zone is
+  where it has not.
+- **Evidence is discarded on a cut.** `DelayGradient::reset()` runs whenever the
+  target is reduced. The trend, the accumulated queue and the overuse state all
+  describe the rate that was just abandoned.
+- **The mark is the lowest recently-failing rate.** It only falls on a failure,
+  and only after five clean seconds above it does it rise to the current rate.
+  That ordering matters: a mark that could move up on a failure would chase an
+  unproven rate, and one that could move down without a failure would ratchet
+  the stream softer on a link that never changed.
+- **A lossless queue cuts 15%, not 25%.** A growing queue with zero drops is the
+  mildest congestion signal there is. The 25% cut and the 500 ms cooldown stay
+  reserved for real packet loss, where the link has already crossed the point
+  that delay probing is safe.
+
+### Latency reporting
+
+The in-stream details panel and the telemetry pill now report **Pipeline**:
+host encode + one-way network + client decode, green at 20 ms or less. It is the
+sum of the only three stages a codec or transport setting can move. Propagation
+delay and display refresh are excluded on purpose: no setting changes them, and
+including them would make the number look like a target the code could miss.
+
+### Verification
+
+- New tests drive the real controller: a 15% cut recovers past 19 Mbps inside a
+  second; a clean path never cuts again; a cut clears the delay trend and
+  records the mark; a failure above the mark never raises it; an unproven high
+  mark collapses to the rate that actually failed.
+- `cargo test --lib`: 206 passed, 0 failed.
+- Relay sessions keep their 35 ms minimum reassembly window, and the delta
+  reassembly window is untouched: both only delay *incomplete* frames, so they
+  affect recovery time rather than steady-state latency.
+- Not verifiable here: the real end-to-end number needs two machines on a real
+  link. The panel now shows it instead of asserting it.

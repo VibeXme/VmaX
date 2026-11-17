@@ -363,7 +363,9 @@ pub const BLIP_WINDOW: Duration = Duration::from_secs(60);
 pub enum SessionPhase {
     Streaming,
     /// No progress on the path; media is paused but the session survives.
-    Interrupted { since: Instant },
+    Interrupted {
+        since: Instant,
+    },
     Ended,
 }
 
@@ -458,12 +460,18 @@ mod tests {
 
     #[test]
     fn same_external_port_is_endpoint_independent() {
-        assert_eq!(classify_nat(Some(40000), Some(40000)), NatBehavior::EndpointIndependent);
+        assert_eq!(
+            classify_nat(Some(40000), Some(40000)),
+            NatBehavior::EndpointIndependent
+        );
     }
 
     #[test]
     fn shifting_external_port_is_symmetric() {
-        assert_eq!(classify_nat(Some(40000), Some(41500)), NatBehavior::Symmetric);
+        assert_eq!(
+            classify_nat(Some(40000), Some(41500)),
+            NatBehavior::Symmetric
+        );
         assert!(NatBehavior::Symmetric.needs_port_prediction());
     }
 
@@ -483,7 +491,11 @@ mod tests {
         assert_eq!(ranked[0].kind, CandidateType::Host);
         assert_eq!(ranked[1].kind, CandidateType::ServerReflexive);
         assert_eq!(ranked[2].kind, CandidateType::Relay);
-        assert!(ranked.windows(2).all(|pair| pair[0].priority >= pair[1].priority));
+        assert!(
+            ranked
+                .windows(2)
+                .all(|pair| pair[0].priority >= pair[1].priority)
+        );
     }
 
     #[test]
@@ -542,10 +554,7 @@ mod tests {
         let relay_a = addr("203.0.113.10:9000");
         let relay_b = addr("203.0.113.11:9000");
         let now = Instant::now();
-        let mut race = RelayRace::new(
-            vec![relay_a, relay_b],
-            Duration::from_millis(400),
-        );
+        let mut race = RelayRace::new(vec![relay_a, relay_b], Duration::from_millis(400));
         race.start(now);
         assert!(race.on_response(relay_b));
         assert!(!race.on_response(relay_a), "first winner must stick");
@@ -585,7 +594,11 @@ mod tests {
         );
         assert!(plan.relay_race_now);
         assert_eq!(plan.predicted.len(), PREDICTED_PORT_COUNT);
-        assert!(plan.predicted.iter().all(|p| p.ip() == addr("203.0.113.9:1").ip()));
+        assert!(
+            plan.predicted
+                .iter()
+                .all(|p| p.ip() == addr("203.0.113.9:1").ip())
+        );
         assert_eq!(plan.ranked[0].kind, CandidateType::Host);
     }
 

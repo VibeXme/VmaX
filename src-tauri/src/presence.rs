@@ -330,22 +330,34 @@ async fn session(app: &AppHandle, cloud: &Cloud) -> Result<Session, String> {
 
 #[tauri::command]
 pub fn cloud_project_url(app: AppHandle) -> Option<String> {
-    Cloud::configured(&app).ok().map(|cloud| cloud.url.to_string())
+    Cloud::configured(&app)
+        .ok()
+        .map(|cloud| cloud.url.to_string())
 }
 
 #[tauri::command]
-pub async fn cloud_configure(app: AppHandle, url: String, publishable_key: String) -> Result<(), String> {
+pub async fn cloud_configure(
+    app: AppHandle,
+    url: String,
+    publishable_key: String,
+) -> Result<(), String> {
     let runtime = app.state::<PresenceState>();
     let _operation = runtime.operation.lock().await;
     if runtime.session.lock().await.is_some() {
         return Err("Sign out before changing the account project".into());
     }
     let cloud = Cloud::new(url.trim(), publishable_key.trim().to_owned())?;
-    cloud.call(reqwest::Method::GET, "/auth/v1/settings", None, None, None).await?;
+    cloud
+        .call(reqwest::Method::GET, "/auth/v1/settings", None, None, None)
+        .await?;
     crate::connections::write_json(
         &crate::commands::app_data_file(&app, "supabase.json")?,
-        &CloudSettings { url: cloud.url.to_string(), publishable_key: cloud.key },
-    ).map_err(|e| e.to_string())?;
+        &CloudSettings {
+            url: cloud.url.to_string(),
+            publishable_key: cloud.key,
+        },
+    )
+    .map_err(|e| e.to_string())?;
     runtime.changed.notify_one();
     Ok(())
 }

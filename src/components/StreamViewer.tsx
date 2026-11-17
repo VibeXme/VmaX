@@ -10,9 +10,11 @@ import {
 } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   Activity,
   ChevronDown,
+  ClipboardCopy,
   Crosshair,
   Gamepad2,
   Gauge,
@@ -38,6 +40,8 @@ import {
   type ResolutionOption,
 } from "../types";
 import { FramePresenter } from "../lib/framePresenter";
+import { DecoderHealth } from "../lib/decodeHealth";
+import { buildDiagnosticsReport, copyDiagnostics } from "../lib/diagnostics";
 import { measureRefreshHz } from "../lib/displayRefresh";
 import { MAX_STREAM_BITRATE_MBPS } from "../config/defaults";
 import { TelemetryBar } from "./TelemetryBar";
@@ -104,6 +108,7 @@ const CODEC_HEVC = 1;
 const CODEC_H264 = 2;
 const CODEC_HEVC_MAIN10 = 3;
 const CODEC_HEVC_444 = 4;
+const CODEC_AV1 = 5;
 const isHevc = (codec: number) => codec === CODEC_HEVC || codec === CODEC_HEVC_MAIN10 || codec === CODEC_HEVC_444;
 // Ordered by preference; older phones and GPUs only answer to a subset of
 // these profile/level strings, so the probe walks the whole list.
@@ -126,6 +131,9 @@ const H264_CANDIDATE_STRINGS = [
   "avc1.42E01E",
   "avc1.42001E",
 ];
+// AV1 Main profile. Level 4.0 covers 1080p60 and 5.0 the 4K tier; the probe
+// walks the list because decoders advertise only the levels they can hold.
+const AV1_CANDIDATE_STRINGS = ["av01.0.08M.08", "av01.0.12M.08", "av01.0.04M.08"];
 const KEYBOARD_SENTINEL = "\u200b";
 let remoteTapId = 0;
 let nextKeyboardCaptureId = 0;
@@ -135,6 +143,32 @@ function hasTauriRuntime(): boolean {
     typeof window !== "undefined" &&
     ("__TAURI_INTERNALS__" in window || "__TAURI__" in window)
   );
+}
+
+/**
+ * AV1 is only negotiated when a *hardware* decoder can hold it: software AV1
+ * at 1080p60 costs far more CPU than the HEVC hardware path it would replace,
+ * which is the opposite of the point. `powerEfficient` is the platform's own
+ * "this runs on a dedicated decode block" answer.
+ */
+async function av1HardwareDecodeAvailable(): Promise<boolean> {
+  const capabilities = navigator.mediaCapabilities;
+  if (!capabilities || typeof capabilities.decodingInfo !== "function") return false;
+  try {
+    const info = await capabilities.decodingInfo({
+      type: "file",
+      video: {
+        contentType: 'video/mp4; codecs="av01.0.08M.08"',
+        width: 1920,
+        height: 1080,
+        bitrate: 20_000_000,
+        framerate: 60,
+      },
+    });
+    return info.supported && info.powerEfficient;
+  } catch {
+    return false;
+  }
 }
 
 async function probeDecoder(candidates: string[]): Promise<VideoDecoderConfig | null> {
@@ -296,6 +330,7 @@ export function StreamViewer({
   const [gamepadError, setGamepadError] = useState<string | null>(null);
   const [bitrateLimit, setBitrateLimit] = useState(MAX_STREAM_BITRATE_MBPS);
   const [bitrateFeedback, setBitrateFeedback] = useState<string | null>(null);
+  const [diagnosticsFeedback, setDiagnosticsFeedback] = useState<string | null>(null);
 
   useEffect(() => {
     if (!hasTauriRuntime()) return;
@@ -668,9 +703,12 @@ export function StreamViewer({
     let awaitingKeyframe = true;
     let lastSubmittedFrame: number | null = null;
     let consecutiveGaps = 0;
-    let decoderBacklogSince: number | null = null;
+    // Decode-everything, drop-at-present: backlog alone never tears down the
+    // reference chain (see lib/decodeHealth.ts).
+    const decoderHealth = new DecoderHealth();
     let receivedFirstFrame = false;
     let lastKeyframeReqMs = -Infinity;
+    let av1Config: VideoDecoderConfig | null = null;
     let hevcConfig: VideoDecoderConfig | null = null;
     let hevcMain10Config: VideoDecoderConfig | null = null;
     let hevc444Config: VideoDecoderConfig | null = null;
@@ -682,7 +720,8 @@ export function StreamViewer({
     let refreshHz = 0;
 
     async function reportCapabilities(includeNative: boolean) {
-      const preferred: Array<"hevc" | "h264"> = [];
+      const preferred: Array<"av1" | "hevc" | "h264"> = [];
+      if (av1Config && !rejectedCodecs.has(CODEC_AV1)) preferred.push("av1");
       if (hevcConfig && !rejectedCodecs.has(CODEC_HEVC)) preferred.push("hevc");
       preferred.push("h264");
       const scale = window.devicePixelRatio || 1;
@@ -778,20 +817,29 @@ export function StreamViewer({
       videoBytes = drawnFrames = decodeSamples = decodeTotalMs = 0;
     }, 500);
 
-    const requestSyncKeyframe = (reason: string) => {
+    /**
+     * Asks the host for a clean reference.
+     *
+     * `lastGoodFrameId` names the newest frame this viewer can still decode.
+     * Naming one lets the host answer with an intra-refresh wave, which costs a
+     * few bits per frame; passing `null` means "no usable reference" and buys a
+     * full IDR, which is a keyframe-sized burst. Only a decoder that has been
+     * rebuilt is in that second state.
+     */
+    const requestSyncKeyframe = (reason: string, lastGoodFrameId: number | null = null) => {
       const now = performance.now();
       if (now - lastKeyframeReqMs < KEYFRAME_REQUEST_COOLDOWN_MS) {
         return;
       }
       lastKeyframeReqMs = now;
-      void invoke("request_keyframe", { reason }).catch(() => {});
+      void invoke("request_keyframe", { reason, lastGoodFrameId }).catch(() => {});
     };
 
     const clearPendingFrames = () => {
       awaitingKeyframe = true;
       lastSubmittedFrame = null;
       consecutiveGaps = 0;
-      decoderBacklogSince = null;
+      decoderHealth.reset();
       decodeSubmittedAt.clear();
       // A frame decoded for the previous reference chain must never be shown
       // after a reset.
@@ -836,8 +884,21 @@ export function StreamViewer({
     const handleDecodeFailure = (codec: number, reason: string) => {
       const failures = (decodeFailures.get(codec) ?? 0) + 1;
       decodeFailures.set(codec, failures);
-      if (codec === CODEC_H264 && failures === 2) {
+      if (codec === CODEC_H264 && failures === 3) {
+        // Two consecutive errors can be a transient (a driver reset while the
+        // display mode changes, a GPU handoff). Downgrading to software decode
+        // on that is a permanent latency increase for the rest of the session,
+        // so it takes three.
         h264Config = { ...h264Config, hardwareAcceleration: "prefer-software" };
+      }
+      if (codec === CODEC_AV1 && failures >= 2) {
+        if (rejectedCodecs.has(codec)) return;
+        rejectedCodecs.add(codec);
+        setStreamNotice("AV1 is struggling here — switching codec…");
+        void reportCapabilities(false).then(() => requestSyncKeyframe(reason)).catch(() => {
+          setStreamNotice("Couldn’t switch away from AV1. Reconnect to retry.");
+        });
+        return;
       }
       if (isHevc(codec) && failures >= 2) {
         if (rejectedCodecs.has(codec)) return;
@@ -883,7 +944,9 @@ export function StreamViewer({
             : hevc)
         : codecByte === CODEC_H264
           ? h264Config
-          : null;
+          : codecByte === CODEC_AV1
+            ? av1Config
+            : null;
       if (!config) {
         handleDecodeFailure(codecByte, "unsupported_codec");
         return null;
@@ -906,6 +969,7 @@ export function StreamViewer({
             decodeSubmittedAt.delete(frame.timestamp);
           }
           decodeFailures.delete(codecByte);
+          decoderHealth.noteProgress(performance.now());
           // The presenter owns the frame now: it is closed after the refresh
           // it is drawn on, or immediately when a newer frame supersedes it.
           presenter.submit(frame);
@@ -936,11 +1000,14 @@ export function StreamViewer({
     };
 
     const startPipeline = async () => {
-      const [fullChroma, main10, hevc, h264, measuredRefreshHz] = await Promise.all([
+      const [fullChroma, main10, hevc, h264, av1, measuredRefreshHz] = await Promise.all([
         probeDecoder(HEVC_444_CANDIDATES),
         probeDecoder(HEVC_MAIN10_CANDIDATE_STRINGS),
         probeDecoder(HEVC_CANDIDATE_STRINGS),
         probeDecoder(H264_CANDIDATE_STRINGS),
+        av1HardwareDecodeAvailable().then((hardware) =>
+          hardware ? probeDecoder(AV1_CANDIDATE_STRINGS) : null,
+        ),
         measureRefreshHz(),
       ]);
       if (cancelled) {
@@ -950,6 +1017,7 @@ export function StreamViewer({
       // the rate this display can actually present.
       refreshHz = measuredRefreshHz;
 
+      av1Config = av1;
       hevcConfig = hevc;
       hevc444Config = fullChroma;
       hevcMain10Config = main10;
@@ -976,13 +1044,15 @@ export function StreamViewer({
         const codecByte = bytes[12];
         const isKeyframe = bytes[13] === 1;
         const codecLabel =
-          codecByte === CODEC_H264
-            ? "H.264"
-            : codecByte === CODEC_HEVC_MAIN10
-              ? "H.265 10-bit"
-              : codecByte === CODEC_HEVC_444
-                ? "H.265 4:4:4"
-                : "H.265";
+          codecByte === CODEC_AV1
+            ? "AV1"
+            : codecByte === CODEC_H264
+              ? "H.264"
+              : codecByte === CODEC_HEVC_MAIN10
+                ? "H.265 10-bit"
+                : codecByte === CODEC_HEVC_444
+                  ? "H.265 4:4:4"
+                  : "H.265";
         // Re-rendering the overlay on every frame is pure main-thread cost at
         // 60-144 FPS; only an actual codec change needs a repaint.
         if (codecLabel !== lastCodecLabel) {
@@ -1006,12 +1076,12 @@ export function StreamViewer({
         }
 
         const gap = lastSubmittedFrame !== null && ((lastSubmittedFrame + 1) >>> 0) !== frameId;
-        const depth = decoder?.decodeQueueSize ?? 0;
         const now = performance.now();
-        decoderBacklogSince = depth >= 2 ? decoderBacklogSince ?? now : null;
-        const stalled =
-          depth > 2 || (decoderBacklogSince !== null && now - decoderBacklogSince >= 45);
-        if (stalled) {
+        // Backlog is only a problem when the decoder is no longer keeping up,
+        // and only a genuine stall justifies tearing down the reference chain.
+        // A three-frame queue is what a burst of datagrams looks like.
+        const verdict = decoderHealth.evaluate(decoder?.decodeQueueSize ?? 0, now);
+        if (verdict.action === "reset") {
           consecutiveGaps = 0;
           resetDecoder();
         } else if (gap && !isKeyframe) {
@@ -1019,19 +1089,17 @@ export function StreamViewer({
           // conceals it and the host heals it with intra-refresh. Freezing the
           // picture until the next IDR on every isolated loss is exactly what
           // makes a healthy 60 FPS stream feel like it stutters, so ask for a
-          // clean reference in the background and keep presenting.
+          // clean reference in the background and keep presenting. Naming the
+          // last good frame keeps that request cheap: the host refreshes the
+          // picture progressively instead of emitting an IDR burst.
           consecutiveGaps++;
-          requestSyncKeyframe("frame_loss");
+          requestSyncKeyframe("frame_loss", lastSubmittedFrame);
           if (consecutiveGaps >= MAX_TOLERATED_GAPS) {
             consecutiveGaps = 0;
             resetDecoder();
           }
         } else {
           consecutiveGaps = 0;
-        }
-        if (awaitingKeyframe && !isKeyframe) {
-          requestSyncKeyframe(stalled ? "decoder_backlog" : "awaiting_sync_frame");
-          return;
         }
 
         const activeDecoder = ensureDecoderForCodec(codecByte);
@@ -1041,7 +1109,11 @@ export function StreamViewer({
 
         if (awaitingKeyframe) {
           if (!isKeyframe) {
-            requestSyncKeyframe("awaiting_initial_idr");
+            // Nothing in this decoder can be decoded until a keyframe lands, so
+            // this request must be for an IDR, not a refresh wave.
+            requestSyncKeyframe(
+              verdict.reason ? `decoder_${verdict.reason}` : "awaiting_sync_frame",
+            );
             return;
           }
           awaitingKeyframe = false;
@@ -1317,6 +1389,56 @@ export function StreamViewer({
     }
   }
 
+  /**
+   * Builds and copies the plain-text diagnostics block. Everything it reports
+   * is what the user is already looking at in this panel, plus the encoder
+   * report the host attaches to the pipeline label.
+   */
+  async function copyStreamDiagnostics() {
+    setDiagnosticsFeedback(null);
+    let version: string | null = null;
+    try {
+      version = await getVersion();
+    } catch {
+      version = null;
+    }
+    const canvas = canvasRef.current;
+    const report = buildDiagnosticsReport(
+      {
+        pipelineLabel: parsecFormatString,
+        codec: activeCodecLabel,
+        requestedResolution: resolution,
+        decodedWidth: streamSize?.w ?? dims.width,
+        decodedHeight: streamSize?.h ?? dims.height,
+        displayWidth: canvas?.clientWidth,
+        displayHeight: canvas?.clientHeight,
+        fps: displayFps ?? null,
+        bitrateMbps: displayBitrateMbps,
+        rttMs: pingMs,
+        networkMs: displayNetworkMs,
+        packetLossPct,
+        decodeMs: displayDecodeMs,
+        encodeMs: displayEncodeMs,
+        presentIntervalMs: playback?.intervalMs ?? null,
+        presentJitterMs: playback?.jitterMs ?? null,
+        supersededFrames: playback?.superseded ?? null,
+        transport: pathLabel,
+        nativePath: nativeVideo,
+        sharpness: viewerSharpness,
+      },
+      {
+        version,
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : undefined,
+        platform: typeof navigator !== "undefined" ? navigator.platform : undefined,
+        devicePixelRatio: typeof window !== "undefined" ? window.devicePixelRatio : undefined,
+      },
+    );
+    const copied = await copyDiagnostics(report);
+    setDiagnosticsFeedback(
+      copied ? "Diagnostics copied to the clipboard" : "Could not copy the diagnostics",
+    );
+  }
+
   const hideCursor = !hardwareCursor || pointerLocked;
   const touchButton =
     "inline-flex min-h-11 items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-950 px-3.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800";
@@ -1333,6 +1455,13 @@ export function StreamViewer({
       : pingMs > 0
         ? pingMs / 2.0
         : null;
+  // Everything VmaX itself controls on the way to the glass: host encode, the
+  // one-way trip, and client decode.  Propagation and display refresh are not
+  // in here because no encoder setting can shorten them.
+  const displayPipelineMs =
+    displayEncodeMs !== null && displayDecodeMs !== null && displayNetworkMs !== null
+      ? displayEncodeMs + displayDecodeMs + displayNetworkMs
+      : null;
   const displayFps = nativeVideo ? nativeFps : playback?.fps;
   const displayBitrateMbps =
     parsecTelemetry?.bitrateMbps ?? playback?.videoMbps ?? 0;
@@ -1501,6 +1630,12 @@ export function StreamViewer({
                 </span>
                 <span className="stream-summary">
                   Network {displayNetworkMs !== null ? `${displayNetworkMs.toFixed(2)}ms` : "—"}
+                </span>
+                <span
+                  className={`stream-summary ${displayPipelineMs !== null && displayPipelineMs <= 20 ? "text-emerald-300" : ""}`}
+                  title="Encode + one-way network + decode"
+                >
+                  Pipeline {displayPipelineMs !== null ? `${displayPipelineMs.toFixed(2)}ms` : "—"}
                 </span>
                 <span className="stream-summary stream-summary-video">
                   Bitrate {displayBitrateMbps.toFixed(2)}Mbps · {displayFps ?? "—"} FPS
@@ -1673,6 +1808,13 @@ export function StreamViewer({
                 >
                   {displayNetworkMs !== null ? `${displayNetworkMs.toFixed(2)} ms` : "—"}
                 </dd>
+                <dt className="text-zinc-500">Pipeline</dt>
+                <dd
+                  title="Encode + one-way network + decode. Everything VmaX controls; display refresh and propagation are extra"
+                  className={`tabular-nums font-semibold ${displayPipelineMs !== null && displayPipelineMs <= 20 ? "text-emerald-300" : "text-white"}`}
+                >
+                  {displayPipelineMs !== null ? `${displayPipelineMs.toFixed(2)} ms` : "—"}
+                </dd>
                 <dt className="text-zinc-500">Bitrate</dt>
                 <dd className="tabular-nums font-semibold text-white">
                   {`${displayBitrateMbps.toFixed(2)} Mbps`}
@@ -1699,6 +1841,18 @@ export function StreamViewer({
                   {packetLossPct !== undefined ? `${packetLossPct.toFixed(1)}%` : "—"}
                 </dd>
               </dl>
+              <button
+                type="button"
+                className="vmax-secondary mt-1 inline-flex w-full items-center justify-center gap-1.5"
+                onClick={() => void copyStreamDiagnostics()}
+              >
+                <ClipboardCopy className="h-3.5 w-3.5" /> Copy diagnostics
+              </button>
+              {diagnosticsFeedback && (
+                <p role="status" className="font-mono text-[10px] text-zinc-400">
+                  {diagnosticsFeedback}
+                </p>
+              )}
               <form className="mt-2 flex flex-wrap items-center gap-2 text-xs" onSubmit={(event) => {
                 event.preventDefault();
                 void applyBitrateLimit(bitrateLimit);

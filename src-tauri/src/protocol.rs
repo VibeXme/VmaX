@@ -101,6 +101,9 @@ pub enum VideoCodec {
     HevcMain10 = 3,
     #[serde(rename = "hevc_444")]
     Hevc444 = 4,
+    /// AV1 Main profile (8-bit 4:2:0). Optional: only negotiated when both the
+    /// host encoder and the client decoder say they can handle it.
+    Av1 = 5,
 }
 
 impl VideoCodec {
@@ -110,6 +113,7 @@ impl VideoCodec {
             2 => Some(Self::H264),
             3 => Some(Self::HevcMain10),
             4 => Some(Self::Hevc444),
+            5 => Some(Self::Av1),
             _ => None,
         }
     }
@@ -173,11 +177,12 @@ impl VideoChunkHeader {
             ]),
             chunk_idx: u16::from_be_bytes([buf[20], buf[21]]),
             total_data_chunks: u16::from_be_bytes([buf[22], buf[23]]),
-            meta: crate::telemetry::FrameTelemetry::decode(&buf[24..VIDEO_HEADER_LEN])
-                .ok_or(ProtocolError::Truncated {
+            meta: crate::telemetry::FrameTelemetry::decode(&buf[24..VIDEO_HEADER_LEN]).ok_or(
+                ProtocolError::Truncated {
                     expected: VIDEO_HEADER_LEN,
                     actual: buf.len(),
-                })?,
+                },
+            )?,
         };
         Ok((header, &buf[VIDEO_HEADER_LEN..]))
     }
@@ -861,19 +866,18 @@ mod fec_tests {
         for data_chunks in 1..=25 {
             let payload = vec![1; data_chunks * (1_200 - VIDEO_HEADER_LEN - 2)];
             let legacy = packetize_video_frame(1, 0, false, &payload, 1_200, 5).unwrap();
-            let upgraded =
-                packetize_video(
-                    VideoCodec::Hevc,
-                    1,
-                    0,
-                    false,
-                    &payload,
-                    1_200,
-                    10,
-                    true,
-                    crate::telemetry::FrameTelemetry::default(),
-                )
-                .unwrap();
+            let upgraded = packetize_video(
+                VideoCodec::Hevc,
+                1,
+                0,
+                false,
+                &payload,
+                1_200,
+                10,
+                true,
+                crate::telemetry::FrameTelemetry::default(),
+            )
+            .unwrap();
             assert_eq!(legacy.len(), upgraded.len());
             assert_eq!(
                 legacy.iter().map(Bytes::len).sum::<usize>(),

@@ -44,11 +44,93 @@ pub fn is_annex_b_keyframe(codec: VideoCodec, data: &[u8]) -> bool {
                         return true;
                     }
                 }
+                // AV1 has no start codes: see `is_av1_keyframe`.
+                VideoCodec::Av1 => return false,
             }
         }
         i = nalu_idx + 1;
     }
     false
+}
+
+/// Reads an AV1 `leb128` length, returning the value and the byte after it.
+fn read_leb128(data: &[u8], mut index: usize) -> Option<(usize, usize)> {
+    let mut value = 0usize;
+    let mut shift = 0u32;
+    loop {
+        let byte = *data.get(index)?;
+        index += 1;
+        value |= usize::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, index));
+        }
+        shift += 7;
+        if shift > 28 {
+            return None;
+        }
+    }
+}
+
+/// True when an AV1 temporal unit starts with a shown key frame.
+///
+/// AV1 is a length-delimited OBU stream, not Annex-B, so the H.26x NAL scan
+/// cannot see it. Only the first frame-header OBU matters: `show_existing_frame`
+/// reuses an earlier picture, otherwise the two bits that follow are
+/// `frame_type`, and `KEY_FRAME` is zero.
+pub fn is_av1_keyframe(data: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < data.len() {
+        let header = data[index];
+        if header & 0x80 != 0 {
+            // Forbidden bit set: not an OBU stream this parser understands.
+            return false;
+        }
+        let obu_type = (header >> 3) & 0x0F;
+        let has_extension = header & 0x04 != 0;
+        let has_size = header & 0x02 != 0;
+        let mut cursor = index + 1;
+        if has_extension {
+            cursor += 1;
+        }
+        let size = if has_size {
+            match read_leb128(data, cursor) {
+                Some((value, next)) => {
+                    cursor = next;
+                    value
+                }
+                None => return false,
+            }
+        } else {
+            0
+        };
+        match obu_type {
+            // OBU_FRAME_HEADER / OBU_FRAME: the picture type lives here.
+            3 | 6 => {
+                let Some(first) = data.get(cursor) else {
+                    return false;
+                };
+                if first & 0x80 != 0 {
+                    return false;
+                }
+                return (first >> 5) & 0x03 == 0;
+            }
+            // Temporal delimiter, sequence header, metadata, padding: skip.
+            _ => {}
+        }
+        if !has_size {
+            return false;
+        }
+        index = cursor.saturating_add(size);
+    }
+    false
+}
+
+/// True when an access unit carries a key frame, for any codec the host emits.
+pub fn is_keyframe(codec: VideoCodec, data: &[u8]) -> bool {
+    match codec {
+        VideoCodec::Av1 => is_av1_keyframe(data),
+        _ => is_annex_b_keyframe(codec, data),
+    }
 }
 
 /// True BT.709 Full-Range (0–255) BGRA8 -> NV12 conversion with 2x2 box-filtered chroma.
@@ -62,17 +144,18 @@ pub fn bgra_to_nv12(bgra: &[u8], width: usize, height: usize, nv12_out: &mut Vec
 
 #[cfg(target_os = "windows")]
 pub mod win {
-    use super::{EncodedAccessUnit, EncoderModePreference, bgra_to_nv12, is_annex_b_keyframe};
+    use super::{EncodedAccessUnit, EncoderModePreference, bgra_to_nv12, is_keyframe};
     use crate::bitrate::FramePacing;
     use crate::capture::win::{
-        DxgiCapturer, NVIDIA_VENDOR_ID, VideoScaler, create_bgra_texture, create_capture_texture, create_texture,
-        open_nvidia_d3d11_device,
+        DxgiCapturer, NVIDIA_VENDOR_ID, VideoScaler, create_bgra_texture, create_capture_texture,
+        create_texture, open_nvidia_d3d11_device,
     };
     use crate::protocol::VideoCodec;
     use core::ffi::c_void;
     use mini_nvcodec::guids::{
-        NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_H264_PROFILE_HIGH_GUID,
-        NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_PRESET_P1_GUID,
+        NV_ENC_AV1_PROFILE_MAIN_GUID, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID,
+        NV_ENC_CODEC_HEVC_GUID, NV_ENC_H264_PROFILE_HIGH_GUID, NV_ENC_HEVC_PROFILE_FREXT_GUID,
+        NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_PRESET_P1_GUID,
         NV_ENC_PRESET_P3_GUID,
     };
     use mini_nvcodec::nvenc_sys::*;
@@ -81,7 +164,7 @@ pub mod win {
     use std::sync::Once;
     use std::time::Instant;
     use tracing::warn;
-    use windows::Win32::Graphics::Direct3D::{ID3DInclude, Fxc::D3DCompile};
+    use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DInclude};
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_UNORDERED_ACCESS, D3D11_TEX2D_UAV1, D3D11_UAV_DIMENSION_TEXTURE2D,
         D3D11_UNORDERED_ACCESS_VIEW_DESC1, D3D11_UNORDERED_ACCESS_VIEW_DESC1_0,
@@ -89,9 +172,9 @@ pub mod win {
         ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
-        DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
+        DXGI_FORMAT_AYUV, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_UNORM,
+        DXGI_FORMAT_R16G16_UNORM,
     };
     use windows::Win32::Media::MediaFoundation::{
         CODECAPI_AVEncCommonBufferSize, CODECAPI_AVEncCommonMaxBitRate,
@@ -99,19 +182,18 @@ pub mod win {
         CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncH264CABACEnable,
         CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
         CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-        IMFMediaBuffer, IMFSample, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
-        MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-        MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
-        MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_LOW_LATENCY,
-        MF_VERSION,
-        MFNominalRange_0_255, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
-        MFVideoTransferMatrix_BT709, MFCreateMediaType,
-        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_NOSOCKET, MFStartup,
-        MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE,
-        MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH,
-        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-        MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
-        MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+        IMFMediaBuffer, IMFSample, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_LOW_LATENCY,
+        MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+        MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+        MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_VERSION,
+        MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+        MFNominalRange_0_255, MFSTARTUP_NOSOCKET, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+        MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+        MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO,
+        MFTEnumEx, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
+        MFVideoInterlace_Progressive, MFVideoPrimaries_BT709, MFVideoTransFunc_709,
+        MFVideoTransferMatrix_BT709,
     };
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::Win32::System::Variant::{
@@ -201,6 +283,20 @@ pub mod win {
                 h264.set_repeatSPSPPS(u32::from(plan.repeat_sps_pps));
                 h264.h264VUIParameters = vui_params(vui);
             }
+            VideoCodec::Av1 => {
+                let av1 = unsafe { &mut encode_config.encodeCodecConfig.av1Config };
+                av1.maxNumRefFramesInDPB = 1;
+                av1.numFwdRefs = NV_ENC_NUM_REF_FRAMES::REF_1;
+                av1.numBwdRefs = NV_ENC_NUM_REF_FRAMES::REF_1;
+                av1.set_repeatSeqHdr(u32::from(plan.repeat_sps_pps));
+                // AV1 signals colour on the config, not through a VUI struct.
+                av1.colorPrimaries = NV_ENC_VUI_COLOR_PRIMARIES(i32::from(vui.colour_primaries));
+                av1.transferCharacteristics =
+                    NV_ENC_VUI_TRANSFER_CHARACTERISTIC(i32::from(vui.transfer_characteristics));
+                av1.matrixCoefficients =
+                    NV_ENC_VUI_MATRIX_COEFFS(i32::from(vui.matrix_coefficients));
+                av1.colorRange = u32::from(vui.video_full_range);
+            }
         }
     }
 
@@ -284,7 +380,9 @@ pub mod win {
                 for preset in presets {
                     match NvencD3d11Encoder::new(capturer, codec, fps, bitrate_bps, preset, nvenc) {
                         Ok(enc) => return Ok(Box::new(enc)),
-                        Err(e) => warn!(?codec, error = %e, "NVENC init failed, trying next option"),
+                        Err(e) => {
+                            warn!(?codec, error = %e, "NVENC init failed, trying next option")
+                        }
                     }
                 }
             }
@@ -373,33 +471,65 @@ pub mod win {
             let device3 = device.cast::<ID3D11Device3>().map_err(|e| e.to_string())?;
             let (format, view_formats, entry) = match codec {
                 VideoCodec::Hevc444 => (
-                    DXGI_FORMAT_AYUV, [None, None, Some(DXGI_FORMAT_R8G8B8A8_UNORM)], windows_core::s!("ayuv"),
+                    DXGI_FORMAT_AYUV,
+                    [None, None, Some(DXGI_FORMAT_R8G8B8A8_UNORM)],
+                    windows_core::s!("ayuv"),
                 ),
                 VideoCodec::HevcMain10 => (
-                    DXGI_FORMAT_P010, [Some(DXGI_FORMAT_R16_UNORM), Some(DXGI_FORMAT_R16G16_UNORM), None], windows_core::s!("p010"),
+                    DXGI_FORMAT_P010,
+                    [
+                        Some(DXGI_FORMAT_R16_UNORM),
+                        Some(DXGI_FORMAT_R16G16_UNORM),
+                        None,
+                    ],
+                    windows_core::s!("p010"),
                 ),
                 _ => (
-                    DXGI_FORMAT_NV12, [Some(DXGI_FORMAT_R8_UNORM), Some(DXGI_FORMAT_R8G8_UNORM), None], windows_core::s!("nv12"),
+                    DXGI_FORMAT_NV12,
+                    [
+                        Some(DXGI_FORMAT_R8_UNORM),
+                        Some(DXGI_FORMAT_R8G8_UNORM),
+                        None,
+                    ],
+                    windows_core::s!("nv12"),
                 ),
             };
             let output = create_texture(
-                device, width, height, format, false, D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+                device,
+                width,
+                height,
+                format,
+                false,
+                D3D11_BIND_UNORDERED_ACCESS.0 as u32,
             )?;
             let mut planes = [None, None, None];
             for (index, format) in view_formats.into_iter().enumerate() {
                 let Some(format) = format else { continue };
-                let plane = if codec == VideoCodec::Hevc444 { 0 } else { index as u32 };
+                let plane = if codec == VideoCodec::Hevc444 {
+                    0
+                } else {
+                    index as u32
+                };
                 let desc = D3D11_UNORDERED_ACCESS_VIEW_DESC1 {
                     Format: format,
                     ViewDimension: D3D11_UAV_DIMENSION_TEXTURE2D,
                     Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC1_0 {
-                        Texture2D: D3D11_TEX2D_UAV1 { MipSlice: 0, PlaneSlice: plane },
+                        Texture2D: D3D11_TEX2D_UAV1 {
+                            MipSlice: 0,
+                            PlaneSlice: plane,
+                        },
                     },
                 };
                 let mut view = None;
-                unsafe { device3.CreateUnorderedAccessView1(&output, Some(&desc), Some(&mut view)) }
-                    .map_err(|e| format!("YUV plane {index} UAV: {e}"))?;
-                planes[index] = Some(view.ok_or("No YUV UAV")?.cast().map_err(|e| e.to_string())?);
+                unsafe {
+                    device3.CreateUnorderedAccessView1(&output, Some(&desc), Some(&mut view))
+                }
+                .map_err(|e| format!("YUV plane {index} UAV: {e}"))?;
+                planes[index] = Some(
+                    view.ok_or("No YUV UAV")?
+                        .cast()
+                        .map_err(|e| e.to_string())?,
+                );
             }
             let mut src = None;
             unsafe { device.CreateShaderResourceView(source, None, Some(&mut src)) }
@@ -408,25 +538,63 @@ pub mod win {
             let mut code = None;
             unsafe {
                 D3DCompile(
-                    source_code.as_ptr().cast(), source_code.len(), windows_core::s!("nv12_csc.hlsl"),
-                    None, None::<&ID3DInclude>, entry, windows_core::s!("cs_5_0"), 0, 0, &mut code, None,
+                    source_code.as_ptr().cast(),
+                    source_code.len(),
+                    windows_core::s!("nv12_csc.hlsl"),
+                    None,
+                    None::<&ID3DInclude>,
+                    entry,
+                    windows_core::s!("cs_5_0"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
                 )
-            }.map_err(|e| format!("YUV compute shader compilation: {e}"))?;
+            }
+            .map_err(|e| format!("YUV compute shader compilation: {e}"))?;
             let code = code.ok_or("No YUV compute bytecode")?;
-            let bytecode = unsafe { core::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) };
+            let bytecode = unsafe {
+                core::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                )
+            };
             let mut shader = None;
-            unsafe { device.CreateComputeShader(bytecode, None, Some(&mut shader)) }.map_err(|e| e.to_string())?;
-            Ok((output, Self::Compute { shader: shader.ok_or("No YUV compute shader")?, src: [src], planes }))
+            unsafe { device.CreateComputeShader(bytecode, None, Some(&mut shader)) }
+                .map_err(|e| e.to_string())?;
+            Ok((
+                output,
+                Self::Compute {
+                    shader: shader.ok_or("No YUV compute shader")?,
+                    src: [src],
+                    planes,
+                },
+            ))
         }
 
-        fn convert(&self, context: &ID3D11DeviceContext, source: &ID3D11Texture2D, width: u32, height: u32) -> Result<(), String> {
+        fn convert(
+            &self,
+            context: &ID3D11DeviceContext,
+            source: &ID3D11Texture2D,
+            width: u32,
+            height: u32,
+        ) -> Result<(), String> {
             match self {
-                Self::Compute { shader, src, planes } => unsafe {
+                Self::Compute {
+                    shader,
+                    src,
+                    planes,
+                } => unsafe {
                     context.CSSetShader(shader, None);
                     context.CSSetShaderResources(0, Some(src));
                     context.CSSetUnorderedAccessViews(0, 3, Some(planes.as_ptr()), None);
                     context.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
-                    context.CSSetUnorderedAccessViews(0, 3, Some([None, None, None].as_ptr()), None);
+                    context.CSSetUnorderedAccessViews(
+                        0,
+                        3,
+                        Some([None, None, None].as_ptr()),
+                        None,
+                    );
                     context.CSSetShaderResources(0, Some(&[None]));
                     context.CSSetShader(None, None);
                     Ok(())
@@ -473,19 +641,31 @@ pub mod win {
             let full_chroma = codec == VideoCodec::Hevc444;
             let width = capturer.encode_width;
             let height = capturer.encode_height;
-            let (yuv_texture, yuv_converter) = match YuvConverter::compute(&nv_device, &input_texture, width, height, codec) {
-                Ok(conversion) => conversion,
-                Err(err) if !full_chroma => {
-                    tracing::debug!(%err, "Using D3D11 video processor for full-range BT.709");
-                    let format = if main10 { DXGI_FORMAT_P010 } else { DXGI_FORMAT_NV12 };
-                    let texture = create_capture_texture(&nv_device, width, height, false, format)?;
-                    let processor = VideoScaler::new(
-                        &nv_device, &nv_context, &texture, width, height, width, height,
-                    )?;
-                    (texture, YuvConverter::VideoProcessor(processor))
-                }
-                Err(err) => return Err(err),
-            };
+            let (yuv_texture, yuv_converter) =
+                match YuvConverter::compute(&nv_device, &input_texture, width, height, codec) {
+                    Ok(conversion) => conversion,
+                    Err(err) if !full_chroma => {
+                        tracing::debug!(%err, "Using D3D11 video processor for full-range BT.709");
+                        let format = if main10 {
+                            DXGI_FORMAT_P010
+                        } else {
+                            DXGI_FORMAT_NV12
+                        };
+                        let texture =
+                            create_capture_texture(&nv_device, width, height, false, format)?;
+                        let processor = VideoScaler::new(
+                            &nv_device,
+                            &nv_context,
+                            &texture,
+                            width,
+                            height,
+                            width,
+                            height,
+                        )?;
+                        (texture, YuvConverter::VideoProcessor(processor))
+                    }
+                    Err(err) => return Err(err),
+                };
             let mut encoder: *mut c_void = core::ptr::null_mut();
             let mut negotiated: Option<NvencApiVersion> = None;
 
@@ -518,8 +698,11 @@ pub mod win {
             };
 
             let codec_guid = match codec {
-                VideoCodec::Hevc | VideoCodec::HevcMain10 | VideoCodec::Hevc444 => NV_ENC_CODEC_HEVC_GUID,
+                VideoCodec::Hevc | VideoCodec::HevcMain10 | VideoCodec::Hevc444 => {
+                    NV_ENC_CODEC_HEVC_GUID
+                }
                 VideoCodec::H264 => NV_ENC_CODEC_H264_GUID,
+                VideoCodec::Av1 => NV_ENC_CODEC_AV1_GUID,
             };
             if main10 {
                 let mut caps: NV_ENC_CAPS_PARAM = unsafe { core::mem::zeroed() };
@@ -573,20 +756,21 @@ pub mod win {
 
             let mut encode_config = preset_cfg.presetCfg;
             encode_config.version = rung.config_ver();
-            let mut intra_refresh =
-                crate::encoder_recovery::IntraRefreshConfig {
-                    enabled: settings.intra_refresh,
-                    period_frames: settings.refresh_period.clamp(2, 600),
-                    refresh_frames: settings.refresh_frames.clamp(1, 60),
-                }.sanitized();
+            let mut intra_refresh = crate::encoder_recovery::IntraRefreshConfig {
+                enabled: settings.intra_refresh,
+                period_frames: settings.refresh_period.clamp(2, 600),
+                refresh_frames: settings.refresh_frames.clamp(1, 60),
+            }
+            .sanitized();
             let mut caps: NV_ENC_CAPS_PARAM = unsafe { core::mem::zeroed() };
             caps.version = rung.caps_param_ver();
             caps.capsToQuery = NV_ENC_CAPS::SUPPORT_INTRA_REFRESH;
             let mut supported = 0;
-            intra_refresh.enabled = intra_refresh.enabled &&
-                unsafe { (api.nvEncGetEncodeCaps)(encoder, codec_guid, &mut caps, &mut supported) }
-                    == NVENCSTATUS::SUCCESS
-                    && supported != 0;
+            intra_refresh.enabled = intra_refresh.enabled
+                && unsafe {
+                    (api.nvEncGetEncodeCaps)(encoder, codec_guid, &mut caps, &mut supported)
+                } == NVENCSTATUS::SUCCESS
+                && supported != 0;
 
             encode_config.gopLength = u32::MAX;
             encode_config.frameIntervalP = 1; // Strict IPP, zero B-frames
@@ -614,7 +798,10 @@ pub mod win {
                     };
                     unsafe {
                         if full_chroma {
-                            encode_config.encodeCodecConfig.hevcConfig.set_chromaFormatIDC(3);
+                            encode_config
+                                .encodeCodecConfig
+                                .hevcConfig
+                                .set_chromaFormatIDC(3);
                         }
                         if main10 {
                             encode_config.encodeCodecConfig.hevcConfig.inputBitDepth =
@@ -659,6 +846,23 @@ pub mod win {
                             .set_repeatSPSPPS(1);
                     }
                 }
+                VideoCodec::Av1 => {
+                    encode_config.profileGUID = NV_ENC_AV1_PROFILE_MAIN_GUID;
+                    unsafe {
+                        let av1 = &mut encode_config.encodeCodecConfig.av1Config;
+                        // Main profile is 8-bit 4:2:0; NVENC has no 10-bit or
+                        // 4:4:4 AV1 encoder, so this path is exact, not lossy.
+                        av1.set_chromaFormatIDC(1);
+                        av1.idrPeriod = u32::MAX;
+                        av1.set_enableIntraRefresh(u32::from(intra_refresh.enabled));
+                        av1.intraRefreshPeriod = intra_refresh.period_frames;
+                        av1.intraRefreshCnt = intra_refresh.refresh_frames;
+                        // A client that joins or recovers mid-stream needs the
+                        // sequence header in band, exactly like the repeat
+                        // VPS/SPS path on the HEVC and H.264 branches.
+                        av1.set_repeatSeqHdr(1);
+                    }
+                }
             }
 
             let mut init_params: NV_ENC_INITIALIZE_PARAMS = unsafe { core::mem::zeroed() };
@@ -678,7 +882,9 @@ pub mod win {
             init_params.tuningInfo = tuning;
 
             let mut plan = crate::nvenc::NvencPlan::streaming(
-                u32::from(fps), bitrate_bps, settings.preset == 3,
+                u32::from(fps),
+                bitrate_bps,
+                settings.preset == 3,
             );
             plan.rate_control.vbr = settings.vbr;
             plan.rate_control.vbv_bits = frame_bits;
@@ -762,6 +968,7 @@ pub mod win {
                 VideoCodec::HevcMain10 => "H.265 10-bit",
                 VideoCodec::Hevc444 => "H.265",
                 VideoCodec::H264 => "H.264",
+                VideoCodec::Av1 => "AV1",
             };
             let chroma = if full_chroma { "4:4:4" } else { "4:2:0" };
             let pipeline_label = format!(
@@ -793,7 +1000,10 @@ pub mod win {
                 intra_refresh,
                 cpu_staging: Vec::new(),
                 last_encode_ms: 0.0,
-                settings: crate::nvenc::NvencSettings { aq_strength: plan.rate_control.aq_strength, ..settings },
+                settings: crate::nvenc::NvencSettings {
+                    aq_strength: plan.rate_control.aq_strength,
+                    ..settings
+                },
                 plan,
                 refine_frames: 0,
             })
@@ -836,7 +1046,9 @@ pub mod win {
 
         fn set_bitrate_bps(&mut self, bitrate_bps: u32) -> Result<(), String> {
             let mut cfg_copy = self.encode_config;
-            let frame_bits = self.settings.vbv_bits(bitrate_bps, self.init_params.frameRateNum);
+            let frame_bits = self
+                .settings
+                .vbv_bits(bitrate_bps, self.init_params.frameRateNum);
             cfg_copy.rcParams.averageBitRate = bitrate_bps;
             cfg_copy.rcParams.maxBitRate = self.settings.max_bitrate(bitrate_bps);
             cfg_copy.rcParams.vbvBufferSize = frame_bits;
@@ -920,7 +1132,12 @@ pub mod win {
                 }
             }
 
-            self.yuv_converter.convert(&self.nv_context, &self.input_texture, self.width, self.height)?;
+            self.yuv_converter.convert(
+                &self.nv_context,
+                &self.input_texture,
+                self.width,
+                self.height,
+            )?;
 
             let mut map: NV_ENC_MAP_INPUT_RESOURCE = unsafe { core::mem::zeroed() };
             map.version = self.rung.map_input_resource_ver();
@@ -944,7 +1161,13 @@ pub mod win {
             pic.pictureStruct = NV_ENC_PIC_STRUCT::FRAME;
 
             if self.force_idr_next {
-                pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+                // AV1 has no SPS/PPS pair to emit: `repeatSeqHdr` already puts
+                // the sequence header OBU in front of every key frame.
+                pic.encodePicFlags = if self.codec == VideoCodec::Av1 {
+                    NV_ENC_PIC_FLAG_FORCEIDR
+                } else {
+                    NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
+                };
                 self.force_idr_next = false;
             } else if self.force_ir_frames > 0 {
                 let frames = core::mem::take(&mut self.force_ir_frames);
@@ -959,12 +1182,16 @@ pub mod win {
                             .h264PicParams
                             .forceIntraRefreshWithFrameCnt = frames;
                     }
+                    VideoCodec::Av1 => {
+                        pic.codecPicParams
+                            .av1PicParams
+                            .forceIntraRefreshWithFrameCnt = frames;
+                    }
                 }
             }
 
             let enc_status = unsafe { (self.api.nvEncEncodePicture)(self.encoder, &mut pic) };
-            let _ =
-                unsafe { (self.api.nvEncUnmapInputResource)(self.encoder, map.mappedResource) };
+            let _ = unsafe { (self.api.nvEncUnmapInputResource)(self.encoder, map.mappedResource) };
 
             if enc_status == NVENCSTATUS::ERR_NEED_MORE_INPUT {
                 return Ok(None);
@@ -982,7 +1209,10 @@ pub mod win {
                 return Err(format!("nvEncLockBitstream failed: {lock_status:?}"));
             }
 
-            let encode_us = t_encode_start.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+            let encode_us = t_encode_start
+                .elapsed()
+                .as_micros()
+                .min(u128::from(u32::MAX)) as u32;
             let slice = unsafe {
                 core::slice::from_raw_parts(
                     lock.bitstreamBufferPtr as *const u8,
@@ -990,8 +1220,8 @@ pub mod win {
                 )
             };
             let payload = slice.to_vec();
-            let pic_is_key = lock.pictureType == NV_ENC_PIC_TYPE::IDR
-                || is_annex_b_keyframe(self.codec, &payload);
+            let pic_is_key =
+                lock.pictureType == NV_ENC_PIC_TYPE::IDR || is_keyframe(self.codec, &payload);
 
             let _ = unsafe { (self.api.nvEncUnlockBitstream)(self.encoder, self.bitstream_buf) };
 
@@ -1113,7 +1343,10 @@ pub mod win {
             }
             let out_subtype = match codec {
                 VideoCodec::H264 => MFVideoFormat_H264,
-                VideoCodec::Hevc | VideoCodec::HevcMain10 | VideoCodec::Hevc444 => MFVideoFormat_HEVC,
+                VideoCodec::Hevc | VideoCodec::HevcMain10 | VideoCodec::Hevc444 => {
+                    MFVideoFormat_HEVC
+                }
+                VideoCodec::Av1 => MFVideoFormat_AV1,
             };
             let output_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
@@ -1147,7 +1380,7 @@ pub mod win {
                 return Err(format!("no Media Foundation encoder found for {codec:?}"));
             }
 
-            let mut chosen: Option<(IMFTransform, bool)> = None;
+            let mut chosen: Option<(IMFTransform, bool, bool)> = None;
             let activates_slice =
                 unsafe { core::slice::from_raw_parts(activates_ptr, count as usize) };
             for maybe_act in activates_slice {
@@ -1157,36 +1390,50 @@ pub mod win {
                 let Ok(mft) = (unsafe { act.ActivateObject::<IMFTransform>() }) else {
                     continue;
                 };
+                // The low-latency attribute belongs to the transform and is
+                // only read before the media types are negotiated, so it is
+                // requested here rather than inside `configure_mft`.
+                let low_latency_attribute = unsafe { mft.GetAttributes() }
+                    .map(|attributes| unsafe { attributes.SetUINT32(&MF_LOW_LATENCY, 1) }.is_ok())
+                    .unwrap_or(false);
                 if Self::configure_mft(&mft, width, height, fps, bitrate_bps, out_subtype).is_ok() {
-                    chosen = Some((mft, !software_only));
+                    chosen = Some((mft, !software_only, low_latency_attribute));
                     break;
-                } else {
-                    let _ = unsafe { act.ShutdownObject() };
                 }
+                let _ = unsafe { act.ShutdownObject() };
             }
 
             unsafe {
                 CoTaskMemFree(Some(activates_ptr.cast()));
             }
 
-            let Some((transform, is_hardware)) = chosen else {
+            let Some((transform, is_hardware, low_latency_attribute)) = chosen else {
                 return Err(format!(
                     "all MFT encoder candidates failed setup for {codec:?}"
                 ));
             };
 
             let codec_api: Option<ICodecAPI> = transform.cast().ok();
+            let mut latency = crate::encoder_quality::MftLatencyReport {
+                hardware: is_hardware,
+                low_latency_attribute,
+                ..crate::encoder_quality::MftLatencyReport::default()
+            };
             if let Some(ref api) = codec_api {
                 let v_low = make_variant_bool(true);
-                let _ = unsafe { api.SetValue(&CODECAPI_AVLowLatencyMode, &v_low) };
-                // Vendor hardware encoders (AMD AMF, Intel Quick Sync, some
-                // Media Foundation filters) enable B-frames by default. Every
-                // B-frame is a reorder delay on top of the capture queue, so
-                // the non-NVIDIA path was a frame or two behind for no
-                // compression benefit worth having at streaming bitrates.
-                let v_bpy = make_variant_u32(0);
-                let _ = unsafe { api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &v_bpy) };
-                Self::apply_rate_control(
+                latency.low_latency_mode =
+                    unsafe { api.SetValue(&CODECAPI_AVLowLatencyMode, &v_low) }.is_ok();
+                if is_hardware {
+                    // Vendor hardware encoders (AMD AMF, Intel Quick Sync, some
+                    // Media Foundation filters) enable B-frames by default, and
+                    // every B-frame is a reorder delay on top of the capture
+                    // queue. The software fallback is deliberately not asked:
+                    // it is short of bits, not of a frame time, and it has no
+                    // such delay to remove in the first place.
+                    latency.no_b_frames =
+                        set_codec_u32(api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+                }
+                latency.rate_control = Self::apply_rate_control(
                     api,
                     crate::encoder_quality::MftRateControl::for_stream(
                         bitrate_bps,
@@ -1212,6 +1459,7 @@ pub mod win {
                 VideoCodec::HevcMain10 => "H.265 10-bit",
                 VideoCodec::Hevc444 => "H.265",
                 VideoCodec::H264 => "H.264",
+                VideoCodec::Av1 => "AV1",
             };
             let mode_label = if software_only {
                 "Software"
@@ -1219,8 +1467,25 @@ pub mod win {
                 "Hardware"
             };
             let pipeline_label = format!(
-                "{mode_label} {codec_label} {width}x{height} 4:2:0 Full Range (Opus Audio)"
+                "{mode_label} {codec_label} {width}x{height} 4:2:0 Full Range (Opus Audio) - {}",
+                latency.label()
             );
+            if latency.is_complete() {
+                tracing::info!(
+                    pipeline = %pipeline_label,
+                    ?codec,
+                    hardware = is_hardware,
+                    "MFT accepted the full low-latency pipeline"
+                );
+            } else {
+                tracing::warn!(
+                    pipeline = %pipeline_label,
+                    rejected = ?latency.rejected(),
+                    ?codec,
+                    hardware = is_hardware,
+                    "MFT refused part of the low-latency pipeline"
+                );
+            }
 
             Ok(Self {
                 transform,
@@ -1248,14 +1513,17 @@ pub mod win {
         /// cannot hold an average rate cannot stream, and the caller must find
         /// out. Everything else is best-effort, because the same GUIDs are
         /// advertised by encoders that quietly ignore them.
+        /// Returns whether a rate-control mode was accepted (the requested
+        /// peak-constrained VBR, or the CBR fallback).
         fn apply_rate_control(
             api: &ICodecAPI,
             plan: crate::encoder_quality::MftRateControl,
             codec: VideoCodec,
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             // Order matters: the rate-control mode decides how the bitrate
             // values are validated.
-            if !set_codec_u32(api, &CODECAPI_AVEncCommonRateControlMode, plan.mode) {
+            let mut accepted = set_codec_u32(api, &CODECAPI_AVEncCommonRateControlMode, plan.mode);
+            if !accepted {
                 // A CBR-only encoder still produces a usable stream, but the
                 // log should say why the picture is softer than it needs to be.
                 if set_codec_u32(
@@ -1264,13 +1532,18 @@ pub mod win {
                     crate::encoder_quality::RC_CBR,
                 ) {
                     warn!("MFT rejected peak-constrained VBR, falling back to CBR");
+                    accepted = true;
                 }
             }
 
             // Encoder effort and GOP are set once, before streaming starts.
             // Re-pushing them mid-stream makes some vendor MFTs reconfigure and
             // stall a frame; only the rate values move after this.
-            let _ = set_codec_u32(api, &CODECAPI_AVEncCommonQualityVsSpeed, plan.quality_vs_speed);
+            let _ = set_codec_u32(
+                api,
+                &CODECAPI_AVEncCommonQualityVsSpeed,
+                plan.quality_vs_speed,
+            );
             let _ = set_codec_u32(api, &CODECAPI_AVEncMPVGOPSize, plan.gop_length);
             if codec == VideoCodec::H264 {
                 // CABAC is worth roughly 10% bitrate at equal quality and the
@@ -1278,7 +1551,8 @@ pub mod win {
                 let cabac = make_variant_bool(true);
                 let _ = unsafe { api.SetValue(&CODECAPI_AVEncH264CABACEnable, &cabac) };
             }
-            Self::apply_bitrate(api, plan)
+            Self::apply_bitrate(api, plan)?;
+            Ok(accepted)
         }
 
         /// Peak, buffer and average: the difference between "compressed" and
@@ -1304,12 +1578,6 @@ pub mod win {
             out_subtype: GUID,
         ) -> Result<(), String> {
             unsafe {
-                // Ask the transform for the low-latency pipeline before any
-                // types are negotiated; hardware MFTs that do not know the
-                // attribute ignore it.
-                if let Ok(attrs) = mft.GetAttributes() {
-                    let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
-                }
                 let out_type = MFCreateMediaType().map_err(|e| e.to_string())?;
                 out_type
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -1356,7 +1624,9 @@ pub mod win {
             Ok(())
         }
 
-        fn set_bt709_full_range(media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType) -> Result<(), String> {
+        fn set_bt709_full_range(
+            media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
+        ) -> Result<(), String> {
             for (attribute, value) in [
                 (MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0),
                 (MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0),
@@ -1470,11 +1740,7 @@ pub mod win {
                 buffer
                     .Lock(&mut ptr, None, None)
                     .map_err(|e| format!("buffer Lock failed: {e}"))?;
-                core::ptr::copy_nonoverlapping(
-                    self.nv12_buf.as_ptr(),
-                    ptr,
-                    self.nv12_buf.len(),
-                );
+                core::ptr::copy_nonoverlapping(self.nv12_buf.as_ptr(), ptr, self.nv12_buf.len());
                 let _ = buffer.Unlock();
                 let _ = buffer.SetCurrentLength(self.nv12_buf.len() as u32);
                 sample
@@ -1510,8 +1776,7 @@ pub mod win {
             }];
             let mut status: u32 = 0;
 
-            let proc_res =
-                unsafe { self.transform.ProcessOutput(0, &mut out_bufs, &mut status) };
+            let proc_res = unsafe { self.transform.ProcessOutput(0, &mut out_bufs, &mut status) };
             let [out_buf] = out_bufs;
             let produced = core::mem::ManuallyDrop::into_inner(out_buf.pSample);
             let _events = core::mem::ManuallyDrop::into_inner(out_buf.pEvents);
@@ -1535,7 +1800,7 @@ pub mod win {
                     } else {
                         unsafe { core::slice::from_raw_parts(out_ptr, cur_len as usize) }
                     };
-                    let is_key = is_annex_b_keyframe(self.codec, bytes);
+                    let is_key = is_keyframe(self.codec, bytes);
                     let payload = if is_key && !bytes.starts_with(&self.sequence_header) {
                         let mut prefixed =
                             Vec::with_capacity(self.sequence_header.len() + bytes.len());
@@ -1563,5 +1828,60 @@ pub mod win {
                 Err(e) => Err(format!("ProcessOutput failed: {e}")),
             }
         }
+    }
+}
+#[cfg(test)]
+mod av1_keyframe_tests {
+    use super::{is_av1_keyframe, is_keyframe};
+    use crate::protocol::VideoCodec;
+
+    /// One OBU with a one-byte size field.
+    fn obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(obu_type << 3) | 0x02, payload.len() as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn a_key_frame_obu_is_detected() {
+        let mut unit = obu(2, &[]); // temporal delimiter
+        unit.extend(obu(1, &[0x0A, 0x0B])); // sequence header
+        unit.extend(obu(6, &[0x10])); // show_existing=0, frame_type=KEY_FRAME
+        assert!(is_av1_keyframe(&unit));
+        assert!(is_keyframe(VideoCodec::Av1, &unit));
+    }
+
+    #[test]
+    fn an_inter_frame_is_not_a_keyframe() {
+        let mut unit = obu(2, &[]);
+        unit.extend(obu(6, &[0x30])); // frame_type = INTER
+        assert!(!is_av1_keyframe(&unit));
+        assert!(!is_keyframe(VideoCodec::Av1, &unit));
+    }
+
+    #[test]
+    fn a_show_existing_frame_is_not_a_keyframe() {
+        // show_existing_frame reuses an earlier picture; it is not a refresh.
+        assert!(!is_av1_keyframe(&obu(6, &[0x80])));
+    }
+
+    #[test]
+    fn multi_byte_obu_sizes_are_skipped() {
+        let mut unit = obu(2, &[]);
+        // Sequence header with a 200-byte payload: size is leb128 (0xC8 0x01).
+        unit.push((1 << 3) | 0x02);
+        unit.extend_from_slice(&[0xC8, 0x01]);
+        unit.extend_from_slice(&[0u8; 200]);
+        unit.extend(obu(6, &[0x10]));
+        assert!(is_av1_keyframe(&unit));
+    }
+
+    #[test]
+    fn h26x_detection_still_works_through_the_dispatcher() {
+        // Annex-B H.264: a NAL type 5 (IDR) is a key frame, type 1 is not.
+        assert!(is_keyframe(VideoCodec::H264, &[0, 0, 0, 1, 0x65, 0x88]));
+        assert!(!is_keyframe(VideoCodec::H264, &[0, 0, 0, 1, 0x41, 0x9A]));
+        // An AV1 byte stream fed to the H.26x scanner must not crash or lie.
+        assert!(!is_av1_keyframe(&[0x00]));
     }
 }

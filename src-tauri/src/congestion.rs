@@ -430,8 +430,13 @@ impl DelayGradient {
     }
 
     fn queue_growth_us(&self) -> f64 {
-        let baseline = self.window.iter().map(|(_, delay)| *delay)
-            .fold(self.window.front().map_or(0.0, |(_, delay)| *delay).min(self.accumulated_delay_us), f64::min);
+        let baseline = self.window.iter().map(|(_, delay)| *delay).fold(
+            self.window
+                .front()
+                .map_or(0.0, |(_, delay)| *delay)
+                .min(self.accumulated_delay_us),
+            f64::min,
+        );
         self.accumulated_delay_us - baseline
     }
 
@@ -483,7 +488,9 @@ impl SendHistory {
     }
 
     fn lookup(&self, frame_id: u32, chunk_idx: u16, parity: bool) -> Option<(u32, u64)> {
-        self.by_key.get(&Self::key(frame_id, chunk_idx, parity)).copied()
+        self.by_key
+            .get(&Self::key(frame_id, chunk_idx, parity))
+            .copied()
     }
 }
 
@@ -579,6 +586,41 @@ impl ThroughputEstimator {
     }
 }
 
+/// Fraction of the current rate added per 100 ms increase tick once the path
+/// has cut us down.  `current / 12` is 8.3% per tick, so a 25% cut is undone
+/// in four ticks (400 ms) and a 50% cut in eight (800 ms): fast enough that a
+/// one-off Wi-Fi retransmit burst does not leave the picture soft for seconds.
+const RECOVERY_DIVISOR: u32 = 12;
+
+/// Fraction of the current rate added per tick when probing *above* the
+/// remembered ceiling.  `current / 256` is 0.39% per tick, about 4% per second
+/// at 20 Mbps: a slow, non-disruptive probe of headroom we have not proven yet.
+const PROBE_DIVISOR: u32 = 256;
+
+/// Floor for the recovery step, so a 2 Mbps stream still climbs at a useful
+/// 400 kbps/s rather than crawling.
+const MIN_RECOVERY_STEP_BPS: u32 = 40_000;
+
+/// Floor for the careful probe step.
+const MIN_PROBE_STEP_BPS: u32 = 20_000;
+
+/// How far below the remembered ceiling still counts as "recovering".  The last
+/// 6% is probed carefully, which turns the steady state into a shallow
+/// limit cycle instead of a full-rate overshoot every time.
+const RECOVERY_HEADROOM_DIVISOR: u32 = 16;
+
+/// Ticks spent clean above the ceiling before that rate is accepted as proven.
+/// Keeps the fast-recovery target tracking a link that genuinely got better,
+/// without ever jumping to an unproven rate.
+const CEILING_PROMOTION_TICKS: u32 = 50;
+
+/// Multiplicative decrease for a pure delay signal with no loss.  A queue that
+/// is growing while nothing is being dropped is the mildest form of congestion,
+/// and cutting a quarter of the bitrate for it is what makes a healthy link look
+/// soft.  0.85 is the WebRTC/GC value; 0.75 stays reserved for real loss.
+const DELAY_DECREASE_NUM: u32 = 17;
+const DELAY_DECREASE_DEN: u32 = 20;
+
 /// Host-side controller.  Feed it every `FeedbackPacket`; it returns a
 /// `BitrateDecision` that maps directly onto your existing
 /// `NetworkEvent::BitrateUpdated` path.
@@ -599,6 +641,12 @@ pub struct GccController {
     last_jitter_us: u32,
     last_rtt_us: u32,
     min_rtt_us: u32,
+    /// The rate the path was running at when it last pushed back.  Recovery
+    /// climbs quickly back to it, then probes above it carefully: the failure
+    /// there was real, but a momentary one must not cost permanent softness.
+    probe_ceiling_bps: Option<u32>,
+    /// Consecutive clean ticks spent above `probe_ceiling_bps`.
+    ceiling_clean_ticks: u32,
 }
 
 impl GccController {
@@ -622,6 +670,8 @@ impl GccController {
             last_jitter_us: 0,
             last_rtt_us: 0,
             min_rtt_us: u32::MAX,
+            probe_ceiling_bps: None,
+            ceiling_clean_ticks: 0,
         }
     }
 
@@ -636,7 +686,14 @@ impl GccController {
     }
 
     /// Record a data shard immediately before `quinn::Connection::send_datagram`.
-    pub fn record_sent(&mut self, frame_id: u32, chunk_idx: u16, parity: bool, bytes: usize, sent: Instant) {
+    pub fn record_sent(
+        &mut self,
+        frame_id: u32,
+        chunk_idx: u16,
+        parity: bool,
+        bytes: usize,
+        sent: Instant,
+    ) {
         self.sends.record(frame_id, chunk_idx, parity, bytes, sent);
     }
 
@@ -671,11 +728,16 @@ impl GccController {
             // stale, and holding an Overusing state here would keep cutting
             // the encoder on each report while nothing is queued. Loss
             // backoff above still covers the total-loss case.
-            if self.last_feedback_samples.is_some_and(|last| now.saturating_duration_since(last) > Duration::from_millis(80)) {
+            if self
+                .last_feedback_samples
+                .is_some_and(|last| now.saturating_duration_since(last) > Duration::from_millis(80))
+            {
                 self.delay.reset();
             }
         }
-        if has_samples { self.last_feedback_samples = Some(now); }
+        if has_samples {
+            self.last_feedback_samples = Some(now);
+        }
         for pair in pairs {
             self.delay.push(pair.0, pair.1, now);
         }
@@ -685,6 +747,10 @@ impl GccController {
         let loss = self.last_loss_permille;
         let in_cooldown = self.cooldown_until.is_some_and(|until| now < until);
         let throughput_bps = self.throughput.bps();
+        // The rate in effect before this report decides anything: if the report
+        // forces a cut, this is the rate that overran and therefore the target
+        // fast recovery should climb back toward.
+        let pre_cut_bps = self.current_bps;
 
         let (next_bps, state, reason) = if in_cooldown {
             (
@@ -702,13 +768,16 @@ impl GccController {
                 CongestionState::SevereCongestion,
                 format!("loss backoff: media={loss}‰ ack={ack_loss}‰"),
             )
-        } else if has_samples && (delay_state == DelayState::Overusing || self.delay.queue_growth_us() >= 4_000.0) {
+        } else if has_samples
+            && (delay_state == DelayState::Overusing || self.delay.queue_growth_us() >= 4_000.0)
+        {
             let throughput_cap = if throughput_bps > 0 {
                 (throughput_bps as f64 * 0.90) as u32
             } else {
                 u32::MAX
             };
-            let reduced = (self.current_bps * 3 / 4).min(throughput_cap);
+            let reduced =
+                (self.current_bps * DELAY_DECREASE_NUM / DELAY_DECREASE_DEN).min(throughput_cap);
             self.cooldown_until = Some(now + Duration::from_millis(300));
             (
                 reduced,
@@ -733,12 +802,35 @@ impl GccController {
             });
             if can_increase && has_samples && loss < 5 && self.delay.trend_ms_per_s() <= 0.0 {
                 self.last_increase = Some(now);
-                let step = 40_000;
+                // Two-speed ramp.  Below the remembered ceiling the link has
+                // already carried this rate, so climb multiplicatively and get
+                // the picture back fast; above it, probe carefully.  The old
+                // controller added a flat 40 kbps per tick, which needed 12.5 s
+                // to undo a single 25% cut from 20 Mbps and left the stream
+                // visibly soft for that whole time.
+                let ceiling = self.probe_ceiling_bps.unwrap_or(self.max_bps);
+                let recovering =
+                    self.current_bps < ceiling.saturating_sub(ceiling / RECOVERY_HEADROOM_DIVISOR);
+                let step = if recovering {
+                    (self.current_bps / RECOVERY_DIVISOR).max(MIN_RECOVERY_STEP_BPS)
+                } else {
+                    // Held this rate long enough above the mark: accept it as
+                    // proven, so the next cut recovers to here.  `max` means
+                    // the mark can follow a link that improved, but never
+                    // outrun what has actually been sustained.
+                    self.ceiling_clean_ticks = self.ceiling_clean_ticks.saturating_add(1);
+                    if self.ceiling_clean_ticks >= CEILING_PROMOTION_TICKS {
+                        self.probe_ceiling_bps = Some(self.current_bps);
+                        self.ceiling_clean_ticks = 0;
+                    }
+                    (self.current_bps / PROBE_DIVISOR).max(MIN_PROBE_STEP_BPS)
+                };
                 (
                     self.current_bps.saturating_add(step),
                     CongestionState::RampingUp,
                     format!(
-                        "clean path: trend={:.1} ms/s loss={}‰",
+                        "clean path: {} trend={:.1} ms/s loss={}‰",
+                        if recovering { "recovery" } else { "probe" },
                         self.delay.trend_ms_per_s(),
                         loss
                     ),
@@ -764,6 +856,29 @@ impl GccController {
             next_bps
         };
         self.current_bps = next_bps.clamp(self.min_bps, self.max_bps);
+
+        // A decrease is evidence about the path: remember the rate that
+        // overran, so recovery has a target and the careful probe knows where
+        // "above" begins.  `min` makes the mark the *lowest* rate that has
+        // failed recently, which is the only estimate of capacity this
+        // controller has; it never ratchets down on its own because a link that
+        // improves gets promoted back up by a long clean run.
+        if matches!(
+            state,
+            CongestionState::SevereCongestion | CongestionState::MildCongestion
+        ) {
+            let ceiling = self
+                .probe_ceiling_bps
+                .map_or(pre_cut_bps, |known| known.min(pre_cut_bps));
+            self.probe_ceiling_bps = Some(ceiling.max(self.min_bps));
+            self.ceiling_clean_ticks = 0;
+            // The delay samples that produced this cut describe the rate we
+            // just left behind.  Keeping them would let the same evidence
+            // trigger another cut the moment the cooldown expires, and three of
+            // those leave the picture at 42% of a rate the link had already
+            // recovered to.  Re-measure from here instead.
+            self.delay.reset();
+        }
 
         let diff = self.current_bps.abs_diff(self.last_notified_bps);
         let threshold = (self.last_notified_bps / 40).max(100_000);
@@ -970,10 +1085,8 @@ mod tests {
         for i in 0..10u64 {
             let packet = packet_with_samples(&[], 200_000 + i * 20_000, seq);
             seq += 1;
-            let decision = controller.on_feedback_at(
-                &packet,
-                origin + Duration::from_millis(500 + i * 20),
-            );
+            let decision =
+                controller.on_feedback_at(&packet, origin + Duration::from_millis(500 + i * 20));
             assert!(
                 decision.target_bitrate_bps >= previous,
                 "idle report {i} cut bitrate from {previous} to {}",
@@ -1018,5 +1131,161 @@ mod tests {
             controller.on_feedback_at(&packet, now);
         }
         assert!(controller.ack_loss_permille() > 0);
+    }
+
+    /// One report on a perfectly flat path: send and arrival advance together,
+    /// so the queue neither grows nor drains.
+    fn flat_tick(
+        controller: &mut GccController,
+        origin: Instant,
+        frame: u32,
+        at: Instant,
+        seq: u32,
+    ) -> u32 {
+        let send_us = 1_000_000u64 + u64::from(frame) * 16_000;
+        controller.record_sent(
+            frame,
+            0,
+            false,
+            1180,
+            origin + Duration::from_micros(send_us),
+        );
+        let mut packet = FeedbackPacket::new(seq, send_us);
+        packet.sample_count = 1;
+        packet.samples[0] = ArrivalSample {
+            frame_id: frame,
+            chunk_idx: 0,
+            flags: 0,
+            arrival_ts_us: send_us + 10_000,
+        };
+        controller.on_feedback_at(&packet, at);
+        controller.current_bitrate_bps()
+    }
+
+    /// Drive 20 Mbps into a queue that grows 1.5 ms per packet with no loss,
+    /// which is the mildest possible congestion signal.  Returns the report
+    /// time offset (ms) of the last report and the next unused report sequence
+    /// number: feedback loss is measured by sequence gaps, so a test that jumps
+    /// the counter is a test that throws away the whole window.
+    fn cut_once(
+        controller: &mut GccController,
+        origin: Instant,
+        base_us: u64,
+        seq0: u32,
+        at_ms: u64,
+    ) -> (u64, u32) {
+        for i in 0..8u32 {
+            controller.record_sent(
+                1,
+                i as u16,
+                false,
+                1180,
+                origin + Duration::from_micros(base_us + u64::from(i) * 2_000),
+            );
+        }
+        let mut seq = seq0;
+        for i in 0..8u64 {
+            let packet = packet_with_samples(
+                &[(1, i as u16, base_us + 10_000 + i * 3_500)],
+                base_us + i * 20_000,
+                seq,
+            );
+            seq = seq.wrapping_add(1);
+            controller.on_feedback_at(&packet, origin + Duration::from_millis(at_ms + 20 + i * 20));
+        }
+        (at_ms + 20 + 8 * 20, seq)
+    }
+
+    #[test]
+    fn a_transient_cut_is_undone_within_a_second() {
+        let origin = Instant::now();
+        let mut controller = GccController::new(20_000_000, 80_000_000);
+        let (cut_end, mut seq) = cut_once(&mut controller, origin, 0, 0, 0);
+        let mut at = origin + Duration::from_millis(cut_end);
+
+        let bottom = controller.current_bitrate_bps();
+        assert!(
+            bottom < 20_000_000,
+            "a growing queue must cut the target, got {bottom}"
+        );
+        assert!(
+            bottom >= 17_000_000,
+            "a lossless queue is mild congestion: cutting more than 15% for it is the quality drop, got {bottom}"
+        );
+
+        // The queue drained.  One report per 100 ms, the cadence the ramp is
+        // actually allowed to step on.
+        let mut frame = 100u32;
+        let mut recovered = None;
+        for tick in 1..=12u32 {
+            at += Duration::from_millis(100);
+            let now = flat_tick(&mut controller, origin, frame, at, seq);
+            seq = seq.wrapping_add(1);
+            frame += 1;
+            assert!(
+                now >= bottom,
+                "a clean path must never cut again: {bottom} -> {now} on tick {tick}"
+            );
+            assert!(
+                now <= 22_000_000,
+                "recovery must stop at the proven 20 Mbps, not race to the 80 Mbps cap (got {now})"
+            );
+            if now >= 19_000_000 {
+                recovered = Some(tick);
+                break;
+            }
+        }
+        let ticks = recovered.expect("bitrate must recover to 19 Mbps within 1.2 s");
+        assert!(
+            ticks <= 10,
+            "recovery took {ticks} ticks ({} ms)",
+            ticks * 100
+        );
+    }
+
+    #[test]
+    fn a_cut_discards_the_delay_evidence_that_produced_it() {
+        let origin = Instant::now();
+        let mut controller = GccController::new(20_000_000, 80_000_000);
+        cut_once(&mut controller, origin, 0, 0, 0);
+        // Stale samples describe the rate that was just abandoned.  Replaying
+        // them against the reduced rate is what produced cascade cuts.
+        assert_eq!(controller.delay.trend_ms_per_s(), 0.0);
+        assert_eq!(controller.delay.state(), DelayState::Normal);
+        assert!(
+            controller
+                .probe_ceiling_bps
+                .is_some_and(|c| c >= 20_000_000),
+            "recovery target is the rate that overran, got {:?}",
+            controller.probe_ceiling_bps
+        );
+    }
+
+    #[test]
+    fn the_mark_is_the_lowest_recently_failing_rate() {
+        let origin = Instant::now();
+        let mut controller = GccController::new(20_000_000, 80_000_000);
+
+        // Stand in for a history the test cannot reproduce: a mark of 80 Mbps
+        // that has never actually been sustained.  A failure at ~20 Mbps must
+        // collapse it, because the lowest failing rate is the only capacity
+        // estimate the controller has.
+        controller.probe_ceiling_bps = Some(80_000_000);
+        cut_once(&mut controller, origin, 0, 0, 0);
+        let first = controller.probe_ceiling_bps.expect("mark recorded");
+        assert!(
+            first < 25_000_000,
+            "an unproven 80 Mbps mark must collapse to the rate that failed, got {first}"
+        );
+
+        // A failure above the mark must never raise it: otherwise a burst of
+        // successful probing would let the mark chase an unproven rate.
+        controller.probe_ceiling_bps = Some(10_000_000);
+        cut_once(&mut controller, origin, 4_000_000, 8, 5_000);
+        assert_eq!(
+            controller.probe_ceiling_bps,
+            Some(10_000_000),
+            "a cut above the mark must leave the mark alone"
+        );
     }
 }

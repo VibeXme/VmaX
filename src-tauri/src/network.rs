@@ -63,7 +63,10 @@ impl VideoRecovery {
     ) {
         self.awaiting_keyframe = true;
         let now = Instant::now();
-        if self.last_request.is_some_and(|last| now - last < Duration::from_millis(300)) {
+        if self
+            .last_request
+            .is_some_and(|last| now - last < Duration::from_millis(300))
+        {
             return;
         }
         self.last_request = Some(now);
@@ -102,7 +105,8 @@ fn pending_video_cap(
     let budget = NETWORK_RTT_TARGET
         .saturating_sub(rtt / 2)
         .max(frame_time)
-        .min(Duration::from_millis(55)) + recovery_allowance;
+        .min(Duration::from_millis(55))
+        + recovery_allowance;
     ((target_bps as f64 / 8.0 * budget.as_secs_f64()) as usize)
         .clamp(64 * 1024, MAX_QUEUED_DELTA_BYTES)
 }
@@ -447,13 +451,21 @@ impl RuntimeOverrides {
         let policy = self.bitrate_policy.load(Ordering::Relaxed);
         let host_max = policy >> 1;
         let client_max = self.client_limit_bps.load(Ordering::Relaxed);
-        let ceiling = if client_max == 0 { host_max } else { host_max.min(client_max) };
+        let ceiling = if client_max == 0 {
+            host_max
+        } else {
+            host_max.min(client_max)
+        };
         (ceiling, policy & 1 != 0)
     }
 
     fn target_bitrate(&self, adaptive_bps: u32) -> u32 {
         let (ceiling, fixed) = self.bitrate_policy();
-        if fixed { ceiling } else { adaptive_bps.min(ceiling) }
+        if fixed {
+            ceiling
+        } else {
+            adaptive_bps.min(ceiling)
+        }
     }
 
     fn apply_bitrate_policy(&self, decision: &mut BitrateDecision) {
@@ -491,14 +503,15 @@ impl SessionTx {
     }
 
     pub fn set_bitrate_policy(&self, max_bps: u32, fixed: bool) {
-        self.overrides.bitrate_policy.store(
-            (max_bps << 1) | u32::from(fixed),
-            Ordering::Relaxed,
-        );
+        self.overrides
+            .bitrate_policy
+            .store((max_bps << 1) | u32::from(fixed), Ordering::Relaxed);
     }
 
     pub fn set_client_bitrate_limit(&self, max_bps: u32) {
-        self.overrides.client_limit_bps.store(max_bps, Ordering::Relaxed);
+        self.overrides
+            .client_limit_bps
+            .store(max_bps, Ordering::Relaxed);
     }
 }
 
@@ -1233,7 +1246,10 @@ async fn run_p2p_session(
                 fp,
                 cands,
                 config.protocol == TransportProtocol::RawUdp,
-                config.invited_client.clone().map(|fingerprint| vec![fingerprint])
+                config
+                    .invited_client
+                    .clone()
+                    .map(|fingerprint| vec![fingerprint])
                     .or_else(|| config.saved_clients.clone()),
                 computer_display_name(),
                 Some(ready_tx),
@@ -1331,7 +1347,9 @@ async fn run_p2p_session(
     if let Some(invited) = &config.invited_client
         && (!mutual_auth || !invited.eq_ignore_ascii_case(&peer_match.peer_fingerprint))
     {
-        return Err(NetworkError::Permission("this device was not approved for the invite".into()));
+        return Err(NetworkError::Permission(
+            "this device was not approved for the invite".into(),
+        ));
     }
     if relay_only && !mutual_auth {
         return Err(NetworkError::RelayUnavailable);
@@ -1429,10 +1447,14 @@ async fn run_p2p_session(
         mutual_auth,
         peer_candidates: &candidates,
     };
-    let probe_socket = (!relay_only && !candidates.is_empty() && relay.is_some()).then(|| {
-        socket2::SockRef::from(&udp_socket).try_clone().ok()
-            .and_then(|socket| UdpSocket::from_std(socket.into()).ok())
-    }).flatten();
+    let probe_socket = (!relay_only && !candidates.is_empty() && relay.is_some())
+        .then(|| {
+            socket2::SockRef::from(&udp_socket)
+                .try_clone()
+                .ok()
+                .and_then(|socket| UdpSocket::from_std(socket.into()).ok())
+        })
+        .flatten();
     let (probe_key, probe_key_rx) = watch::channel(None);
     let (direct_path, direct_path_rx) = watch::channel(None);
     let mut attempt = None;
@@ -1480,13 +1502,18 @@ async fn run_p2p_session(
                 let bridge = Arc::new(bridge);
                 let udp = Arc::new(udp);
                 let upgrade = crate::relay_upgrade::RelayUpgrade {
-                    udp: udp.clone(), candidates: probe_candidates,
-                    host: role == SessionRole::Host, key: probe_key_rx, path: direct_path.clone(),
+                    udp: udp.clone(),
+                    candidates: probe_candidates,
+                    host: role == SessionRole::Host,
+                    key: probe_key_rx,
+                    path: direct_path.clone(),
                 };
                 let direct_receive = async {
                     let result = upgrade.receive(bridge.clone()).await;
                     direct_path.send_replace(None);
-                    if let Err(error) = result { debug!(%error, "direct path probe stopped"); }
+                    if let Err(error) = result {
+                        debug!(%error, "direct path probe stopped");
+                    }
                     std::future::pending::<()>().await;
                 };
                 tokio::select! {
@@ -1514,7 +1541,10 @@ async fn run_p2p_session(
     drop(relay);
     if _relay_task.is_some() {
         let mut key = [0; 32];
-        if connection.export_keying_material(&mut key, b"EXPORTER-VmaX-direct-path-v1", b"").is_ok() {
+        if connection
+            .export_keying_material(&mut key, b"EXPORTER-VmaX-direct-path-v1", b"")
+            .is_ok()
+        {
             probe_key.send_replace(Some(key));
         }
     }
@@ -1524,7 +1554,10 @@ async fn run_p2p_session(
         _relay_task.is_some(),
         connection.rtt(),
     );
-    if role == SessionRole::Host && !config.fixed_bitrate && startup_bitrate < config.initial_bitrate_bps {
+    if role == SessionRole::Host
+        && !config.fixed_bitrate
+        && startup_bitrate < config.initial_bitrate_bps
+    {
         config.initial_bitrate_bps = startup_bitrate;
         telemetry.lock().await.target_bitrate_bps = config.initial_bitrate_bps;
         let _ = event_tx.send(NetworkEvent::BitrateUpdated(BitrateDecision {
@@ -1707,7 +1740,8 @@ impl QuicPeer<'_> {
             None
         };
         let mut endpoint_config = EndpointConfig::default();
-        endpoint_config.max_udp_payload_size(crate::nat_mobility::CELLULAR_MAX_MTU)
+        endpoint_config
+            .max_udp_payload_size(crate::nat_mobility::CELLULAR_MAX_MTU)
             .map_err(io::Error::other)?;
         let mut endpoint = Endpoint::new(
             endpoint_config,
@@ -1773,7 +1807,9 @@ struct SessionCounters {
 impl Default for SessionCounters {
     fn default() -> Self {
         Self {
-            media_bitrate: std::sync::Mutex::new(crate::telemetry::BitrateCounter::new(Duration::from_secs(1))),
+            media_bitrate: std::sync::Mutex::new(crate::telemetry::BitrateCounter::new(
+                Duration::from_secs(1),
+            )),
             video_frames_tx: AtomicU64::new(0),
             video_frames_rx: AtomicU64::new(0),
             video_frames_dropped: AtomicU64::new(0),
@@ -1809,8 +1845,10 @@ fn handle_inbound_media_datagram(
         return;
     }
 
-    if matches!(ChannelId::try_from(dgram[0]), Ok(ChannelId::Video | ChannelId::Audio))
-        && let Ok(mut bitrate) = counters.media_bitrate.lock()
+    if matches!(
+        ChannelId::try_from(dgram[0]),
+        Ok(ChannelId::Video | ChannelId::Audio)
+    ) && let Ok(mut bitrate) = counters.media_bitrate.lock()
     {
         bitrate.add(dgram.len(), Instant::now());
     }
@@ -1979,9 +2017,13 @@ fn fixed_bitrate_uses_the_host_target_and_honors_the_viewer_limit() {
         client_limit_bps: Arc::new(AtomicU32::new(0)),
     };
     assert_eq!(overrides.target_bitrate(4_000_000), 200_000_000);
-    overrides.client_limit_bps.store(35_000_000, Ordering::Relaxed);
+    overrides
+        .client_limit_bps
+        .store(35_000_000, Ordering::Relaxed);
     assert_eq!(overrides.target_bitrate(4_000_000), 35_000_000);
-    overrides.bitrate_policy.store(80_000_000 << 1, Ordering::Relaxed);
+    overrides
+        .bitrate_policy
+        .store(80_000_000 << 1, Ordering::Relaxed);
     assert_eq!(overrides.target_bitrate(16_000_000), 16_000_000);
     assert_eq!(overrides.target_bitrate(40_000_000), 35_000_000);
 }
@@ -2010,8 +2052,14 @@ fn jitter_extends_recovery_without_changing_the_stable_path_window() {
     assert_eq!(quic_startup_bitrate(20_000_000, false, ms(64)), 6_000_000);
     assert_eq!(quic_startup_bitrate(20_000_000, true, ms(8)), 4_000_000);
     assert_eq!(quic_startup_bitrate(2_500_000, false, ms(64)), 2_500_000);
-    assert_eq!(pending_video_cap(4_000_000, 60, ms(100), false, Duration::ZERO), 16_666);
-    assert_eq!(pending_video_cap(4_000_000, 60, ms(100), true, Duration::ZERO), 65_536);
+    assert_eq!(
+        pending_video_cap(4_000_000, 60, ms(100), false, Duration::ZERO),
+        16_666
+    );
+    assert_eq!(
+        pending_video_cap(4_000_000, 60, ms(100), true, Duration::ZERO),
+        65_536
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2077,7 +2125,8 @@ async fn run_quic_multiplex_loop(
     // reassemble without delaying delivery of complete frames.
     let minimum_window_ms = if originally_direct { 0 } else { 35 };
     let jitter_window = Duration::from_millis(config.jitter_window_ms.max(minimum_window_ms));
-    let recovery_allowance = jitter_window.saturating_sub(Duration::from_millis(18))
+    let recovery_allowance = jitter_window
+        .saturating_sub(Duration::from_millis(18))
         .min(Duration::from_millis(35));
     let delta_send_deadline = MAX_CAPTURE_QUEUE_AGE + recovery_allowance;
     let dgram_task = tokio::spawn(async move {
@@ -2995,12 +3044,16 @@ mod tests {
         if route == TestRoute::RelayUpgrade {
             timeout(Duration::from_secs(4), async {
                 loop {
-                    if !host.telemetry.lock().await.relayed && !client.telemetry.lock().await.relayed {
+                    if !host.telemetry.lock().await.relayed
+                        && !client.telemetry.lock().await.relayed
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-            }).await.expect("peers did not upgrade the live connection");
+            })
+            .await
+            .expect("peers did not upgrade the live connection");
         }
         let relayed = matches!(route, TestRoute::UnreachableUdp | TestRoute::RelayOnly);
         assert_eq!(host.telemetry.lock().await.relayed, relayed);
@@ -3109,7 +3162,11 @@ mod tests {
             .await
             .unwrap();
 
-        let rumble = crate::haptics::Rumble { large: 192, small: 54, pad: 0 };
+        let rumble = crate::haptics::Rumble {
+            large: 192,
+            small: 54,
+            pad: 0,
+        };
         host.tx.haptics_tx.send_replace(rumble);
         let mut got_video = false;
         let mut got_audio = false;
@@ -3141,7 +3198,9 @@ mod tests {
         assert!(got_video, "client did not receive video frame");
         assert!(got_audio, "client did not receive audio packet");
         assert!(got_rumble, "client did not receive haptic feedback");
-        host.tx.haptics_tx.send_replace(crate::haptics::Rumble::default());
+        host.tx
+            .haptics_tx
+            .send_replace(crate::haptics::Rumble::default());
         timeout(Duration::from_secs(2), async {
             while let Some(event) = client.event_rx.recv().await {
                 if let NetworkEvent::RumbleReceived(packet) = event {
@@ -3150,7 +3209,9 @@ mod tests {
                 }
             }
             panic!("session ended before stop rumble arrived");
-        }).await.expect("client did not receive stop rumble");
+        })
+        .await
+        .expect("client did not receive stop rumble");
 
         let mut got_key = false;
         let mut got_mouse = false;
@@ -3202,7 +3263,10 @@ mod tests {
             host.tx.video_tx.send(frame(3, false)).await.unwrap();
             timeout(Duration::from_secs(2), async {
                 while let Some(event) = host.event_rx.recv().await {
-                    if let NetworkEvent::KeyframeRequested { last_good_frame_id, reason } = event
+                    if let NetworkEvent::KeyframeRequested {
+                        last_good_frame_id,
+                        reason,
+                    } = event
                         && reason == "video queue lost a reference frame"
                     {
                         assert_eq!(last_good_frame_id, None, "recovery must request an IDR");
@@ -3210,7 +3274,9 @@ mod tests {
                     }
                 }
                 panic!("host event channel closed");
-            }).await.expect("queue drop should request an IDR");
+            })
+            .await
+            .expect("queue drop should request an IDR");
 
             host.tx.video_tx.send(frame(4, true)).await.unwrap();
             timeout(Duration::from_secs(2), async {
@@ -3222,7 +3288,9 @@ mod tests {
                     }
                 }
                 panic!("client event channel closed");
-            }).await.expect("client should receive the replacement keyframe");
+            })
+            .await
+            .expect("client should receive the replacement keyframe");
         }
 
         client.tx.close();
@@ -3268,20 +3336,25 @@ mod tests {
                         }
                     }
                     panic!("host closed before publishing its invite");
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 let mut client = start_client_session(config, invite).await.unwrap();
                 for session in [&mut host, &mut client] {
                     timeout(Duration::from_secs(8), async {
                         while let Some(event) = session.event_rx.recv().await {
                             match event {
                                 NetworkEvent::PhaseChanged(ConnectionPhase::Connected) => return,
-                                NetworkEvent::PhaseChanged(ConnectionPhase::Failed) =>
-                                    panic!("session failed during setup"),
+                                NetworkEvent::PhaseChanged(ConnectionPhase::Failed) => {
+                                    panic!("session failed during setup")
+                                }
                                 _ => {}
                             }
                         }
                         panic!("session ended during setup");
-                    }).await.unwrap();
+                    })
+                    .await
+                    .unwrap();
                 }
 
                 let mut cadence = interval(Duration::from_nanos(16_666_667));
@@ -3295,27 +3368,35 @@ mod tests {
                         // Skip one reference frame each second. A new keyframe
                         // after the gap models the host's recovery response.
                         if id % 60 != 48 {
-                            video_tx.send(OutboundVideoFrame {
-                                frame_id: id,
-                                codec: VideoCodec::H264,
-                                meta: crate::telemetry::FrameTelemetry::full_range_hardware(0, 1920, 1080),
-                                timestamp_us: u64::from(id) * 16_667,
-                                captured_at: Instant::now(),
-                                fps: 60,
-                                is_keyframe: matches!(id % 60, 0 | 50),
-                                payload: payload.clone(),
-                            }).await.unwrap();
+                            video_tx
+                                .send(OutboundVideoFrame {
+                                    frame_id: id,
+                                    codec: VideoCodec::H264,
+                                    meta: crate::telemetry::FrameTelemetry::full_range_hardware(
+                                        0, 1920, 1080,
+                                    ),
+                                    timestamp_us: u64::from(id) * 16_667,
+                                    captured_at: Instant::now(),
+                                    fps: 60,
+                                    is_keyframe: matches!(id % 60, 0 | 50),
+                                    payload: payload.clone(),
+                                })
+                                .await
+                                .unwrap();
                         }
-                        audio_tx.send(AudioPacket {
-                            header: AudioPacketHeader {
-                                codec: AudioCodec::Opus as u8,
-                                flags: 0,
-                                channels: 2,
-                                seq: id,
-                                timestamp_us: u64::from(id) * 16_667,
-                            },
-                            payload: Bytes::from_static(b"audio"),
-                        }).await.unwrap();
+                        audio_tx
+                            .send(AudioPacket {
+                                header: AudioPacketHeader {
+                                    codec: AudioCodec::Opus as u8,
+                                    flags: 0,
+                                    channels: 2,
+                                    seq: id,
+                                    timestamp_us: u64::from(id) * 16_667,
+                                },
+                                payload: Bytes::from_static(b"audio"),
+                            })
+                            .await
+                            .unwrap();
                     }
                 };
 
@@ -3336,26 +3417,43 @@ mod tests {
                                 }
                             }
                             NetworkEvent::AudioPacketReceived(_) => audio += 1,
-                            NetworkEvent::PhaseChanged(ConnectionPhase::Failed | ConnectionPhase::Disconnected) =>
-                                panic!("transport closed during load"),
+                            NetworkEvent::PhaseChanged(
+                                ConnectionPhase::Failed | ConnectionPhase::Disconnected,
+                            ) => panic!("transport closed during load"),
                             _ => {}
                         }
                         if matches!(last_frame, Some(479)) && audio >= 460 {
                             break;
                         }
                     }
-                    eprintln!("relayed={relay_only}: {video} video frames, {audio} audio packets, {replacements} replacement keyframes");
-                    assert!(video >= 420, "too few video frames: {video}, relayed={relay_only}");
-                    assert!(audio >= 460, "too few audio packets: {audio}, relayed={relay_only}");
-                    assert_eq!(replacements, 8, "a replacement keyframe was lost, relayed={relay_only}");
+                    eprintln!(
+                        "relayed={relay_only}: {video} video frames, {audio} audio packets, {replacements} replacement keyframes"
+                    );
+                    assert!(
+                        video >= 420,
+                        "too few video frames: {video}, relayed={relay_only}"
+                    );
+                    assert!(
+                        audio >= 460,
+                        "too few audio packets: {audio}, relayed={relay_only}"
+                    );
+                    assert_eq!(
+                        replacements, 8,
+                        "a replacement keyframe was lost, relayed={relay_only}"
+                    );
                 };
-                timeout(Duration::from_secs(15), async { tokio::join!(produce, consume); })
-                    .await.expect("stream stalled under load");
+                timeout(Duration::from_secs(15), async {
+                    tokio::join!(produce, consume);
+                })
+                .await
+                .expect("stream stalled under load");
                 client.tx.close();
                 timeout(Duration::from_secs(2), async {
                     client.join_handle.await.unwrap().unwrap();
                     host.join_handle.await.unwrap().unwrap();
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
             }
         };
         tokio::join!(test_session(false), test_session(true), test_session(true));

@@ -610,6 +610,7 @@ export function SettingsModal({
                         { value: "h264", label: "H.264" },
                         { value: "hevc", label: "H.265" },
                         { value: "hevc_main10", label: "H.265 Main 10" },
+                        { value: "av1", label: "AV1 (hardware only)" },
                       ]}
                       onChangeValue={(value) => onUpdateVideo({ codec: value as StreamVideoSettings["codec"] })} />
                   </SettingRow>
@@ -787,7 +788,7 @@ export function SettingsModal({
 
                   <SettingRow
                     title="Hardware Cursor"
-                    hint="Render local OS pointer independently for zero perceived lag"
+                    hint="Host draws the pointer into the stream. Off keeps this device's pointer (instant, but only follows local input)"
                     icon={<MousePointer className="h-4 w-4" />}
                   >
                     <ToggleSwitch

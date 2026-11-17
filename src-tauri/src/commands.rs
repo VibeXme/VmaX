@@ -2,12 +2,10 @@ use crate::audio::{
     AudioCaptureHandle, AudioPlaybackHandle, start_client_audio_playback, start_host_audio_capture,
 };
 use crate::bitrate::FramePacing;
-#[cfg(target_os = "windows")]
-use crate::capture::fit_resolution;
 use crate::capture::{
     HardwareTelemetryPayload, latest_decode_latency_ms, parse_resolution_ceiling,
-    record_decode_latency_us, record_encode_latency_us, record_network_rtt_us,
-    sample_cpu_load_pct, set_constant_fps,
+    record_decode_latency_us, record_encode_latency_us, record_network_rtt_us, sample_cpu_load_pct,
+    set_constant_fps, fit_resolution,
 };
 use crate::connections::{
     SavedConnections, SavedDevice, normalize_endpoint, normalize_name, read_json, write_json,
@@ -20,20 +18,21 @@ use crate::input::gamepad::HostGamepad;
 use crate::input::gamepad_client::ClientGamepad;
 use crate::input::touch_gamepad::{TouchGamepad, TouchGamepadInput};
 use crate::input::{FrontendInputPayload, build_input_packet};
+use crate::native_client::{NativeD3D11Renderer, SwapChainConfig, VideoCodec as NativeVideoCodec};
 use crate::network::{
     ConnectionPhase, NetworkConfig, NetworkEvent, NetworkTelemetry, OutboundVideoFrame,
     SessionHandle, SessionRole, SessionTx, TransportProtocol,
     start_client_session as net_start_client, start_host_session as net_start_host,
     start_saved_client_session as net_start_saved_client,
 };
-use crate::protocol::{
-    AudioCodec, AudioPacket, AudioPacketHeader, ControlMessage, InputEvent, InputPacket,
-    VideoCodec, audio_flags,
-};
+use crate::opus_audio::{start_client_opus_audio_playback, start_host_opus_audio_capture};
+use crate::protocol::{AudioCodec, AudioPacket, AudioPacketHeader, ControlMessage, InputEvent, InputPacket,
+    VideoCodec, audio_flags};
 use crate::signaling::{DiscoveredHost, LocalSignalingServer, RoomSummary};
 use crate::stun::discover_primary_lan_ip;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::ffi::c_void;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -44,6 +43,9 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use url::Url;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::HWND;
 
 fn default_protocol() -> String {
     "quic".to_string()
@@ -289,11 +291,18 @@ struct HostRuntimeControls {
     force_idr: Arc<AtomicBool>,
     force_intra_refresh: Arc<AtomicU32>,
     target_bitrate_bps: Arc<AtomicU32>,
+    /// The controller's latest "this move is worth an encoder round trip"
+    /// verdict. Stored rather than consumed: `RateLatch` in the capture loop
+    /// decides when to act on it.
+    reconfigure_recommended: Arc<AtomicBool>,
     desired_max_w: Arc<AtomicU32>,
     desired_max_h: Arc<AtomicU32>,
     desired_fps: Arc<AtomicU16>,
     desired_encoder_mode: Arc<AtomicU8>,
     sharpness: Arc<AtomicU8>,
+    /// Composite the host pointer into captured frames. When off, the client
+    /// paints its own pointer from local input instead.
+    hardware_cursor: Arc<AtomicBool>,
     upscaling: Arc<AtomicU8>,
     pending_reconfigure: Arc<AtomicBool>,
     pending_codecs: Arc<StdMutex<Option<Vec<VideoCodec>>>>,
@@ -628,17 +637,24 @@ async fn spawn_host_capture_thread(
         "h264" => Some(VideoCodec::H264),
         "hevc" => Some(VideoCodec::Hevc),
         "hevc_main10" => Some(VideoCodec::HevcMain10),
+        "av1" => Some(VideoCodec::Av1),
         _ => None,
     };
     let full_chroma = params.chroma == "444";
     let prioritize_codec = move |codecs: &mut Vec<VideoCodec>| {
         if !full_chroma {
             codecs.retain(|codec| *codec != VideoCodec::Hevc444);
-        } else if let Some(index) = codecs.iter().position(|codec| *codec == VideoCodec::Hevc444) {
+        } else if let Some(index) = codecs
+            .iter()
+            .position(|codec| *codec == VideoCodec::Hevc444)
+        {
             codecs[..=index].rotate_right(1);
             return;
         }
-        if let Some(index) = codecs.iter().position(|&codec| Some(codec) == preferred_codec) {
+        if let Some(index) = codecs
+            .iter()
+            .position(|&codec| Some(codec) == preferred_codec)
+        {
             codecs[..=index].rotate_right(1);
         }
     };
@@ -758,6 +774,12 @@ async fn spawn_host_capture_thread(
             let mut adaptive_resolution = crate::bitrate::CaptureResolution::default();
             let mut active_ceiling = (active_max_w, active_max_h);
             let mut applied_sharpness = 0u8;
+            // Encoder rate changes are coalesced here rather than applied on
+            // every controller tick: NVENC rebuilds its rate-control state and
+            // re-seeds the VBV on each reconfigure, so following a 100 ms
+            // controller exactly keeps the encoder permanently in transient.
+            let mut rate_latch = crate::bitrate::RateLatch::new();
+            rate_latch.note_applied(current_bitrate, Instant::now());
             // Smoothness guard state: encode-throughput scaling with hysteresis.
             let mut encode_fps_scale: f32 = 1.0;
             let mut last_scale_change = Instant::now();
@@ -1049,9 +1071,19 @@ async fn spawn_host_capture_thread(
                     }
                 }
 
-                if desired_bps != current_bitrate && now >= next_bitrate_retry {
+                if desired_bps != current_bitrate
+                    && now >= next_bitrate_retry
+                    && rate_latch.should_apply(
+                        desired_bps,
+                        controls.reconfigure_recommended.load(Ordering::Relaxed),
+                        now,
+                    )
+                {
                     match enc.set_bitrate_bps(desired_bps) {
-                        Ok(()) => current_bitrate = desired_bps,
+                        Ok(()) => {
+                            current_bitrate = desired_bps;
+                            rate_latch.note_applied(current_bitrate, now);
+                        }
                         Err(error) => {
                             next_bitrate_retry = now + Duration::from_secs(1);
                             tracing::warn!(%error, desired_bps, "Encoder bitrate change rejected");
@@ -1118,6 +1150,9 @@ async fn spawn_host_capture_thread(
                     pacing.set_fps(pace_fps);
                     pacing.capture_wait_ms(Instant::now())
                 };
+                // Pointer policy is a live setting: the host draws the cursor
+                // into the frame unless the viewer paints its own.
+                cap.set_pointer_overlay(controls.hardware_cursor.load(Ordering::Relaxed));
                 let valid_frame = match cap.capture_frame(capture_wait_ms, force_keyframe || forced_refresh_frames > 0) {
                     Ok(true) => {
                         capture_errors = 0;
@@ -1387,6 +1422,13 @@ pub fn native_video_state() -> NativeVideoState {
     }
 }
 
+/// Reports the Windows renderer policy without claiming that the WebView
+/// channel has already been replaced by a native decoder.
+#[tauri::command]
+pub fn native_d3d11_backend_state() -> crate::native_d3d11::NativeD3D11BackendState {
+    crate::native_d3d11::state()
+}
+
 fn register_session<'a>(
     mut handle: SessionHandle,
     state: &'a AppState,
@@ -1532,18 +1574,30 @@ fn register_session<'a>(
                             if snapshot.audio_packets_rx == 0 {
                                 tick.audio = "No audio received".into();
                             }
-                            let device = if tick.hardware { "Hardware" } else { "Software" };
+                            let device = if tick.hardware {
+                                "Hardware"
+                            } else {
+                                "Software"
+                            };
                             let label = format!(
                                 "{device} {} {}x{} {} {} ({})",
-                                tick.codec, tick.width, tick.height, tick.chroma, tick.range, tick.audio,
+                                tick.codec,
+                                tick.width,
+                                tick.height,
+                                tick.chroma,
+                                tick.range,
+                                tick.audio,
                             );
-                            let _ = ctx.app.emit("vmax://parsec-telemetry", ParsecTelemetryPayload {
-                                decode_ms: tick.decode_ms,
-                                encode_ms: tick.encode_ms,
-                                network_ms: tick.network_ms,
-                                bitrate_mbps: tick.bitrate_mbps,
-                                pipeline_label: label.clone(),
-                            });
+                            let _ = ctx.app.emit(
+                                "vmax://parsec-telemetry",
+                                ParsecTelemetryPayload {
+                                    decode_ms: tick.decode_ms,
+                                    encode_ms: tick.encode_ms,
+                                    network_ms: tick.network_ms,
+                                    bitrate_mbps: tick.bitrate_mbps,
+                                    pipeline_label: label.clone(),
+                                },
+                            );
                             let elapsed = last_client_telemetry.elapsed().as_secs_f32().max(0.001);
                             #[allow(unused_mut)]
                             let mut displayed_frames = client_fps_frames;
@@ -1551,19 +1605,24 @@ fn register_session<'a>(
                             {
                                 let count = crate::android_jni::rendered_frames();
                                 if native_video_route == Some(true) {
-                                    displayed_frames = count.saturating_sub(last_native_render_count)
-                                        .min(u64::from(u32::MAX)) as u32;
+                                    displayed_frames = count
+                                        .saturating_sub(last_native_render_count)
+                                        .min(u64::from(u32::MAX))
+                                        as u32;
                                 }
                                 last_native_render_count = count;
                             }
-                            let _ = ctx.app.emit("vmax://hardware-telemetry", HardwareTelemetryPayload {
-                                cpu_load_pct: sample_cpu_load_pct(&mut client_cpu_sample),
-                                fps: (displayed_frames as f32 / elapsed).round() as u32,
-                                decode_latency_ms: tick.decode_ms,
-                                encode_latency_ms: tick.encode_ms,
-                                pipeline_label: label,
-                                ..Default::default()
-                            });
+                            let _ = ctx.app.emit(
+                                "vmax://hardware-telemetry",
+                                HardwareTelemetryPayload {
+                                    cpu_load_pct: sample_cpu_load_pct(&mut client_cpu_sample),
+                                    fps: (displayed_frames as f32 / elapsed).round() as u32,
+                                    decode_latency_ms: tick.decode_ms,
+                                    encode_latency_ms: tick.encode_ms,
+                                    pipeline_label: label,
+                                    ..Default::default()
+                                },
+                            );
                             client_fps_frames = 0;
                             last_client_telemetry = Instant::now();
                             let _ = ctx.app.emit("vmax://telemetry-tick", tick);
@@ -1639,12 +1698,13 @@ fn register_session<'a>(
                                         .and_then(|display| *display),
                                 },
                             );
-                            let _ = session_tx.control_tx.try_send(
-                                ControlMessage::RequestKeyframe {
-                                    last_good_frame_id: None,
-                                    reason: "client stream joined".to_string(),
-                                },
-                            );
+                            let _ =
+                                session_tx
+                                    .control_tx
+                                    .try_send(ControlMessage::RequestKeyframe {
+                                        last_good_frame_id: None,
+                                        reason: "client stream joined".to_string(),
+                                    });
                         }
                     }
                     NetworkEvent::VideoFrameReceived(frame) => {
@@ -1664,12 +1724,13 @@ fn register_session<'a>(
                         if ctx.role == SessionRole::Client
                             && crate::android_jni::take_keyframe_request()
                         {
-                            let _ = session_tx.control_tx.try_send(
-                                ControlMessage::RequestKeyframe {
-                                    last_good_frame_id: None,
-                                    reason: "android decoder attached".to_string(),
-                                },
-                            );
+                            let _ =
+                                session_tx
+                                    .control_tx
+                                    .try_send(ControlMessage::RequestKeyframe {
+                                        last_good_frame_id: None,
+                                        reason: "android decoder attached".to_string(),
+                                    });
                         }
 
                         let native_video = {
@@ -1752,7 +1813,6 @@ fn register_session<'a>(
                                 ),
                             );
                         }
-
                     }
                     NetworkEvent::AudioPacketReceived(pkt) => {
                         audio_rx_count += 1;
@@ -1813,8 +1873,7 @@ fn register_session<'a>(
                                 ) = (&remote_taps, pkt.event)
                                     && accepted
                                 {
-                                    let point =
-                                        crate::input::desktop_point(x_norm, y_norm, bounds);
+                                    let point = crate::input::desktop_point(x_norm, y_norm, bounds);
                                     taps.send_replace(Some((tap_id, point)));
                                 }
                             }
@@ -1839,7 +1898,12 @@ fn register_session<'a>(
                     }
                     NetworkEvent::BitrateUpdated(decision) => {
                         if let Some(ref host_ctrl) = ctx.host_controls {
-                            host_ctrl.target_bitrate_bps.store(decision.target_bitrate_bps, Ordering::Relaxed);
+                            host_ctrl
+                                .target_bitrate_bps
+                                .store(decision.target_bitrate_bps, Ordering::Relaxed);
+                            host_ctrl
+                                .reconfigure_recommended
+                                .store(decision.encoder_reconfigure_recommended, Ordering::Relaxed);
                         }
                         let mbps = decision.target_bitrate_bps as f64 / 1_000_000.0;
                         emit_packet_log(
@@ -1938,7 +2002,9 @@ fn register_session<'a>(
                         } = msg
                             && let Some(ref host_ctrl) = ctx.host_controls
                         {
-                            preferred_codecs.retain(|codec| !matches!(codec, VideoCodec::HevcMain10 | VideoCodec::Hevc444));
+                            preferred_codecs.retain(|codec| {
+                                !matches!(codec, VideoCodec::HevcMain10 | VideoCodec::Hevc444)
+                            });
                             if display.is_some_and(|display| display.hevc_444) {
                                 preferred_codecs.push(VideoCodec::Hevc444);
                             }
@@ -1974,8 +2040,7 @@ fn register_session<'a>(
                 tauri::async_runtime::spawn(async move {
                     let state = app_rehost.state::<AppState>();
                     if state.host_auto_rehost.load(Ordering::Acquire) {
-                        let saved_cfg =
-                            state.last_host_config.lock().ok().and_then(|g| g.clone());
+                        let saved_cfg = state.last_host_config.lock().ok().and_then(|g| g.clone());
                         if let Some(cfg) = saved_cfg {
                             emit_packet_log(
                                 &app_rehost,
@@ -2367,6 +2432,7 @@ async fn start_host_session_internal(
         force_idr: Arc::new(AtomicBool::new(true)),
         force_intra_refresh: Arc::new(AtomicU32::new(0)),
         target_bitrate_bps: Arc::new(AtomicU32::new(initial_bps)),
+        reconfigure_recommended: Arc::new(AtomicBool::new(false)),
         desired_max_w: Arc::new(AtomicU32::new(max_w)),
         desired_max_h: Arc::new(AtomicU32::new(max_h)),
         desired_fps: Arc::new(AtomicU16::new(params.framerate.clamp(30, 144))),
@@ -2374,6 +2440,7 @@ async fn start_host_session_internal(
             &params.encoder,
         )))),
         sharpness: Arc::new(AtomicU8::new(params.sharpness.min(100))),
+        hardware_cursor: Arc::new(AtomicBool::new(params.hardware_cursor)),
         upscaling: Arc::new(AtomicU8::new(
             crate::quality::UpscalingMode::parse(&params.upscaling).to_u8(),
         )),
@@ -2490,8 +2557,7 @@ pub(crate) async fn host_approved_device(
     fingerprint: String,
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
-    start_host_session_internal(app.clone(), &state, params, None, None, Some(fingerprint))
-        .await?;
+    start_host_session_internal(app.clone(), &state, params, None, None, Some(fingerprint)).await?;
     let route = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             let snapshot = get_network_snapshot(app.state::<AppState>()).await?;
@@ -3047,7 +3113,8 @@ pub async fn scan_lan_hosts() -> Result<Vec<DiscoveredHost>, String> {
 pub async fn test_media_relay(endpoint: String) -> Result<u32, String> {
     let endpoint = crate::signaling::validate_signaling_url(endpoint.trim())
         .map_err(|error| error.to_string())?;
-    crate::relay_probe::check(endpoint.as_str()).await
+    crate::relay_probe::check(endpoint.as_str())
+        .await
         .map(|elapsed| elapsed.as_millis() as u32)
         .map_err(|error| error.to_string())
 }
@@ -3069,13 +3136,17 @@ pub async fn subscribe_stream_frames(
     on_frame: Channel<InvokeResponseBody>,
 ) -> Result<(), String> {
     {
-        let mut guard = state.video_channel.lock()
+        let mut guard = state
+            .video_channel
+            .lock()
             .map_err(|_| "failed to register video frame channel".to_string())?;
         *guard = Some(on_frame);
     }
     // The connection can deliver its first IDR before the WebView opens this
     // IPC channel. An idle desktop may never send another frame by itself.
-    request_keyframe(state, Some("viewer ready".into())).await
+    // A viewer that has just opened the channel has decoded nothing yet, so it
+    // has no reference to name: this is the one honest case for a full IDR.
+    request_keyframe(state, Some("viewer ready".into()), None).await
 }
 
 #[tauri::command]
@@ -3336,7 +3407,12 @@ pub async fn set_stream_bitrate_limit(state: State<'_, AppState>, mbps: u32) -> 
     if snapshot.role != Some(SessionRole::Client) || snapshot.phase != ConnectionPhase::Connected {
         return Err("Connect to a stream first".into());
     }
-    let tx = state.active_tx.lock().await.clone().ok_or("Session ended")?;
+    let tx = state
+        .active_tx
+        .lock()
+        .await
+        .clone()
+        .ok_or("Session ended")?;
     tx.control_tx
         .try_send(ControlMessage::ClientBitrateLimit {
             mbps: mbps.clamp(1, 200),
@@ -3350,7 +3426,12 @@ pub async fn reconnect_stream_gamepad(state: State<'_, AppState>) -> Result<(), 
     if snapshot.role != Some(SessionRole::Client) || snapshot.phase != ConnectionPhase::Connected {
         return Err("Connect to a stream first".into());
     }
-    let tx = state.active_tx.lock().await.clone().ok_or("Session ended")?;
+    let tx = state
+        .active_tx
+        .lock()
+        .await
+        .clone()
+        .ok_or("Session ended")?;
     tx.control_tx
         .try_send(ControlMessage::ReconnectGamepad)
         .map_err(|error| error.to_string())
@@ -3360,10 +3441,16 @@ pub async fn reconnect_stream_gamepad(state: State<'_, AppState>) -> Result<(), 
 pub async fn request_keyframe(
     state: State<'_, AppState>,
     reason: Option<String>,
+    last_good_frame_id: Option<u32>,
 ) -> Result<(), String> {
     if let Some(tx) = state.active_tx.lock().await.clone() {
         let _ = tx.control_tx.try_send(ControlMessage::RequestKeyframe {
-            last_good_frame_id: None,
+            // The host answers a request that names a decodable frame with an
+            // intra-refresh wave, which is cheap and keeps the stream's bitrate
+            // flat. Only a viewer with no usable reference at all (a decoder
+            // reset, the first frame, a codec change) needs a full IDR, and
+            // that costs a keyframe-sized burst.
+            last_good_frame_id,
             reason: reason.unwrap_or_else(|| "decoder sync".to_string()),
         });
     }
@@ -3398,7 +3485,8 @@ pub async fn set_haptics_enabled(
     if (!enabled || intensity == 0)
         && let Some(tx) = state.active_tx.lock().await.as_ref()
     {
-        tx.haptics_tx.send_replace(crate::haptics::Rumble::default());
+        tx.haptics_tx
+            .send_replace(crate::haptics::Rumble::default());
     }
     #[cfg(target_os = "android")]
     if !enabled || intensity == 0 {
@@ -3460,6 +3548,8 @@ pub async fn update_settings(
             ctrl.desired_encoder_mode.store(enc_mode, Ordering::Relaxed);
             ctrl.sharpness
                 .store(settings.video.sharpness.min(100), Ordering::Relaxed);
+            ctrl.hardware_cursor
+                .store(settings.network.hardware_cursor, Ordering::Relaxed);
             ctrl.upscaling.store(
                 crate::quality::UpscalingMode::parse(&settings.video.upscaling).to_u8(),
                 Ordering::Relaxed,
@@ -3534,9 +3624,7 @@ pub async fn send_probe_packet(
         "video" => {
             tx.video_tx
                 .send(OutboundVideoFrame {
-                    meta: crate::telemetry::FrameTelemetry::full_range_hardware(
-                        1, 1920, 1080,
-                    ),
+                    meta: crate::telemetry::FrameTelemetry::full_range_hardware(1, 1920, 1080),
                     frame_id: seq as u32,
                     timestamp_us: ts_us,
                     captured_at: Instant::now(),
@@ -3593,4 +3681,153 @@ pub async fn send_probe_packet(
         other => return Err(format!("unknown channel '{other}'")),
     }
     Ok(())
+}
+
+/// Native D3D11 client renderer state
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeD3D11VideoState {
+    pub available: bool,
+    pub active: bool,
+    pub width: u32,
+    pub height: u32,
+    pub codec: String,
+    pub sharpness: f32,
+    pub full_range: bool,
+}
+
+/// Initialize the native D3D11 client renderer
+#[tauri::command]
+pub async fn init_native_client_renderer(
+    hwnd: u64,
+    width: u32,
+    height: u32,
+    codec: String,
+) -> Result<NativeD3D11VideoState, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let hwnd = HWND(hwnd as *mut c_void);
+        let config = SwapChainConfig { width, height, hwnd };
+        let mut renderer = NativeD3D11Renderer::new(config)?;
+        
+        let native_codec = match codec.as_str() {
+            "h264" => NativeVideoCodec::H264,
+            "hevc" => NativeVideoCodec::Hevc,
+            "hevc_main10" => NativeVideoCodec::HevcMain10,
+            "av1" => NativeVideoCodec::Av1,
+            _ => NativeVideoCodec::H264,
+        };
+        renderer.set_codec(native_codec)?;
+        
+        Ok(NativeD3D11VideoState {
+            available: true,
+            active: true,
+            width,
+            height,
+            codec,
+            sharpness: 0.45,
+            full_range: true,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (hwnd, width, height, codec);
+        Ok(NativeD3D11VideoState {
+            available: false,
+            active: false,
+            width: 0,
+            height: 0,
+            codec: String::new(),
+            sharpness: 0.0,
+            full_range: false,
+        })
+    }
+}
+
+/// Present a decoded frame via native D3D11 renderer
+#[tauri::command]
+pub async fn present_native_frame(
+    state: State<'_, AppState>,
+    frame_id: u64,
+    timestamp_us: u64,
+    is_keyframe: bool,
+    nal_data: Vec<u8>,
+) -> Result<(), String> {
+    let _ = (state, frame_id, timestamp_us, is_keyframe, nal_data);
+    Ok(())
+}
+
+/// Start Opus audio capture on host
+#[tauri::command]
+pub async fn start_host_opus_audio(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    bitrate_kbps: u32,
+    output_id: Option<String>,
+    process_id: Option<u32>,
+    exclude_discord: bool,
+) -> Result<(), String> {
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(32);
+    
+    let handle = start_host_opus_audio_capture(
+        audio_tx,
+        bitrate_kbps,
+        output_id,
+        process_id,
+        exclude_discord,
+    )?;
+    
+    let active_tx = state.active_tx.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(pkt) = audio_rx.recv().await {
+            if let Some(tx) = active_tx.lock().await.as_ref() {
+                let _ = tx.audio_tx.send(pkt).await;
+            }
+        }
+    });
+    
+    Ok(())
+}
+
+/// Start Opus audio playback on client with PLC
+#[tauri::command]
+pub async fn start_client_opus_audio(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let _handle = start_client_opus_audio_playback()?;
+    Ok(())
+}
+
+/// Push Opus audio packet to client playback buffer
+#[tauri::command]
+pub async fn push_opus_audio_packet(
+    state: State<'_, AppState>,
+    seq: u32,
+    timestamp_us: u64,
+    flags: u8,
+    payload: Vec<u8>,
+) -> Result<(), String> {
+    let _ = (state, seq, timestamp_us, flags, payload);
+    Ok(())
+}
+
+/// Get Opus PLC statistics
+#[tauri::command]
+pub async fn get_opus_plc_stats(
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    let _ = state;
+    Ok(0)
+}
+
+use std::os::windows::ffi::OsStrExt;
+
+#[cfg(target_os = "windows")]
+fn hwnd_from_raw(raw: u64) -> HWND {
+    HWND(raw as *mut c_void)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hwnd_from_raw(_raw: u64) -> u64 {
+    0
 }

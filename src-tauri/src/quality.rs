@@ -320,8 +320,8 @@ impl FidelityDetector {
             self.pending = None;
             return self.current;
         }
-        let is_downgrade = target.render_pixels() < self.current.render_pixels()
-            || target.fsr > self.current.fsr;
+        let is_downgrade =
+            target.render_pixels() < self.current.render_pixels() || target.fsr > self.current.fsr;
         if is_downgrade {
             self.pending = None;
             self.current = target;
@@ -472,8 +472,8 @@ impl RcasSharpener {
                 let edge = 4 * center - (left + right + top + bottom);
                 let local = (left - right).abs() + (top - bottom).abs();
                 let limit = local.max(8);
-                let contribution = (f32::from(edge) * amount / 5.0 * (8.0 / f32::from(limit)))
-                    .clamp(-63.0, 63.0);
+                let contribution =
+                    (f32::from(edge) * amount / 5.0 * (8.0 / f32::from(limit))).clamp(-63.0, 63.0);
                 let value = center + contribution.round() as i16;
                 row[x] = value.clamp(0, 255) as u8;
             }

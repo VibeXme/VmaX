@@ -148,6 +148,32 @@ The in-stream details panel shows **Frame pacing** as the median interval
 between presented frames plus its 95th-percentile deviation; healthy 60 Hz
 playback sits near `16.67 ms ± <1 ms`.
 
+### Congestion recovery
+
+A delay-based controller has to slow down when a queue builds, but it also has
+to *come back*. VmaX keeps a **remembered ceiling**: the rate the path was
+running at when it last pushed back.
+
+- Below that ceiling the bitrate climbs multiplicatively (about 8% per 100 ms),
+  so a one-off Wi-Fi retransmit burst costs a few hundred milliseconds of lower
+  bitrate instead of a permanently soft picture.
+- Above it the climb is deliberately cautious (about 4% per second), because
+  that is the region where the path has already failed once.
+- A cut **discards the delay samples that produced it**. Those samples describe
+  the rate that was just abandoned; replaying them against the smaller rate is
+  what turned one congestion event into a cascade of cuts.
+- The ceiling is the **lowest rate that has failed recently**, never the highest
+  that succeeded. It can only fall on a failure and only rise after five clean
+  seconds above it, so it converges on the real capacity from above instead of
+  drifting downward on its own.
+- A queue that grows with **no loss** is the mildest congestion signal and cuts
+  15%, not 25%. A quarter of the bitrate is reserved for actual packet loss.
+
+The details panel reports **Pipeline** — host encode + one-way network + client
+decode. That is everything a codec or transport setting can move; propagation
+and display refresh sit on top of it and are not affected by anything VmaX does.
+Green means 20 ms or less.
+
 ## Image quality
 
 Smoothness and clarity are set by separate parts of the pipeline, so VmaX tunes
@@ -183,6 +209,27 @@ The client renders at the size the video actually occupies in device pixels,
 resamples exactly once, and then applies a single contrast-adaptive sharpen
 pass. Nothing is stretched twice, so the picture does not soften on a
 high-density phone display.
+
+## Mouse pointer
+
+Windows hands the mouse pointer to a desktop-duplication capturer *separately*
+from the desktop image, so a stream that does not draw it shows a cursor-less
+desktop. VmaX composites the pointer back in:
+
+- The bitmap is fetched only when Windows says it changed, and blitted into the
+  frame after scaling, using the same factor for the hotspot — so the tip lands
+  exactly where the cursor is, on any capture resolution.
+- Colour, masked-colour and classic monochrome (AND/XOR) shapes are all
+  supported, because Windows still hands out all three.
+- A pointer parked on another monitor is clipped, not wrapped.
+- Mouse movement now produces a *different* frame. When the overlay is off, a
+  mouse-only update no longer forces a full encode of an unchanged picture —
+  that was a full 1080p encode per mouse move.
+
+Set **Hardware Cursor** off on the host to stop drawing the pointer into the
+video; the viewer then shows its own pointer from local input, which responds
+instantly but cannot follow host-side state (a hidden pointer, a drag lock, a
+game that captures the mouse).
 
 ## Friends and saved networks
 

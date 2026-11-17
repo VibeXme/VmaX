@@ -220,9 +220,8 @@ impl SubFramePacer {
     pub fn plan(&self, shards: Vec<Bytes>, fps: u16, now: Instant) -> PacedFrame {
         let wire_bytes: usize = shards.iter().map(Bytes::len).sum();
         let count = shards.len();
-        let serialization = Duration::from_secs_f64(
-            (wire_bytes as f64 * 8.0) / self.rate_bps.max(1) as f64,
-        );
+        let serialization =
+            Duration::from_secs_f64((wire_bytes as f64 * 8.0) / self.rate_bps.max(1) as f64);
         let budget = self.budget(fps);
         // Never space the frame out longer than the budget: holding a complete
         // frame longer than a frame interval is pure added latency.
@@ -237,11 +236,7 @@ impl SubFramePacer {
 
     /// Send the frame at the planned instants.  Returns the number of shards
     /// the transport accepted.
-    pub fn send_paced_frame<S: DatagramSink>(
-        &self,
-        sink: &S,
-        plan: &PacedFrame,
-    ) -> usize {
+    pub fn send_paced_frame<S: DatagramSink>(&self, sink: &S, plan: &PacedFrame) -> usize {
         let mut sent = 0;
         for (shard, at) in plan.shards.iter().zip(plan.send_at.iter()) {
             spin_sleep_until(*at);

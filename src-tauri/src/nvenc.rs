@@ -63,7 +63,9 @@ impl Default for NvencSettings {
 
 impl NvencSettings {
     pub fn vbv_bits(self, bitrate_bps: u32, fps: u32) -> u32 {
-        (bitrate_bps / fps.max(1)).max(1).saturating_mul(u32::from(self.vbv_frames.clamp(1, 4)))
+        (bitrate_bps / fps.max(1))
+            .max(1)
+            .saturating_mul(u32::from(self.vbv_frames.clamp(1, 4)))
     }
 
     /// Peak bits VBR may spend on one frame.
@@ -230,6 +232,7 @@ pub enum CodecId {
     Hevc = 1,
     Hevc444 = 2,
     HevcP010 = 3,
+    Av1 = 4,
 }
 
 impl CodecId {
@@ -239,6 +242,7 @@ impl CodecId {
             crate::protocol::VideoCodec::Hevc => Self::Hevc,
             crate::protocol::VideoCodec::HevcMain10 => Self::HevcP010,
             crate::protocol::VideoCodec::Hevc444 => Self::Hevc444,
+            crate::protocol::VideoCodec::Av1 => Self::Av1,
         }
     }
 
@@ -254,6 +258,7 @@ impl CodecId {
             1 => "H.265",
             2 => "H.265 4:4:4",
             3 => "H.265 10-bit",
+            4 => "AV1",
             _ => "H.265",
         }
     }
@@ -264,6 +269,7 @@ impl CodecId {
             Self::Hevc => "H.265",
             Self::Hevc444 => "H.265 4:4:4",
             Self::HevcP010 => "H.265 10-bit",
+            Self::Av1 => "AV1",
         }
     }
 }

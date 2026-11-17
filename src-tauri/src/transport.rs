@@ -273,7 +273,10 @@ impl PacedSender {
         self.stats
             .queue_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
-        match self.tx.try_send(PacerCommand::Frame(shards, deadline, spread)) {
+        match self
+            .tx
+            .try_send(PacerCommand::Frame(shards, deadline, spread))
+        {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.stats
@@ -481,7 +484,11 @@ impl AdaptiveFec {
     /// keyframe is protected at the configured (usually 10%) level.
     pub fn with_group_size(group_size: u8) -> Self {
         let group_size = group_size.min(50);
-        let parity_pct = if group_size == 0 { 0 } else { (100.0 / f32::from(group_size)).round() as u8 };
+        let parity_pct = if group_size == 0 {
+            0
+        } else {
+            (100.0 / f32::from(group_size)).round() as u8
+        };
         Self {
             current: FecDecision {
                 parity_pct,
@@ -505,7 +512,11 @@ impl AdaptiveFec {
         self.last_signal = signal;
         let loss = f32::from(signal.loss_permille);
         let ack_loss = f32::from(signal.ack_loss_permille);
-        let mut target = if signal.rtt_ms >= 45 || signal.jitter_us >= 4_000 { 10.0 } else { 2.0 };
+        let mut target = if signal.rtt_ms >= 45 || signal.jitter_us >= 4_000 {
+            10.0
+        } else {
+            2.0
+        };
         target += loss * 0.20; // 3% media loss -> +6%
         target += ack_loss * 0.60; // 3% feedback loss -> +18%
         if signal.jitter_us > 8_000 {

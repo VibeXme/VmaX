@@ -95,8 +95,7 @@ impl NvencUllConfig {
         if clamped < self.bitrate_bps || packet_loss_pct > 1.5 {
             self.bitrate_bps = (clamped as f32 * 0.90) as u32;
         } else {
-            self.bitrate_bps =
-                ((self.bitrate_bps as f32 * 0.85) + (clamped as f32 * 0.15)) as u32;
+            self.bitrate_bps = ((self.bitrate_bps as f32 * 0.85) + (clamped as f32 * 0.15)) as u32;
         }
     }
 }

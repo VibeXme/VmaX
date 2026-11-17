@@ -556,7 +556,9 @@ impl RelayConnection {
                     .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
                 if let Some((socket, path)) = &direct {
                     let selected = *path.borrow();
-                    if let Some(address) = selected && socket.send_to(&buf[..len], address).await.is_ok() {
+                    if let Some(address) = selected
+                        && socket.send_to(&buf[..len], address).await.is_ok()
+                    {
                         continue;
                     }
                 }

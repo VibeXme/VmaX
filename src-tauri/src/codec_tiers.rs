@@ -126,7 +126,9 @@ impl ClientCaps {
         match tier {
             CodecTier::Avc => self.flags & FLAG_H264 != 0,
             CodecTier::Hevc => self.flags & FLAG_HEVC != 0,
-            CodecTier::HevcMain10 => self.flags & FLAG_HEVC_10BIT != 0 && self.flags & FLAG_HEVC != 0,
+            CodecTier::HevcMain10 => {
+                self.flags & FLAG_HEVC_10BIT != 0 && self.flags & FLAG_HEVC != 0
+            }
             CodecTier::Av1 => self.flags & FLAG_AV1 != 0,
         }
     }
@@ -141,6 +143,7 @@ impl ClientCaps {
                 VideoCodec::Hevc => caps.with_codec(CodecTier::Hevc),
                 VideoCodec::HevcMain10 => caps.with_codec(CodecTier::HevcMain10),
                 VideoCodec::Hevc444 => caps.with_codec(CodecTier::Hevc),
+                VideoCodec::Av1 => caps.with_codec(CodecTier::Av1),
             };
         }
         if !caps.supports(CodecTier::Avc) {
@@ -278,7 +281,11 @@ pub fn negotiate(host: &HostCaps, client: &ClientCaps) -> CodecSelection {
     } else {
         1080
     };
-    let max_fps = if client.max_fps >= 30 { client.max_fps } else { 60 };
+    let max_fps = if client.max_fps >= 30 {
+        client.max_fps
+    } else {
+        60
+    };
 
     let reason = match tier {
         CodecTier::Av1 => "AV1: both endpoints support tier 3",
@@ -350,7 +357,13 @@ mod tests {
         let client = ClientCaps::new(3840, 2160, 120).with_codec(CodecTier::Av1);
         let selection = negotiate(&host, &client);
         assert_ne!(selection.tier, CodecTier::Av1);
-        assert!(selection.codecs.iter().flatten().all(|c| *c != VideoCodec::H264 || true));
+        assert!(
+            selection
+                .codecs
+                .iter()
+                .flatten()
+                .all(|c| *c != VideoCodec::H264 || true)
+        );
     }
 
     #[test]

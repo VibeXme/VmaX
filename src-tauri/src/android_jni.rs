@@ -164,9 +164,14 @@ pub fn take_keyframe_request() -> bool {
 
 /// Called from the QUIC receive path for every complete access unit.
 pub fn submit_video_frame(frame: &ReassembledFrame) -> FrameRoute {
-    if frame.codec == crate::protocol::VideoCodec::Hevc444 as u8
-        || (frame.codec == crate::protocol::VideoCodec::Hevc as u8 && !crate::haptics::android_hevc())
-        || (frame.codec == crate::protocol::VideoCodec::HevcMain10 as u8 && !crate::haptics::android_main10())
+    // The Kotlin bridge knows H.264 and HEVC only; AV1 frames go to WebCodecs,
+    // which reaches MediaCodec's AV1 decoder on SoCs that have one.
+    if frame.codec == crate::protocol::VideoCodec::Av1 as u8
+        || frame.codec == crate::protocol::VideoCodec::Hevc444 as u8
+        || (frame.codec == crate::protocol::VideoCodec::Hevc as u8
+            && !crate::haptics::android_hevc())
+        || (frame.codec == crate::protocol::VideoCodec::HevcMain10 as u8
+            && !crate::haptics::android_main10())
         || !is_active()
         || FORCE_WEBVIEW.load(Ordering::Acquire)
     {
