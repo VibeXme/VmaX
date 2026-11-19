@@ -286,15 +286,20 @@ impl PunchSchedule {
     }
 
     /// Interval before the next burst, and the burst size for that tick.
+    ///
+    /// Ultra-aggressive first 200 ms at 5 ms (40 attempts), then relax to
+    /// 10 ms for 800 ms, then 25 ms, 50 ms, and finally 100 ms.  This gets
+    /// through strict NATs within a single RTT on most networks.
     pub fn next(&mut self, elapsed: Duration) -> (Duration, usize) {
         self.attempts = self.attempts.saturating_add(1);
-        if elapsed < self.aggressive_until {
-            // Several datagrams per tick: a NAT that needs a two-way exchange
-            // still sees a burst before the first backoff step.
-            (Duration::from_millis(10), 2)
+        if elapsed < Duration::from_millis(200) {
+            // 5 ms interval, 2 packets per burst = 80 packets in 200 ms
+            (Duration::from_millis(5), 2)
         } else if elapsed < Duration::from_millis(1_000) {
-            (Duration::from_millis(25), 1)
+            (Duration::from_millis(10), 1)
         } else if elapsed < Duration::from_millis(2_000) {
+            (Duration::from_millis(25), 1)
+        } else if elapsed < Duration::from_millis(4_000) {
             (Duration::from_millis(50), 1)
         } else {
             (Duration::from_millis(100), 1)

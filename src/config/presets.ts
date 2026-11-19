@@ -102,6 +102,24 @@ export function builtinPresets(baseConfig: VmaXConfig): SettingsPreset[] {
 
   return [
     make(
+      "ultra",
+      "Ultra Low Latency · <30ms",
+      "Sub-30ms glass-to-glass target: native 120 FPS with motion pacing, 16 ms packet window, zero FEC on clean paths, and the most aggressive congestion sensitivity. Best for LAN or high-quality Wi-Fi.",
+      {
+        resolution: "native",
+        framerate: 120,
+        bitrateMbps: 60,
+        framePacing: "motion",
+        sharpness: 25,
+        viewerSharpness: 50,
+        upscaling: "off",
+        lockResolution: true,
+        constantFps: true,
+        unlimitedBitrate: false,
+      },
+      { protocol: "quic", fecRedundancyPct: 0, hardwareCursor: true, packetWindowMs: 16, congestionSensitivity: "ultra_low_latency" },
+    ),
+    make(
       "smooth",
       "Smooth · recommended",
       "The shipped tuning, one click away: 1080p60 at an adaptive 20 Mbps that softens before it drops a frame, a 32 ms repair window to absorb Wi-Fi bursts, and a cursor composited by the host.",

@@ -138,7 +138,7 @@ export type RemoteInputPayload =
   | { kind: "mouse_wheel"; deltaX: number; deltaY: number }
   | { kind: "key"; scanCode: number; pressed: boolean; modifiers: number };
 
-export type ResolutionOption = "720p" | "1080p" | "1440p" | "4K";
+export type ResolutionOption = "native" | "720p" | "1080p" | "1440p" | "4K";
 export type FramerateOption = 30 | 60 | 90 | 120 | 144;
 export type EncoderMode = "hardware" | "software";
 export type FramePacing = "balanced" | "motion" | "detail";
@@ -201,7 +201,7 @@ export interface AudioSettings {
   bitrateKbps: AudioBitrateKbps;
 }
 
-export type CongestionSensitivity = "balanced" | "low_latency" | "quality";
+export type CongestionSensitivity = "balanced" | "low_latency" | "ultra_low_latency" | "quality";
 
 export interface NetworkSettings {
   protocol: TransportProtocol;

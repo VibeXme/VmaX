@@ -41,6 +41,10 @@ pub struct IceCandidates {
     pub lan_addrs: Vec<SocketAddr>,
     pub public_reflexive: Option<SocketAddr>,
     pub public_reflexive_v6: Option<SocketAddr>,
+    /// External IPv4 ports the STUN probes were told about, in answer order.
+    /// Two different ports mean the NAT allocates one mapping per destination
+    /// (symmetric), which is what makes port prediction necessary.
+    pub reflexive_ports: Vec<u16>,
 }
 
 pub(crate) fn canonical_addr(addr: SocketAddr) -> SocketAddr {
@@ -202,6 +206,14 @@ fn decode_address_attr(val: &[u8], xor: bool, tx_id: &[u8; 12]) -> Option<Socket
     }
 }
 
+/// Result of the reflexive probe: one mapped address per family plus every
+/// external port that was observed, which is what NAT classification reads.
+#[derive(Debug, Default)]
+struct ReflexiveProbe {
+    mapped: [Option<SocketAddr>; 2],
+    ports: Vec<u16>,
+}
+
 /// Races STUN endpoints per address family with a single receive loop.
 async fn discover_reflexive_addrs(
     socket: &UdpSocket,
@@ -209,8 +221,9 @@ async fn discover_reflexive_addrs(
     attempt: Duration,
     ipv4: bool,
     ipv6: bool,
-) -> [Option<SocketAddr>; 2] {
+) -> ReflexiveProbe {
     let mut mapped_addrs = [None, None];
+    let mut ports: Vec<u16> = Vec::new();
     let family_enabled = [ipv4, ipv6];
     let mut resolving: FuturesUnordered<_> = stun_servers
         .iter()
@@ -262,11 +275,22 @@ async fn discover_reflexive_addrs(
                             && canonical_addr(mapped).is_ipv6() == from.is_ipv6()
                             && mapped.port() != 0
                         {
-                            mapped_addrs[family] = Some(canonical_addr(mapped));
-                            if (0..2).all(|i| !family_enabled[i] || mapped_addrs[i].is_some()) {
+                            let mapped = canonical_addr(mapped);
+                            mapped_addrs[family] = mapped_addrs[family].or(Some(mapped));
+                            if !ports.contains(&mapped.port()) {
+                                ports.push(mapped.port());
+                            }
+                            // One answer per family is already enough to start;
+                            // a second one is what reveals a symmetric NAT, so
+                            // it is given at most another 75 ms to arrive.
+                            if (0..2).all(|i| !family_enabled[i] || mapped_addrs[i].is_some())
+                                && ports.len() >= 2
+                            {
                                 break;
                             }
-                            requests.retain(|target, _| target.is_ipv6() != from.is_ipv6());
+                            if ports.len() >= 2 {
+                                requests.retain(|target, _| target.is_ipv6() != from.is_ipv6());
+                            }
                             deadline = deadline.min(Instant::now() + Duration::from_millis(75));
                         }
                     }
@@ -276,7 +300,10 @@ async fn discover_reflexive_addrs(
             }
         }
     }
-    mapped_addrs
+    ReflexiveProbe {
+        mapped: mapped_addrs,
+        ports,
+    }
 }
 
 /// Gathers local LAN + STUN public reflexive candidates using the given UDP socket.
@@ -310,7 +337,7 @@ pub async fn gather_candidates(
         }
     }
 
-    let [public_reflexive, public_reflexive_v6] = if enable_stun {
+    let probe = if enable_stun {
         let servers: Vec<&str> = if stun_servers.is_empty() {
             DEFAULT_STUN_SERVERS.to_vec()
         } else {
@@ -318,14 +345,15 @@ pub async fn gather_candidates(
         };
         discover_reflexive_addrs(socket, &servers, Duration::from_millis(650), ipv4, ipv6).await
     } else {
-        [None, None]
+        ReflexiveProbe::default()
     };
 
     IceCandidates {
         local_addr,
         lan_addrs,
-        public_reflexive,
-        public_reflexive_v6,
+        public_reflexive: probe.mapped[0],
+        public_reflexive_v6: probe.mapped[1],
+        reflexive_ports: probe.ports,
     }
 }
 
@@ -422,7 +450,10 @@ mod tests {
         })
         .await
         .expect("must finish before retrying the silent endpoint");
-        assert_eq!(mapped, [Some("203.0.113.45:51234".parse().unwrap()), None]);
+        assert_eq!(
+            mapped.mapped,
+            [Some("203.0.113.45:51234".parse().unwrap()), None]
+        );
     }
 
     #[tokio::test]

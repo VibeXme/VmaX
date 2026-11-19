@@ -44,6 +44,16 @@ const PUNCH_ACK_MAGIC: &[u8] = b"VMAX_PUNCH_ACK_V1";
 const DEFAULT_FEC_GROUP_SIZE: u8 = 10;
 const MAX_QUEUED_DELTA_BYTES: usize = 512 * 1024;
 const RELAY_STARTUP_BITRATE_BPS: u32 = 4_000_000;
+/// Ceiling for a relayed session.  The relay is a TCP WebSocket chain, so every
+/// megabit the path cannot drain accumulates in a send buffer as latency: the
+/// field log that motivated this cap measured 839 ms RTT at 23.7 Mbps, which is
+/// roughly two megabytes of queue rather than distance.  Well under the relay's
+/// capacity, and low enough that congestion control can keep the queue empty.
+const RELAY_BITRATE_CEILING_BPS: u32 = 10_000_000;
+/// Loopback buffers between QUIC and the relay.  Defaults let a stalled
+/// WebSocket hold hundreds of milliseconds of media; dropping instead is what
+/// QUIC congestion control expects.
+const RELAY_LOOPBACK_BUFFER_BYTES: usize = 128 * 1024;
 const HIGH_RTT_STARTUP_BITRATE_BPS: u32 = 6_000_000;
 /// A frame that waited longer than this is already too old to present on
 /// time, so sending it only adds delay behind it. 30 ms is under two frames
@@ -53,7 +63,7 @@ const HIGH_RTT_STARTUP_BITRATE_BPS: u32 = 6_000_000;
 /// last line of defense, and every millisecond it allows is latency the
 /// client has to present.
 const MAX_CAPTURE_QUEUE_AGE: Duration = Duration::from_millis(30);
-const LAN_PROBE_HEAD_START: Duration = Duration::from_millis(125);
+const LAN_PROBE_HEAD_START: Duration = Duration::from_millis(50);
 const NETWORK_RTT_TARGET: Duration = Duration::from_millis(35);
 
 #[derive(Default)]
@@ -255,6 +265,7 @@ pub enum TransportProtocol {
 pub enum CongestionSensitivity {
     Balanced,
     LowLatency,
+    UltraLowLatency,
     Quality,
 }
 
@@ -314,13 +325,14 @@ impl Default for NetworkConfig {
             fixed_bitrate: false,
             fec_group_size: DEFAULT_FEC_GROUP_SIZE,
             protocol: TransportProtocol::Quic,
-            target_fps: 60,
+            target_fps: 120,
             // Only incomplete frames wait this long; complete frames play
-            // immediately. A window of ~2 frame intervals at 60 Hz absorbs
-            // ordinary Wi-Fi/cellular jitter without adding latency.
-            jitter_window_ms: 32,
-            hole_punch_timeout_ms: 4_500,
-            congestion_sensitivity: CongestionSensitivity::Balanced,
+            // immediately. One frame at 120 Hz (8.3 ms) + small margin.
+            jitter_window_ms: 16,
+            // Aggressive punching (5 ms intervals for 200 ms) typically
+            // succeeds within 200-500 ms. 3 s is a generous safety net.
+            hole_punch_timeout_ms: 3_000,
+            congestion_sensitivity: CongestionSensitivity::UltraLowLatency,
             identity_file: None,
             profile_endpoint: None,
             saved_clients: None,
@@ -926,6 +938,59 @@ fn build_client_config(
     Ok(client_cfg)
 }
 
+/// A gateway mapping for the life of the session.  When the session ends the
+/// rule is removed so the router is not left with a stale forward.
+struct UpnpLease {
+    mapper: crate::wan_transport::UpnpMapper,
+    external_port: u16,
+}
+
+impl Drop for UpnpLease {
+    fn drop(&mut self) {
+        let mapper = self.mapper.clone();
+        let external_port = self.external_port;
+        // `DeletePortMapping` is blocking HTTP; keep it off the runtime and off
+        // the session teardown path.
+        std::thread::spawn(move || {
+            let _ = mapper.unmap_udp(external_port);
+        });
+    }
+}
+
+/// Ask the gateway for a fixed external UDP port pointing at this socket.
+///
+/// A mapped port removes the timing dependence of simultaneous open: the peer
+/// has one address to send to, so the session stays direct instead of falling
+/// back to the relay, whose extra hop is the difference between a 30 ms path
+/// and a 100 ms one.  Gateways without IGD simply return `None`.
+async fn upnp_mapping(
+    public_reflexive: Option<SocketAddr>,
+    local_port: u16,
+) -> Option<(UpnpLease, SocketAddr)> {
+    let wan_ip = public_reflexive.filter(SocketAddr::is_ipv4)?.ip();
+    if local_port == 0 {
+        return None;
+    }
+    let std::net::IpAddr::V4(lan_ip) = crate::stun::discover_primary_lan_ip()? else {
+        return None;
+    };
+    let (mapper, external_port) = tokio::task::spawn_blocking(move || {
+        let mapper = crate::wan_transport::UpnpMapper::discover()?;
+        let external_port = mapper.map_udp(lan_ip, local_port, local_port)?;
+        Some((mapper, external_port))
+    })
+    .await
+    .ok()
+    .flatten()?;
+    Some((
+        UpnpLease {
+            mapper,
+            external_port,
+        },
+        SocketAddr::new(wan_ip, external_port),
+    ))
+}
+
 /// Performs simultaneous UDP hole-punching on the bound socket before handing the socket to Quinn.
 async fn hole_punch_udp(
     socket: &UdpSocket,
@@ -1273,6 +1338,7 @@ async fn run_p2p_session(
             lan_addrs: Vec::new(),
             public_reflexive: None,
             public_reflexive_v6: None,
+            reflexive_ports: Vec::new(),
         }
     } else {
         let enable_stun = config.enable_stun && public_signaling;
@@ -1281,11 +1347,42 @@ async fn run_p2p_session(
             candidates = gather_candidates(&udp_socket, &config.stun_servers, enable_stun) => candidates,
         }
     };
-    let ordered_candidates = if relay_only {
+    // A mapped gateway port gives this socket a fixed external address, so the
+    // peer can punch straight to it instead of paying for a relay hop.  A
+    // gateway without IGD answers `None` after at most 1.5 s and the session
+    // carries on exactly as before.
+    let upnp_lease = if relay_only {
+        None
+    } else {
+        timeout(
+            Duration::from_millis(1_500),
+            upnp_mapping(candidates.public_reflexive, candidates.local_addr.port()),
+        )
+        .await
+        .ok()
+        .flatten()
+    };
+    // Two STUN answers with different external ports mean the NAT allocates a
+    // mapping per destination (symmetric CGNAT).  The advertised port is then
+    // stale before the first punch arrives, which is why such sessions used to
+    // end up on the relay for their whole life.
+    let nat = crate::connectivity::classify_nat(
+        candidates.reflexive_ports.first().copied(),
+        candidates.reflexive_ports.get(1).copied(),
+    );
+    let mut port_predictor = crate::connectivity::PortPredictor::new();
+    for port in &candidates.reflexive_ports {
+        port_predictor.observe(*port);
+    }
+    let mut ordered_candidates = if relay_only {
         Vec::new()
     } else {
         candidates.ordered_targets()
     };
+    if let Some((_, mapped)) = &upnp_lease {
+        let after_lan = candidates.lan_addrs.len().min(ordered_candidates.len());
+        ordered_candidates.insert(after_lan, *mapped);
+    }
 
     {
         let mut guard = telemetry.lock().await;
@@ -1471,19 +1568,47 @@ async fn run_p2p_session(
         .into_iter()
         .map(canonical_addr)
         .collect();
+    // Rank the peer's candidates, and on a symmetric NAT add the ports its next
+    // mappings will most likely use.  Both peers punch at the predicted ports,
+    // which is the only way through a per-destination CGNAT without a relay.
+    let punch_targets = if nat.needs_port_prediction() && !candidates.is_empty() {
+        let ranked: Vec<(SocketAddr, crate::connectivity::CandidateType)> = candidates
+            .iter()
+            .map(|address| {
+                let kind = if is_local_candidate(*address) {
+                    crate::connectivity::CandidateType::Host
+                } else {
+                    crate::connectivity::CandidateType::ServerReflexive
+                };
+                (*address, kind)
+            })
+            .collect();
+        let plan = crate::connectivity::plan(
+            &ranked,
+            &port_predictor,
+            nat,
+            Duration::from_millis(config.hole_punch_timeout_ms),
+        );
+        let mut targets: Vec<SocketAddr> = plan.ranked.into_iter().map(|hit| hit.addr).collect();
+        targets.extend(plan.predicted);
+        targets
+    } else {
+        candidates.clone()
+    };
     let direct = if relay_only || candidates.is_empty() {
         Err(NetworkError::HolePunchTimeout)
     } else {
         set_phase(ConnectionPhase::HolePunching, &telemetry, &event_tx).await;
-        let probe_ms =
-            if mutual_auth && config.protocol == TransportProtocol::Quic && public_signaling {
-                config.hole_punch_timeout_ms.min(1_500)
-            } else {
-                config.hole_punch_timeout_ms
-            };
+        // A public (WAN) punch gets the full configured budget. It used to be
+        // capped at 1.5 s, which most friend-to-friend NATs cannot clear; the
+        // session then fell back to the WebSocket relay and paid TCP
+        // head-of-line blocking for the rest of the call. A direct path is
+        // worth the extra seconds of setup, and relay-only sessions skip
+        // punching entirely.
+        let probe_ms = config.hole_punch_timeout_ms;
         hole_punch_udp(
             &udp_socket,
-            &candidates,
+            &punch_targets,
             Duration::from_millis(probe_ms),
             tag,
             shutdown_rx.clone(),
@@ -1580,6 +1705,13 @@ async fn run_p2p_session(
         let signaling = relay.take().ok_or(NetworkError::HolePunchTimeout)?;
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         let bridge = UdpSocket::bind("127.0.0.1:0").await?;
+        // Bound the queue in front of the relay so a slow WebSocket cannot turn
+        // into a second of added latency.
+        for loopback in [&socket, &bridge] {
+            let handle = socket2::SockRef::from(loopback);
+            let _ = handle.set_send_buffer_size(RELAY_LOOPBACK_BUFFER_BYTES);
+            let _ = handle.set_recv_buffer_size(RELAY_LOOPBACK_BUFFER_BYTES);
+        }
         let bridge_addr = bridge.local_addr()?;
         bridge.connect(socket.local_addr()?).await?;
         let relay_path_rx = direct_path_rx.clone();
@@ -1623,6 +1755,18 @@ async fn run_p2p_session(
             )
             .await?;
         telemetry.lock().await.relayed = true;
+        // "Unlimited bitrate" is a fixed-rate override, so it also disables the
+        // congestion control that would otherwise notice the relay queueing.
+        // Cap the ceiling and let the controller drain the queue instead.
+        let (configured_max, _) = overrides.bitrate_policy();
+        overrides.bitrate_policy.store(
+            configured_max.min(RELAY_BITRATE_CEILING_BPS) << 1,
+            Ordering::Relaxed,
+        );
+        info!(
+            ceiling_bps = configured_max.min(RELAY_BITRATE_CEILING_BPS),
+            "relay path: bitrate capped and fixed override cleared"
+        );
         (endpoint, connection, Some(task))
     };
     drop(relay);
@@ -1664,6 +1808,8 @@ async fn run_p2p_session(
     info!(
         ?role,
         relayed = _relay_task.is_some(),
+        nat = nat.label(),
+        rtt_ms = connection.rtt().as_secs_f64() * 1000.0,
         "QUIC connection established"
     );
     {
@@ -2417,6 +2563,7 @@ async fn run_quic_multiplex_loop(
         match config.congestion_sensitivity {
             CongestionSensitivity::Balanced => crate::congestion::GccSensitivity::Balanced,
             CongestionSensitivity::LowLatency => crate::congestion::GccSensitivity::LowLatency,
+            CongestionSensitivity::UltraLowLatency => crate::congestion::GccSensitivity::UltraLowLatency,
             CongestionSensitivity::Quality => crate::congestion::GccSensitivity::Quality,
         },
     );

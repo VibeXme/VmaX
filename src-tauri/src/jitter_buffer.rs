@@ -19,11 +19,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-pub const MIN_HOLD: Duration = Duration::from_millis(2);
-pub const MAX_HOLD: Duration = Duration::from_millis(14);
+pub const MIN_HOLD: Duration = Duration::from_millis(1);
+pub const MAX_HOLD: Duration = Duration::from_millis(12);
 pub const JITTER_WINDOW: usize = 100;
 /// If a held frame is this far past its due time, emit it rather than freeze.
-pub const MAX_LATE_GRACE: Duration = Duration::from_millis(33);
+pub const MAX_LATE_GRACE: Duration = Duration::from_millis(25);
 
 /// One reassembled access unit waiting for the decoder.
 #[derive(Debug, Clone)]
@@ -219,11 +219,13 @@ impl JitterEstimator {
     }
 
     fn target_hold_us(&self) -> u32 {
-        // 1 ms base + 1.4x the p95 jitter, capped at 15 ms.  The multiplier
-        // leaves room for one retransmission/reordering interval without
-        // building a full display frame of delay.
+        // 0.5 ms base + 1.2x the p95 jitter, capped at 12 ms.  Tighter for
+        // ultra-low-latency: on a clean path we hold only 1 ms; on a jittery
+        // path we add just enough margin for one retransmit interval.
         let p95 = self.p95_us() as f32;
-        ((MIN_HOLD.as_micros() as f32 + p95 * 1.4) as u32)
+        let base_us = 500.0; // 0.5 ms
+        let mult = 1.2;
+        ((base_us + p95 * mult) as u32)
             .clamp(MIN_HOLD.as_micros() as u32, MAX_HOLD.as_micros() as u32)
     }
 }

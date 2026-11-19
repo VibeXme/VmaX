@@ -45,17 +45,17 @@ use std::time::{Duration, Instant};
 /// GTP/UDP tunnel encapsulation without IP fragmentation.
 pub const WAN_DATAGRAM_BUDGET: usize = 1180;
 
-/// 200 ms keepalive: keeps CGNAT mappings warm and still costs under 1.5 kB/s
-/// of uplink on a phone radio.
-pub const WAN_KEEPALIVE: Duration = Duration::from_millis(200);
+/// 100 ms keepalive: keeps CGNAT mappings warm with faster failure detection.
+/// Still under 3 kB/s uplink on a phone radio.
+pub const WAN_KEEPALIVE: Duration = Duration::from_millis(100);
 
-/// A handover must not tear down the session.  15 s is long enough for a
-/// Wi-Fi -> LTE transition and short enough to release a dead peer.
-pub const WAN_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// A handover must not tear down the session.  10 s is long enough for a
+/// Wi-Fi -> LTE transition and short enough to release a dead peer faster.
+pub const WAN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 4 MiB kernel buffers absorb the capture cadence while the pacer smooths the
-/// wire.  Must match `crate::transport::SOCKET_BUFFER_BYTES`.
-pub const SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// 2 MiB kernel buffers: smaller buffers reduce queueing latency while the
+/// pacer smooths the wire.  Must match `crate::transport::SOCKET_BUFFER_BYTES`.
+pub const SOCKET_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 /// DSCP Expedited Forwarding (46 << 2).  On Wi-Fi this maps to WMM AC_VO.
 pub const DSCP_EF: u32 = 0xB8;
@@ -68,6 +68,13 @@ pub const PUNCH_MAGIC: &[u8; 8] = b"VMAXPNCH";
 pub const WAN_MIN_MTU: u16 = 1200;
 /// 1240-byte ceiling: 1180 payload + VmaX tag + QUIC short header + AEAD tag.
 pub const WAN_MAX_MTU: u16 = 1240;
+
+/// Hole punch every 5 ms for the first 200 ms, then back off to 20 ms.
+/// Aggressive initial burst gets through strict NATs within one RTT.
+pub const PUNCH_INTERVAL_INITIAL: Duration = Duration::from_millis(5);
+pub const PUNCH_INTERVAL_BACKOFF: Duration = Duration::from_millis(20);
+pub const PUNCH_INITIAL_ROUNDS: u32 = 40; // 200 ms aggressive phase
+pub const PUNCH_TOTAL_ROUNDS: u32 = 200; // Up to 3.8 s total window
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -337,26 +344,32 @@ pub enum WanPath {
     Relay,
 }
 
-/// Simultaneous-open hole puncher.  Both peers run this at the same time with
-/// each other's candidate list.
+/// Simultaneous-open hole puncher with aggressive-then-backoff cadence.
+/// Both peers run this at the same time with each other's candidate list.
 pub struct HolePuncher {
     socket: Arc<UdpSocket>,
-    round_interval: Duration,
-    rounds: u32,
+    initial_interval: Duration,
+    backoff_interval: Duration,
+    initial_rounds: u32,
+    total_rounds: u32,
 }
 
 impl HolePuncher {
     pub fn new(socket: Arc<UdpSocket>) -> Self {
         Self {
             socket,
-            round_interval: PUNCH_INTERVAL,
-            rounds: PUNCH_ROUNDS,
+            initial_interval: PUNCH_INTERVAL_INITIAL,
+            backoff_interval: PUNCH_INTERVAL_BACKOFF,
+            initial_rounds: PUNCH_INITIAL_ROUNDS,
+            total_rounds: PUNCH_TOTAL_ROUNDS,
         }
     }
 
-    pub fn with_window(mut self, interval: Duration, rounds: u32) -> Self {
-        self.round_interval = interval;
-        self.rounds = rounds.max(1);
+    pub fn with_window(mut self, initial_interval: Duration, backoff_interval: Duration, initial_rounds: u32, total_rounds: u32) -> Self {
+        self.initial_interval = initial_interval;
+        self.backoff_interval = backoff_interval;
+        self.initial_rounds = initial_rounds.max(1);
+        self.total_rounds = total_rounds.max(initial_rounds);
         self
     }
 
@@ -371,8 +384,8 @@ impl HolePuncher {
         out
     }
 
-    /// Blocking punch.  Returns as soon as a peer answers, or `WanPath::Relay`
-    /// when the window expires.
+    /// Blocking punch with aggressive-then-backoff cadence.
+    /// Returns as soon as a peer answers, or `WanPath::Relay` when the window expires.
     pub fn run(&self, peers: &[SocketAddr]) -> WanPath {
         if peers.is_empty() {
             return WanPath::Relay;
@@ -380,13 +393,23 @@ impl HolePuncher {
         let local_port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let payload = Self::punch_payload(local_port);
         let mut buf = [0u8; 64];
-        let deadline = Instant::now() + self.round_interval * self.rounds;
+        let started = Instant::now();
+        let deadline = started + self.backoff_interval * self.total_rounds;
 
+        let mut round = 0u32;
         while Instant::now() < deadline {
+            let interval = if round < self.initial_rounds {
+                self.initial_interval
+            } else {
+                self.backoff_interval
+            };
+
             for peer in peers {
                 let _ = self.socket.send_to(&payload, peer);
             }
-            let until = Instant::now() + self.round_interval;
+            round = round.saturating_add(1);
+
+            let until = Instant::now() + interval;
             while Instant::now() < until {
                 match self.socket.recv_from(&mut buf) {
                     Ok((len, from)) => {
@@ -680,7 +703,7 @@ impl WanLink {
     }
 }
 
-/// QUIC transport config tuned for mobile paths.
+/// QUIC transport config tuned for ultra-low-latency mobile paths.
 ///
 /// QUIC requires at least 1200 UDP payload bytes. DPLPMTUD is bounded to 1240 bytes
 /// (so QUIC's own max UDP payload never exceeds a 464XLAT-safe size) and every
@@ -691,8 +714,9 @@ impl WanLink {
 pub fn wan_transport_config(link: WanLink) -> TransportConfig {
     let mut cfg = TransportConfig::default();
     cfg.congestion_controller_factory(Arc::new(BbrConfig::default()));
-    cfg.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    cfg.datagram_send_buffer_size(4 * 1024 * 1024);
+    // 2 MiB buffers: smaller than default to reduce queueing latency
+    cfg.datagram_receive_buffer_size(Some(SOCKET_BUFFER_BYTES));
+    cfg.datagram_send_buffer_size(SOCKET_BUFFER_BYTES);
     cfg.keep_alive_interval(Some(link.keepalive()));
     cfg.max_idle_timeout(IdleTimeout::try_from(link.idle_timeout()).ok());
 
@@ -700,13 +724,13 @@ pub fn wan_transport_config(link: WanLink) -> TransportConfig {
     cfg.initial_mtu(WAN_MIN_MTU);
     cfg.min_mtu(WAN_MIN_MTU);
     let mut mtud = MtuDiscoveryConfig::default();
-    mtud.interval(Duration::from_secs(300));
+    // Faster MTU probing for quicker path adaptation
+    mtud.interval(Duration::from_secs(60));
     mtud.upper_bound(link.max_mtu());
-    mtud.black_hole_cooldown(Duration::from_secs(30));
+    mtud.black_hole_cooldown(Duration::from_secs(10));
     cfg.mtu_discovery_config(Some(mtud));
 
-    // Padding every datagram would waste phone uplink and break the pacer's
-    // byte budget; QUIC still pads handshakes per RFC 9000.
+    // Disable padding to save uplink bandwidth and reduce serialization delay
     cfg.pad_to_mtu(false);
     cfg
 }

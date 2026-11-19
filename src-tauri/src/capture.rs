@@ -110,7 +110,7 @@ impl Default for HardwareTelemetryPayload {
 }
 
 /// Sub-millisecond frame pacer for uncapped 60 / 120 / 144 FPS streaming.
-/// Avoids Windows' default 15.6 ms sleep granularity by yielding only for the final ~1.5 ms.
+/// Avoids Windows' default 15.6 ms sleep granularity by yielding only for the final ~0.5 ms.
 pub struct HighResFramePacer {
     next_tick: Instant,
 }
@@ -135,8 +135,8 @@ impl HighResFramePacer {
             return;
         }
         let remaining = self.next_tick.duration_since(now);
-        if remaining > Duration::from_millis(2) {
-            std::thread::sleep(remaining - Duration::from_millis(2));
+        if remaining > Duration::from_micros(500) {
+            std::thread::sleep(remaining - Duration::from_micros(500));
         }
         while Instant::now() < self.next_tick {
             std::hint::spin_loop();

@@ -48,24 +48,20 @@ const DEFAULT_NVENC: NvencSettings = {
 
 export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
   video: {
-    resolution: "1080p",
-    framerate: 60,
-    bitrateMbps: 20,
+    // Ultra low latency preset as default
+    resolution: "native",
+    framerate: 120,
+    bitrateMbps: 60,
     encoder: "hardware",
     codec: "auto",
     chroma: "420",
-    framePacing: "balanced",
+    framePacing: "motion",
     sharpness: 25,
-    // Contrast-adaptive sharpening after reconstruction: luma-only, so it
-    // crisps letter edges without amplifying 4:2:0 colour fringing.
-    viewerSharpness: 55,
+    viewerSharpness: 50,
     upscaling: "off",
     renderer: "auto",
     lockResolution: true,
     constantFps: true,
-    // Adaptive by default. The ceiling is still the user's bitrate, but
-    // congestion feedback may lower it: a link that cannot carry 20 Mbps
-    // should soften the picture, not drop frames.
     unlimitedBitrate: false,
     nvenc: DEFAULT_NVENC,
   },
@@ -76,16 +72,14 @@ export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
     excludeDiscord: false,
     gamePid: "",
     aiNoiseSuppression: false,
-    bitrateKbps: 128,
+    bitrateKbps: 192,
   },
   network: {
     protocol: "quic",
-    fecRedundancyPct: 5,
+    fecRedundancyPct: 0,
     hardwareCursor: true,
-    // ~2 frame intervals at 60 Hz. Complete frames never wait for it; only
-    // incomplete ones get this long to be repaired by a late packet.
-    packetWindowMs: 32,
-    congestionSensitivity: "balanced",
+    packetWindowMs: 16,
+    congestionSensitivity: "ultra_low_latency",
   },
   customization: {
     statsOverlay: true,
@@ -102,7 +96,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function asResolution(val: unknown, fallback: ResolutionOption): ResolutionOption {
-  return val === "720p" || val === "1080p" || val === "1440p" || val === "4K" ? val : fallback;
+  return val === "native" || val === "720p" || val === "1080p" || val === "1440p" || val === "4K" ? val : fallback;
 }
 
 function asFramerate(val: unknown, fallback: FramerateOption): FramerateOption {

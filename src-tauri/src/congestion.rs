@@ -29,19 +29,19 @@ use std::time::{Duration, Instant};
 pub const FEEDBACK_MAGIC: u32 = 0x564D_5846; // "VMXF"
 pub const FEEDBACK_VERSION: u8 = 1;
 pub const MAX_ARRIVAL_SAMPLES: usize = 12;
-/// 100 Hz delay-gradient sampling. Faster than a 60 Hz frame so a transit
-/// increase is caught before the modem buffer fills and packets drop.
-pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(10);
+/// 200 Hz delay-gradient sampling. Fast enough to catch queue buildup within
+/// one 120 FPS frame (8.3 ms) and react before bufferbloat adds latency.
+pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Minimum bitrate floor — 2 Mbps keeps text readable on thin links.
 pub const DEFAULT_MIN_BITRATE_BPS: u32 = 2_000_000;
 pub const DEFAULT_MAX_BITRATE_BPS: u32 = crate::bitrate::MAX_VIDEO_BITRATE_BPS;
 
 /// How many consecutive feedback intervals with no samples before the
-/// delay gradient is considered stale and reset. At 10 ms/interval,
-/// 8 = 80 ms (≈5 frames at 60 FPS). Longer than a frame but short
+/// delay gradient is considered stale and reset. At 5 ms/interval,
+/// 16 = 80 ms (≈10 frames at 120 FPS). Longer than a frame but short
 /// enough that idle-screen pauses don't keep stale queue evidence.
-const IDLE_SAMPLE_RESET_INTERVALS: u32 = 8;
+const IDLE_SAMPLE_RESET_INTERVALS: u32 = 16;
 
 /// Delay gradient threshold (ms/s) for declaring Overusing.
 /// WebRTC uses ~12.5; we use 9.0 for delay-sensitive game streaming.
@@ -685,6 +685,9 @@ pub enum GccSensitivity {
     /// Higher sensitivity (~6 ms/s threshold, shorter hold).
     /// Catches queue buildup earlier for competitive gaming / esports.
     LowLatency,
+    /// Ultra-high sensitivity (~4 ms/s threshold, 3 ms hold).
+    /// For sub-30ms glass-to-glass latency on clean paths.
+    UltraLowLatency,
     /// Lower sensitivity (~14 ms/s threshold, longer hold).
     /// Tolerates more jitter for maximum quality on stable links.
     Quality,
@@ -698,7 +701,8 @@ impl GccController {
         sensitivity: GccSensitivity,
     ) -> Self {
         let (threshold, hold) = match sensitivity {
-            GccSensitivity::LowLatency => (6.0, Duration::from_millis(5)),
+            GccSensitivity::UltraLowLatency => (3.0, Duration::from_millis(2)),
+            GccSensitivity::LowLatency => (4.0, Duration::from_millis(3)),
             GccSensitivity::Balanced => (DEFAULT_DELAY_THRESHOLD_MS_PER_S, DEFAULT_STATE_HOLD),
             GccSensitivity::Quality => (14.0, Duration::from_millis(20)),
         };
