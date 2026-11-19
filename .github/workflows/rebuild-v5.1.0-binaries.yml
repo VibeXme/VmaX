@@ -34,6 +34,15 @@ jobs:
           rustup target add x86_64-pc-windows-msvc
           rustup target add aarch64-linux-android
 
+      - name: Reconcile Cargo.lock with Cargo.toml
+        shell: pwsh
+        run: |
+          # The v5.1.0 source manifest changed after the lockfile was generated.
+          # Resolve only workspace packages to avoid gratuitously upgrading all
+          # third-party dependencies, then keep --locked for both builds.
+          cargo update --workspace --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Build Windows executable
         shell: pwsh
         run: |
