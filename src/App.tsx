@@ -28,6 +28,7 @@ import { SavedConnectionsPanel } from "./components/SavedConnectionsPanel";
 import { QrScanner } from "./components/QrScanner";
 import { StreamViewer } from "./components/StreamViewer";
 import { TitleBar } from "./components/TitleBar";
+import { VmaXLogo } from "./components/VmaXLogo";
 import { MAX_STREAM_BITRATE_MBPS, STREAM_FRAMERATES, useVmaXConfig } from "./config/defaults";
 import type {
   DiscoveredHost,
@@ -865,6 +866,7 @@ export function App() {
               {page === "home" && (
                 <header className="vmax-home">
                   <div className="vmax-brand">
+                    <VmaXLogo size={72} className="vmax-brand-logo" />
                     <div><h1>Quick Connect</h1><p>Join a computer with an invite or find one nearby.</p></div>
                   </div>
                   {canHost && (

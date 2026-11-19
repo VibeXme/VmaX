@@ -222,7 +222,8 @@ html.vmax-native-video .vmax-stream {
   color: var(--vmax-accent);
   background: color-mix(in srgb, var(--vmax-accent) 12%, var(--vmax-surface));
 }
-.vmax-mark { object-fit: contain; flex: none; }
+.vmax-mark { display: block; object-fit: contain; flex: none; border-radius: 10px; }
+.vmax-brand-logo { box-shadow: 0 10px 30px rgba(0, 0, 0, .45); }
 .vmax-workspace { display: grid; grid-template-columns: 176px minmax(0, 1fr); flex: 1; min-height: 0; }
 .vmax-nav { display: flex; flex-direction: column; gap: 8px; padding: 20px 12px; border-right: 1px solid var(--vmax-line); background: var(--vmax-surface); }
 .vmax-nav button { display: flex; align-items: center; gap: 11px; padding: 12px; border-radius: 10px; text-align: left; }
