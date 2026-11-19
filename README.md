@@ -29,11 +29,13 @@ channel, so neither side trusts an unverified peer.
 
 ## Screenshots
 
-| Quick Connect | Network options |
+| Quick Connect | Hosting a session |
 | --- | --- |
-| ![Quick Connect](docs/screenshots/home.png) | ![Network options](docs/screenshots/network-options.png) |
+| ![Quick Connect](docs/screenshots/home.png) | ![Hosting](docs/screenshots/sessions.png) |
 
-![Streaming settings](docs/screenshots/settings.png)
+| Network options | Streaming settings |
+| --- | --- |
+| ![Network options](docs/screenshots/network-options.png) | ![Streaming settings](docs/screenshots/settings.png) |
 
 ## Downloads
 
