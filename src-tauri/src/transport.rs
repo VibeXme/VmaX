@@ -23,7 +23,11 @@ use std::time::{Duration, Instant};
 /// tag; 1180 bytes keeps the final UDP payload below the smallest common
 /// mobile-carrier MTU (1280) even with IPv6 extension headers.
 pub const MAX_APP_DATAGRAM_BYTES: usize = 1170;
-pub const QUIC_DATAGRAM_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Keep QUIC's application datagram queue small enough that congestion is
+/// visible to the capture loop before it turns into user-visible input/video
+/// latency. 512 KiB is still large enough for a keyframe burst, but at 60 Mbps
+/// it represents ~70 ms instead of >500 ms of hidden queueing.
+pub const QUIC_DATAGRAM_BUFFER_BYTES: usize = 512 * 1024;
 
 /// DSCP Expedited Forwarding (46 << 2). Networks may ignore or remark it.
 pub const DSCP_EF: u32 = 0xB8;

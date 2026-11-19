@@ -691,8 +691,11 @@ impl WanLink {
 pub fn wan_transport_config(link: WanLink) -> TransportConfig {
     let mut cfg = TransportConfig::default();
     cfg.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    // Receive can stay generous because it does not add sender-side latency.
+    // Keep the send queue aligned with transport::QUIC_DATAGRAM_BUFFER_BYTES so
+    // the backlog signal reflects the real amount QUIC can hide.
     cfg.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    cfg.datagram_send_buffer_size(4 * 1024 * 1024);
+    cfg.datagram_send_buffer_size(crate::transport::QUIC_DATAGRAM_BUFFER_BYTES);
     cfg.keep_alive_interval(Some(link.keepalive()));
     cfg.max_idle_timeout(IdleTimeout::try_from(link.idle_timeout()).ok());
 
