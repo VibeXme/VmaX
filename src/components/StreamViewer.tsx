@@ -101,11 +101,11 @@ type DecoderConfigWithLatency = VideoDecoderConfig & {
 };
 /**
  * Consecutive lost frames tolerated before the decoder is reset to wait for a
- * keyframe. Twelve frames is ~200 ms at 60 FPS: long enough that a single
- * dropped datagram never freezes the picture, short enough that visible
- * corruption cannot linger.
+ * keyframe. Four frames is ~67 ms at 60 FPS and ~33 ms at 120 FPS. Isolated
+ * loss still gets cheap intra-refresh recovery, but a genuinely broken
+ * reference chain can no longer stay visible for ~200 ms.
  */
-const MAX_TOLERATED_GAPS = 12;
+const MAX_TOLERATED_GAPS = 4;
 const HEADER_SIZE_BYTES = 16;
 const CODEC_HEVC = 1;
 const CODEC_H264 = 2;
