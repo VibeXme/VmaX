@@ -146,6 +146,10 @@ impl HighResFramePacer {
 
 pub fn parse_resolution_ceiling(label: &str) -> (u32, u32) {
     match label.trim().to_ascii_lowercase().as_str() {
+        // "native" is not a size: it means "whatever the captured display is".
+        // `fit_resolution` never upscales, so a ceiling far above any panel
+        // leaves the host's own resolution untouched.
+        "native" | "max" => (7680, 4320),
         "720p" => (1280, 720),
         "1080p" => (1920, 1080),
         "1440p" => (2560, 1440),

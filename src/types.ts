@@ -138,7 +138,11 @@ export type RemoteInputPayload =
   | { kind: "mouse_wheel"; deltaX: number; deltaY: number }
   | { kind: "key"; scanCode: number; pressed: boolean; modifiers: number };
 
-export type ResolutionOption = "720p" | "1080p" | "1440p" | "4K";
+/**
+ * Stream size ceiling. `native` keeps the host's display resolution (up to
+ * 8K); the others cap the encoded picture at a fixed height.
+ */
+export type ResolutionOption = "native" | "720p" | "1080p" | "1440p" | "4K";
 export type FramerateOption = 30 | 60 | 90 | 120 | 144;
 export type EncoderMode = "hardware" | "software";
 export type FramePacing = "balanced" | "motion" | "detail";

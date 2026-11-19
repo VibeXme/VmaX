@@ -58,6 +58,62 @@ use getrandom;
 use tauri::{Emitter, Manager, WindowEvent};
 use tracing_subscriber::EnvFilter;
 
+/// Opts the process out of Windows' background power throttling.
+///
+/// Windows 11 places a process that is not the foreground window under EcoQoS,
+/// which starves the capture/encode threads on the host and the WebView's
+/// decode/present tasks on the client. The picture stays smooth but arrives
+/// hundreds of milliseconds late, which is exactly the "worse when the app is
+/// out of focus" symptom. This is a per-process setting, so it covers both
+/// roles for the lifetime of the app.
+#[cfg(target_os = "windows")]
+fn disable_power_throttling() {
+    // PROCESS_POWER_THROTTLING_STATE. Declared locally with raw FFI so this
+    // stays independent of the windows-crate feature set, matching the crash
+    // handler above.
+    #[repr(C)]
+    struct ProcessPowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+    const CURRENT_VERSION: u32 = 1;
+    const EXECUTION_SPEED: u32 = 0x1;
+    // ProcessPowerThrottling in PROCESS_INFORMATION_CLASS.
+    const PROCESS_POWER_THROTTLING: i32 = 4;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn SetProcessInformation(
+            process: *mut std::ffi::c_void,
+            information_class: i32,
+            information: *mut std::ffi::c_void,
+            information_length: u32,
+        ) -> i32;
+    }
+
+    let mut state = ProcessPowerThrottlingState {
+        version: CURRENT_VERSION,
+        control_mask: EXECUTION_SPEED,
+        // A clear StateMask bit means "do not throttle execution speed".
+        state_mask: 0,
+    };
+    // SAFETY: `state` is a correctly sized PROCESS_POWER_THROTTLING_STATE and
+    // outlives the call. Failure is non-fatal: the app still runs throttled.
+    let applied = unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            PROCESS_POWER_THROTTLING,
+            (&raw mut state).cast(),
+            std::mem::size_of::<ProcessPowerThrottlingState>() as u32,
+        ) == 1
+    };
+    if !applied {
+        tracing::debug!("process power throttling opt-out was not applied");
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn install_crash_handler() {
     use std::fs::{File, create_dir_all};
@@ -413,6 +469,11 @@ pub fn run() {
 
     // Install crash logging for both Rust panics AND native Windows exceptions (access violations, etc.)
     install_crash_handler();
+
+    // Latency must not depend on window focus: keep capture/encode and the
+    // WebView pipeline out of Windows' background EcoQoS throttling.
+    #[cfg(target_os = "windows")]
+    disable_power_throttling();
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(

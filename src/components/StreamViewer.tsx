@@ -81,6 +81,9 @@ const RESOLUTION_DIMENSIONS: Record<
   ResolutionOption,
   { width: number; height: number }
 > = {
+  // Only a pre-decode fallback: once the first frame arrives the real size comes
+  // from the decoder, so "native" needs no host query here.
+  native: { width: 1920, height: 1080 },
   "720p": { width: 1280, height: 720 },
   "1080p": { width: 1920, height: 1080 },
   "1440p": { width: 2560, height: 1440 },

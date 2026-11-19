@@ -102,27 +102,45 @@ export function builtinPresets(baseConfig: VmaXConfig): SettingsPreset[] {
 
   return [
     make(
-      "smooth",
-      "Smooth · recommended",
-      "The shipped tuning, one click away: 1080p60 at an adaptive 20 Mbps that softens before it drops a frame, a 32 ms repair window to absorb Wi-Fi bursts, and a cursor composited by the host.",
+      "native",
+      "Native 120 · gaming",
+      "The default: the host display's own resolution at a constant 120 FPS, with a 60 Mbps adaptive ceiling, motion-first pacing, strong reconstruction sharpening and a one-frame repair window. Congestion control gives back bitrate before it gives back frame rate, so a relayed session loses detail instead of gaining lag.",
       {
-        resolution: "1080p",
-        framerate: 60,
-        bitrateMbps: 20,
-        framePacing: "balanced",
-        sharpness: 25,
+        resolution: "native",
+        framerate: 120,
+        bitrateMbps: 60,
+        framePacing: "motion",
+        sharpness: 30,
         viewerSharpness: 55,
         upscaling: "off",
         lockResolution: true,
         constantFps: true,
         unlimitedBitrate: false,
       },
-      { protocol: "quic", fecRedundancyPct: 5, hardwareCursor: true, packetWindowMs: 32, congestionSensitivity: "balanced" },
+      { protocol: "quic", fecRedundancyPct: 5, hardwareCursor: true, packetWindowMs: 16, congestionSensitivity: "low_latency" },
+    ),
+    make(
+      "lan",
+      "Native 120 · LAN / Tailscale",
+      "For a direct path only: the same native 120 FPS picture with a 50 Mbps budget and no parity shards. Pick this when both devices are on the same network or a private overlay; over a relayed internet session that much bitrate becomes queueing delay instead of detail.",
+      {
+        resolution: "native",
+        framerate: 120,
+        bitrateMbps: 50,
+        framePacing: "motion",
+        sharpness: 30,
+        viewerSharpness: 55,
+        upscaling: "off",
+        lockResolution: true,
+        constantFps: true,
+        unlimitedBitrate: false,
+      },
+      { protocol: "quic", fecRedundancyPct: 0, hardwareCursor: true, packetWindowMs: 16, congestionSensitivity: "low_latency" },
     ),
     make(
       "latency",
-      "Lowest latency",
-      "Glass-to-glass priority: no FEC overhead, the shortest reassembly window, and minimal post-processing so the picture reaches the panel as early as possible.",
+      "Lowest latency · 1080p",
+      "For links that cannot carry a native frame at 60 FPS: the same zero-FEC path and shortest reassembly window, capped at 1080p, with minimal post-processing so the picture reaches the panel as early as possible.",
       {
         resolution: "1080p",
         framerate: 60,
@@ -135,7 +153,7 @@ export function builtinPresets(baseConfig: VmaXConfig): SettingsPreset[] {
         constantFps: true,
         unlimitedBitrate: false,
       },
-      { protocol: "quic", fecRedundancyPct: 0, hardwareCursor: true, packetWindowMs: 20, congestionSensitivity: "low_latency" },
+      { protocol: "quic", fecRedundancyPct: 0, hardwareCursor: true, packetWindowMs: 16, congestionSensitivity: "low_latency" },
     ),
     make(
       "esports",
@@ -176,7 +194,7 @@ export function builtinPresets(baseConfig: VmaXConfig): SettingsPreset[] {
       { protocol: "quic", fecRedundancyPct: 5, hardwareCursor: true, packetWindowMs: 32, congestionSensitivity: "quality" },
     ),
     make(
-      "lan",
+      "showcase",
       "LAN showcase · 4K",
       "Local network only: 4K60 with headroom to spare, no FEC tax, and resolution locked so the picture never softens mid-session.",
       {
@@ -300,7 +318,8 @@ export function describeConfig(config: VmaXConfig): string {
         ? "detail-first"
         : "balanced";
   const rate = config.video.unlimitedBitrate ? "fixed" : "adaptive";
-  return `${config.video.resolution} · ${config.video.framerate} FPS · ${config.video.bitrateMbps} Mbps ${rate} · ${pacing}${above}`;
+  const res = config.video.resolution === "native" ? "Native" : config.video.resolution;
+  return `${res} · ${config.video.framerate} FPS · ${config.video.bitrateMbps} Mbps ${rate} · ${pacing}${above}`;
 }
 
 /** Snapshots the current configuration under a new name. */

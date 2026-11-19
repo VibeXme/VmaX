@@ -103,6 +103,7 @@ const CATEGORIES: readonly {
 ];
 
 const RESOLUTION_OPTIONS: readonly { value: ResolutionOption; label: string }[] = [
+  { value: "native", label: "Native · host display" },
   { value: "720p", label: "720p · HD" },
   { value: "1080p", label: "1080p · FHD" },
   { value: "1440p", label: "1440p · QHD" },

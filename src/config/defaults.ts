@@ -48,24 +48,34 @@ const DEFAULT_NVENC: NvencSettings = {
 
 export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
   video: {
-    resolution: "1080p",
-    framerate: 60,
-    bitrateMbps: 20,
+    // High-end gaming baseline: encode at the host's own display resolution and
+    // hold a constant 120 FPS. `fit_resolution` never upscales, so "native" is
+    // exactly the monitor the host is capturing, and the client hands the
+    // stream to its panel at that same size. The 60 Mbps is an adaptive
+    // ceiling, not a fixed rate: congestion control gives back bitrate before
+    // it ever adds latency, so a relayed friend session softens its picture
+    // while a direct path gets the full detail. Lower the ceiling (or use the
+    // weakest-link preset) if either end is on a slow uplink.
+    resolution: "native",
+    framerate: 120,
+    bitrateMbps: 60,
     encoder: "hardware",
     codec: "auto",
     chroma: "420",
-    framePacing: "balanced",
-    sharpness: 25,
+    framePacing: "motion",
+    sharpness: 30,
     // Contrast-adaptive sharpening after reconstruction: luma-only, so it
-    // crisps letter edges without amplifying 4:2:0 colour fringing.
+    // crisps letter edges without amplifying 4:2:0 colour fringing. At 120 FPS
+    // the cost of this pass is negligible, so it runs strong enough to read
+    // HUD text and weapon detail through a 4:2:0 encode.
     viewerSharpness: 55,
     upscaling: "off",
     renderer: "auto",
     lockResolution: true,
     constantFps: true,
     // Adaptive by default. The ceiling is still the user's bitrate, but
-    // congestion feedback may lower it: a link that cannot carry 20 Mbps
-    // should soften the picture, not drop frames.
+    // congestion feedback may lower it: a link that cannot carry 60 Mbps
+    // should soften the picture, not drop frames or add bufferbloat.
     unlimitedBitrate: false,
     nvenc: DEFAULT_NVENC,
   },
@@ -76,16 +86,19 @@ export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
     excludeDiscord: false,
     gamePid: "",
     aiNoiseSuppression: false,
-    bitrateKbps: 128,
+    bitrateKbps: 192,
   },
   network: {
     protocol: "quic",
+    // Parity shards are cheap insurance on the relayed path, where one lost
+    // packet is a TCP retransmit stall rather than an isolated datagram.
     fecRedundancyPct: 5,
     hardwareCursor: true,
-    // ~2 frame intervals at 60 Hz. Complete frames never wait for it; only
-    // incomplete ones get this long to be repaired by a late packet.
-    packetWindowMs: 32,
-    congestionSensitivity: "balanced",
+    // One frame interval at 120 Hz: enough for a late packet to be repaired by
+    // parity before the frame is displayed without it. Complete frames are
+    // never held for this window, so this only bounds incomplete ones.
+    packetWindowMs: 16,
+    congestionSensitivity: "low_latency",
   },
   customization: {
     statsOverlay: true,
@@ -102,7 +115,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function asResolution(val: unknown, fallback: ResolutionOption): ResolutionOption {
-  return val === "720p" || val === "1080p" || val === "1440p" || val === "4K" ? val : fallback;
+  return val === "native" || val === "720p" || val === "1080p" || val === "1440p" || val === "4K"
+    ? val
+    : fallback;
 }
 
 function asFramerate(val: unknown, fallback: FramerateOption): FramerateOption {
@@ -187,6 +202,95 @@ function migrateRefreshFrames(period: unknown, frames: unknown): number {
   return storedPeriod === 60 && clamped === 5 ? DEFAULT_NVENC.refreshFrames : clamped;
 }
 
+/**
+ * The shipped 5.0.0 baseline was 1080p/60 at 20 Mbps, balanced pacing, 5% FEC
+ * and a 32 ms window. A stored config that still matches that exact shape was
+ * never customised, so moving it to the native/60/low-latency baseline is the
+ * same as shipping a new default. Anything the user changed stays untouched.
+ */
+function migrateToNativeBaseline(config: VmaXConfig): VmaXConfig {
+  const v = config.video;
+  const n = config.network;
+  const untouchedShippedBaseline =
+    v.resolution === "1080p" &&
+    v.framerate === 60 &&
+    v.bitrateMbps === 20 &&
+    v.framePacing === "balanced" &&
+    v.sharpness === 25 &&
+    v.viewerSharpness === 55 &&
+    n.fecRedundancyPct === 5 &&
+    n.packetWindowMs === 32 &&
+    n.congestionSensitivity === "balanced";
+  if (!untouchedShippedBaseline) {
+    return migrateToGamingBaseline(config);
+  }
+  // Only picture policy moves here. The 20 Mbps / 5% FEC / 32 ms budget is
+  // already what a relayed internet session needs, so it is left alone.
+  return migrateToGamingBaseline({
+    ...config,
+    video: {
+      ...v,
+      resolution: "native",
+      framePacing: "motion",
+      sharpness: 20,
+      viewerSharpness: 30,
+    },
+    network: {
+      ...n,
+      congestionSensitivity: "low_latency",
+    },
+  });
+}
+
+/**
+ * The native baseline that shipped next was native/60 at 20 Mbps, motion
+ * pacing, 20 host / 30 viewer sharpening, 5% FEC, a 32 ms repair window and
+ * low-latency congestion. A config that still matches that whole shape was
+ * never tuned by hand, so it follows the new gaming default: 120 FPS, a 60 Mbps
+ * adaptive ceiling, stronger sharpening, a one-frame repair window and 192 kbps
+ * audio. Any deliberate change (or a preset the user picked) is left alone.
+ */
+function migrateToGamingBaseline(config: VmaXConfig): VmaXConfig {
+  const v = config.video;
+  const n = config.network;
+  const untouchedNativeBaseline =
+    v.resolution === "native" &&
+    v.framerate === 60 &&
+    v.bitrateMbps === 20 &&
+    v.framePacing === "motion" &&
+    v.sharpness === 20 &&
+    v.viewerSharpness === 30 &&
+    v.upscaling === "off" &&
+    v.lockResolution &&
+    v.constantFps &&
+    !v.unlimitedBitrate &&
+    n.fecRedundancyPct === 5 &&
+    n.packetWindowMs === 32 &&
+    n.congestionSensitivity === "low_latency";
+  if (!untouchedNativeBaseline) {
+    return config;
+  }
+  return {
+    ...config,
+    video: {
+      ...v,
+      framerate: 120,
+      bitrateMbps: 60,
+      sharpness: 30,
+      viewerSharpness: 55,
+    },
+    audio: {
+      ...config.audio,
+      // Only lift audio if it was never touched either.
+      bitrateKbps: config.audio.bitrateKbps === 128 ? 192 : config.audio.bitrateKbps,
+    },
+    network: {
+      ...n,
+      packetWindowMs: 16,
+    },
+  };
+}
+
 function loadSavedConfig(): VmaXConfig {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -204,7 +308,7 @@ function loadSavedConfig(): VmaXConfig {
     const n = isRecord(parsed.network) ? parsed.network : {};
     const c = isRecord(parsed.customization) ? parsed.customization : {};
 
-    return {
+    return migrateToNativeBaseline({
       video: {
         resolution: asResolution(v.resolution, DEFAULT_VMAX_CONFIG.video.resolution),
         framerate: asFramerate(v.framerate, DEFAULT_VMAX_CONFIG.video.framerate),
@@ -269,7 +373,7 @@ function loadSavedConfig(): VmaXConfig {
         hapticsEnabled: asBoolean(c.hapticsEnabled, true),
         hapticsIntensity: Math.round(asClampedNumber(c.hapticsIntensity, 0, 100, 100)),
       },
-    };
+    });
   } catch {
     return DEFAULT_VMAX_CONFIG;
   }

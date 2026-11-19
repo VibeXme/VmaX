@@ -1475,16 +1475,16 @@ async fn run_p2p_session(
         Err(NetworkError::HolePunchTimeout)
     } else {
         set_phase(ConnectionPhase::HolePunching, &telemetry, &event_tx).await;
-        let probe_ms =
-            if mutual_auth && config.protocol == TransportProtocol::Quic && public_signaling {
-                config.hole_punch_timeout_ms.min(1_500)
-            } else {
-                config.hole_punch_timeout_ms
-            };
+        // A public (WAN) punch gets the full configured budget. It used to be
+        // capped at 1.5 s, which most friend-to-friend NATs cannot clear; the
+        // session then fell back to the WebSocket relay and paid TCP
+        // head-of-line blocking for the rest of the call. A direct path is
+        // worth the extra seconds of setup, and relay-only sessions skip
+        // punching entirely.
         hole_punch_udp(
             &udp_socket,
             &candidates,
-            Duration::from_millis(probe_ms),
+            Duration::from_millis(config.hole_punch_timeout_ms),
             tag,
             shutdown_rx.clone(),
         )

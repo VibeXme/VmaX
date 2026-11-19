@@ -63,11 +63,14 @@ const MIN_ENCODE_FPS_SCALE: f32 = 0.5;
 const ENCODE_FPS_SCALE_STEP: f32 = 0.15;
 
 fn default_resolution() -> String {
-    "1440p".to_string()
+    // Native = the host display's own size; see `parse_resolution_ceiling`.
+    "native".to_string()
 }
 
 fn default_framerate() -> u16 {
-    60
+    // Gaming baseline: high-refresh cadence. The client's panel refresh still
+    // caps the negotiated rate, so a 60 Hz viewer is never sent 120 FPS.
+    120
 }
 
 fn default_encoder() -> String {
@@ -82,12 +85,20 @@ fn default_audio_bitrate() -> u16 {
     192
 }
 
+fn default_frame_pacing() -> FramePacing {
+    // The shipped preset paces for motion; the enum's own Default is the old
+    // balanced value, which would silently undo that for payloads that omit it.
+    FramePacing::Motion
+}
+
 fn default_fec_pct() -> u8 {
-    10
+    // Match the frontend default preset; 10% parity on a 20 Mbps budget is
+    // pure overhead on a path that already carries 2 frame intervals of slack.
+    5
 }
 
 fn default_sharpness() -> u8 {
-    35
+    30
 }
 
 fn default_jitter_window() -> u64 {
@@ -95,7 +106,9 @@ fn default_jitter_window() -> u64 {
 }
 
 fn default_congestion_sensitivity() -> CongestionSensitivity {
-    NetworkConfig::default().congestion_sensitivity
+    // The shipped preset trades bitrate before latency rather than sitting in
+    // the balanced middle; keep serde defaults in step with the UI.
+    CongestionSensitivity::LowLatency
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +134,7 @@ pub struct StartSessionParams {
     pub resolution: String,
     #[serde(default = "default_framerate")]
     pub framerate: u16,
-    #[serde(default)]
+    #[serde(default = "default_frame_pacing")]
     pub frame_pacing: FramePacing,
     #[serde(default = "default_jitter_window")]
     pub jitter_window_ms: u64,
@@ -201,7 +214,7 @@ pub struct VideoSettingsPayload {
     pub upscaling: String,
     #[serde(default)]
     pub renderer: String,
-    #[serde(default)]
+    #[serde(default = "default_frame_pacing")]
     pub frame_pacing: FramePacing,
     /// Never shrink the encoded resolution below what the host configured.
     #[serde(default = "default_true")]
@@ -255,18 +268,19 @@ impl Default for VmaXSettingsPayload {
         Self {
             video: VideoSettingsPayload {
                 // Match the frontend defaults so a session started without a
-                // settings payload still negotiates 1080p60 at a ceiling every
-                // client class can carry, instead of 4K at 40 Mbps.
-                resolution: "1080p".to_string(),
-                framerate: 60,
-                bitrate_mbps: 20,
+                // settings payload still negotiates the host display's native
+                // size at a constant 120 FPS with the gaming preset's adaptive
+                // 60 Mbps ceiling.
+                resolution: "native".to_string(),
+                framerate: 120,
+                bitrate_mbps: 60,
                 encoder: "hardware".to_string(),
                 codec: "auto".to_string(),
                 chroma: "420".to_string(),
                 sharpness: default_sharpness(),
                 upscaling: "off".to_string(),
                 renderer: "auto".to_string(),
-                frame_pacing: FramePacing::default(),
+                frame_pacing: FramePacing::Motion,
                 lock_resolution: true,
                 constant_fps: true,
                 // Adaptive by default: the ceiling is still the user's value,
@@ -277,14 +291,17 @@ impl Default for VmaXSettingsPayload {
             },
             audio: AudioSettingsPayload {
                 ai_noise_suppression: true,
-                bitrate_kbps: 128,
+                bitrate_kbps: default_audio_bitrate(),
             },
             network: NetworkSettingsPayload {
                 protocol: "quic".to_string(),
-                fec_redundancy_pct: 10,
-                packet_window_ms: default_jitter_window(),
+                // Same path the UI ships: parity for the relayed case, one
+                // frame interval of reassembly slack, and congestion control
+                // that trades bitrate before it trades latency.
+                fec_redundancy_pct: 5,
+                packet_window_ms: 16,
                 hardware_cursor: true,
-                congestion_sensitivity: default_congestion_sensitivity(),
+                congestion_sensitivity: CongestionSensitivity::LowLatency,
             },
             customization: CustomizationSettingsPayload {
                 stats_overlay: true,
