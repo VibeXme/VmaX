@@ -431,6 +431,11 @@ export function SettingsModal({
               >
                 Settings
               </h2>
+              {buildVersion && (
+                <p className="mt-0.5 text-[11px] leading-tight text-zinc-500">
+                  VmaX {buildVersion}
+                </p>
+              )}
             </div>
           </div>
 
@@ -586,7 +591,6 @@ export function SettingsModal({
             {activeTab === "video" && (
               <>
                 <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-zinc-500">
-                {buildVersion && <p className="text-xs text-zinc-400">VmaX {buildVersion}</p>}
                   <Monitor className="h-3.5 w-3.5 text-zinc-400" />
                   <span>Video &amp; Display</span>
                 </div>
@@ -1060,7 +1064,7 @@ export function SettingsModal({
         </div>
 
         {/* Footer */}
-        <div className="vmax-settings-footer shrink-0 flex items-center justify-between gap-3 border-t border-zinc-800 bg-zinc-950/50 px-4 sm:px-6 py-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+        <div className="vmax-settings-footer shrink-0 flex items-center justify-between gap-3 border-t border-zinc-800 bg-zinc-950 px-4 sm:px-6 py-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           <button
             type="button"
             onClick={onReset}
