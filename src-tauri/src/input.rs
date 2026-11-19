@@ -111,6 +111,10 @@ pub fn build_input_packet(seq: u64, payload: FrontendInputPayload) -> InputPacke
 pub struct HeldRemoteInputs {
     keys: std::collections::HashSet<u32>,
     buttons: std::collections::HashSet<u8>,
+    /// Highest input sequence already applied. Critical input is sent both as a
+    /// datagram (fast path) and on the reliable stream (loss recovery), so the
+    /// host must ignore the later duplicate/older copy.
+    last_input_seq: Option<u64>,
     last_position_seq: Option<u64>,
 }
 
@@ -163,6 +167,13 @@ impl HeldRemoteInputs {
         packet: &InputPacket,
         bounds: Option<windows::Win32::Foundation::RECT>,
     ) -> bool {
+        if self
+            .last_input_seq
+            .is_some_and(|last| packet.seq <= last)
+        {
+            return true;
+        }
+        self.last_input_seq = Some(packet.seq);
         let event = &packet.event;
         if matches!(
             event,
