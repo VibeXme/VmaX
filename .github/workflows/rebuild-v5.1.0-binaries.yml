@@ -1,0 +1,67 @@
+name: Rebuild v5.1.0 binaries
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild-release-binaries:
+    if: github.repository == 'VibeXme/VmaX'
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout patched source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install frontend and Tauri dependencies
+        shell: pwsh
+        run: npm ci
+
+      - name: Install Rust targets
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          rustup target add aarch64-linux-android
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: |
+          npm.cmd run tauri -- build --ci --no-bundle --target x86_64-pc-windows-msvc -- --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $meta = cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps --locked | ConvertFrom-Json
+          $exe = Join-Path $meta.target_directory 'x86_64-pc-windows-msvc\release\vmax.exe'
+          if (-not (Test-Path $exe)) { throw "Windows executable was not produced at $exe" }
+          Copy-Item -LiteralPath $exe -Destination 'VmaX.exe' -Force
+
+      - name: Build Android ARM64 APK
+        shell: pwsh
+        run: |
+          .\build_vmax_release.ps1 -SkipWindows -SkipInstaller
+          if (-not (Test-Path 'VmaX-Android-arm64.apk')) {
+            throw 'Android APK was not produced.'
+          }
+
+      - name: Verify release files
+        shell: pwsh
+        run: |
+          Get-Item VmaX.exe, VmaX-Android-arm64.apk | Format-Table Name,Length,LastWriteTime
+          if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
+          if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
+
+      - name: Replace v5.1.0 EXE and APK
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload v5.1.0 VmaX.exe VmaX-Android-arm64.apk --clobber --repo VibeXme/VmaX
