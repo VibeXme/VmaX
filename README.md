@@ -122,8 +122,17 @@ cd src-tauri
 cargo test --lib
 ```
 
-## Fixes in 5.0.0
+## Fixes in 5.1.0
 
+- **Native 120 FPS gaming baseline** — Default preset now captures at the host's own display resolution ("Native") at a constant 120 FPS with a 60 Mbps adaptive ceiling. Congestion control trades bitrate before latency.
+- **New "Native" resolution option** — Keeps the host's exact display size (up to 8K); the encoder never upscales.
+- **One-frame repair window** — Jitter buffer reduced from 32 ms to 16 ms (one frame at 120 Hz).
+- **Stronger reconstruction sharpening** — Host sharpening 30 → viewer sharpening 55 for readable HUD text through 4:2:0.
+- **192 kbps Opus audio** — Up from 128 kbps for clearer voice and game audio.
+- **Windows power-throttling opt-out** — Disables EcoQoS so capture/encode threads keep full priority when window loses focus.
+- **Longer hole-punch budget** — Removed 1.5 s WAN cap; direct NAT traversal gets the full configured timeout.
+- **WebView2 background timer throttling disabled** — Keeps decode/present loop responsive.
+- **Duplicated LAN preset ID fixed** — Presets are now `native`, `lan`, `latency`, `esports`, and `showcase`.
 - Installed the rustls `ring` crypto provider exactly once at startup, fixing the
   crash on the first TLS/signaling connection (both `ring` and `aws-lc-rs` are
   enabled transitively, so rustls could not infer a provider).
