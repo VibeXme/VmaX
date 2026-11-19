@@ -280,6 +280,46 @@ input:is([type="range"], [type="checkbox"]), input[type="radio"] { accent-color:
 }
 .vmax-theme-picker { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 9px; }
 .vmax-theme-picker button { justify-content: flex-start; }
+/*
+ * Presets sit above the tabs because they span every tab. The active chip is
+ * the configuration that is live *now*, so it uses the same accent treatment as
+ * the active category instead of inventing a second "selected" look.
+ */
+.vmax-preset-panel {
+  border: 1px solid var(--vmax-control-border);
+  border-radius: 12px;
+  background: var(--vmax-card);
+  padding: 12px;
+}
+.vmax-preset-row { gap: 6px; }
+.vmax-preset-chip {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--vmax-control-border);
+  border-radius: 9999px;
+  background: var(--vmax-surface);
+  overflow: hidden;
+}
+.vmax-preset-chip:hover { border-color: var(--vmax-accent); }
+.vmax-preset-chip > button {
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 0;
+  background: transparent;
+  color: #f1f4fa;
+  font-size: .78rem;
+}
+.vmax-preset-chip > button:hover { color: var(--vmax-accent); }
+.vmax-preset-chip > button[aria-pressed="true"] {
+  color: var(--vmax-accent);
+  background: color-mix(in srgb, var(--vmax-accent) 13%, var(--vmax-surface));
+}
+.vmax-preset-chip > .vmax-preset-remove {
+  padding-inline: 6px 10px;
+  color: #a0a9b7;
+  border-left: 1px solid var(--vmax-control-border);
+}
+.vmax-preset-chip > .vmax-preset-remove:hover { color: #fda4af; }
 .vmax-theme-swatch { width: 16px; height: 16px; flex: none; border-radius: 50%; background: var(--vmax-theme-preview); }
 [data-theme-choice="neon"] { --vmax-theme-preview: #1be4f4; }
 [data-theme-choice="blue"] { --vmax-theme-preview: #348dff; }

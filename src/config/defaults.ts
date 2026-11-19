@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AudioBitrateKbps,
   AudioSettings,
@@ -14,25 +14,32 @@ import type {
   UpscalingMode,
   VmaXConfig,
 } from "../types";
+import {
+  type SettingsPreset,
+  MAX_CUSTOM_PRESETS,
+  applyPresetToConfig,
+  builtinPresets,
+  loadCustomPresets,
+  persistCustomPresets,
+  presetMatches,
+  snapshotPreset,
+} from "./presets";
 
 const STORAGE_KEY = "vmax.config.v1";
 
 export const MAX_STREAM_BITRATE_MBPS = 200;
 export const STREAM_FRAMERATES = [30, 60, 90, 120, 144] as const;
 
-export const STREAM_PRESETS = {
-  latency: { label: "Low latency", resolution: "1080p", framerate: 60, bitrateMbps: 25, fec: 0, framePacing: "motion" },
-  balanced: { label: "Balanced", resolution: "1080p", framerate: 60, bitrateMbps: 20, fec: 5, framePacing: "balanced" },
-  quality: { label: "High quality", resolution: "1080p", framerate: 60, bitrateMbps: 35, fec: 5, framePacing: "detail" },
-  mobile: { label: "Unstable network", resolution: "720p", framerate: 60, bitrateMbps: 8, fec: 15, framePacing: "motion" },
-} as const;
-
 const DEFAULT_NVENC: NvencSettings = {
   preset: 4,
   vbr: true,
-  vbvFrames: 1,
+  // Two frame-times of rate budget: one frame forces a quantiser cliff on
+  // every detailed frame, which is what made text look soft and then sharp.
+  vbvFrames: 2,
   aqStrength: 8,
-  minQp: 5,
+  // 5 was where 4:2:0 text stopped sharpening: the rate controller would not
+  // spend another bit on a static screen. 3 lets text use the VBR headroom.
+  minQp: 3,
   quarterPass: true,
   intraRefresh: true,
   refreshPeriod: 120,
@@ -41,15 +48,17 @@ const DEFAULT_NVENC: NvencSettings = {
 
 export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
   video: {
-    resolution: STREAM_PRESETS.balanced.resolution,
-    framerate: STREAM_PRESETS.balanced.framerate,
-    bitrateMbps: STREAM_PRESETS.balanced.bitrateMbps,
+    resolution: "1080p",
+    framerate: 60,
+    bitrateMbps: 20,
     encoder: "hardware",
     codec: "auto",
     chroma: "420",
     framePacing: "balanced",
     sharpness: 25,
-    viewerSharpness: 40,
+    // Contrast-adaptive sharpening after reconstruction: luma-only, so it
+    // crisps letter edges without amplifying 4:2:0 colour fringing.
+    viewerSharpness: 55,
     upscaling: "off",
     renderer: "auto",
     lockResolution: true,
@@ -71,11 +80,12 @@ export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
   },
   network: {
     protocol: "quic",
-    fecRedundancyPct: STREAM_PRESETS.balanced.fec,
+    fecRedundancyPct: 5,
     hardwareCursor: true,
     // ~2 frame intervals at 60 Hz. Complete frames never wait for it; only
     // incomplete ones get this long to be repaired by a late packet.
     packetWindowMs: 32,
+    congestionSensitivity: "balanced",
   },
   customization: {
     statsOverlay: true,
@@ -134,6 +144,34 @@ function asBoolean(val: unknown, fallback: boolean): boolean {
 }
 
 /**
+ * One frame of rate budget was the old default and the reason detailed frames
+ * (text, UI chrome) collapsed: the VBV only allowed a single frame's bits, so
+ * every busy frame hit the quantiser ceiling. Untouched values move to the
+ * two-frame budget; a deliberate user choice is left alone.
+ */
+function migrateVbvFrames(value: unknown): number {
+  const frames = Math.round(asClampedNumber(value, 1, 4, DEFAULT_NVENC.vbvFrames));
+  return frames === 1 ? DEFAULT_NVENC.vbvFrames : frames;
+}
+
+/** A QP floor of 5 was the old default; 3 is the text-friendly one. */
+function migrateMinQp(value: unknown): number {
+  const qp = Math.round(asClampedNumber(value, 0, 51, DEFAULT_NVENC.minQp));
+  return qp === 5 ? DEFAULT_NVENC.minQp : qp;
+}
+
+/**
+ * The shipped sharpening default was 40, which leaves text soft on a 4:2:0
+ * stream. Untouched settings move to the new default; a chosen value is kept.
+ */
+function migrateViewerSharpness(value: unknown): number {
+  const sharpness = Math.round(
+    asClampedNumber(value, 0, 100, DEFAULT_VMAX_CONFIG.video.viewerSharpness),
+  );
+  return sharpness === 40 ? DEFAULT_VMAX_CONFIG.video.viewerSharpness : sharpness;
+}
+
+/**
  * Settings written before the intra-refresh retune carry the 60/5 pair that
  * produced a visible quality pulse. Untouched values are moved to the thin
  * continuous band; anything the user picked themselves is left alone.
@@ -179,7 +217,7 @@ function loadSavedConfig(): VmaXConfig {
             : "auto",
         framePacing: v.framePacing === "motion" || v.framePacing === "detail" ? v.framePacing : "balanced",
         sharpness: Math.round(asClampedNumber(v.sharpness, 0, 100, DEFAULT_VMAX_CONFIG.video.sharpness)),
-        viewerSharpness: Math.round(asClampedNumber(v.viewerSharpness, 0, 100, DEFAULT_VMAX_CONFIG.video.viewerSharpness)),
+        viewerSharpness: migrateViewerSharpness(v.viewerSharpness),
         upscaling: asUpscaling(v.upscaling, DEFAULT_VMAX_CONFIG.video.upscaling),
         renderer: asGraphicsBackend(v.renderer, DEFAULT_VMAX_CONFIG.video.renderer),
         lockResolution: asBoolean(v.lockResolution, DEFAULT_VMAX_CONFIG.video.lockResolution),
@@ -188,9 +226,9 @@ function loadSavedConfig(): VmaXConfig {
         nvenc: {
           preset: nvenc.preset === 3 ? 3 : 4,
           vbr: asBoolean(nvenc.vbr, DEFAULT_NVENC.vbr),
-          vbvFrames: Math.round(asClampedNumber(nvenc.vbvFrames, 1, 4, DEFAULT_NVENC.vbvFrames)),
+          vbvFrames: migrateVbvFrames(nvenc.vbvFrames),
           aqStrength: Math.round(asClampedNumber(nvenc.aqStrength, 0, 15, DEFAULT_NVENC.aqStrength)),
-          minQp: Math.round(asClampedNumber(nvenc.minQp, 0, 51, DEFAULT_NVENC.minQp)),
+          minQp: migrateMinQp(nvenc.minQp),
           quarterPass: asBoolean(nvenc.quarterPass, DEFAULT_NVENC.quarterPass),
           intraRefresh: asBoolean(nvenc.intraRefresh, DEFAULT_NVENC.intraRefresh),
           refreshPeriod: migrateRefreshPeriod(nvenc.refreshPeriod),
@@ -219,6 +257,9 @@ function loadSavedConfig(): VmaXConfig {
         ),
         hardwareCursor: asBoolean(n.hardwareCursor, DEFAULT_VMAX_CONFIG.network.hardwareCursor),
         packetWindowMs: Math.round(asClampedNumber(n.packetWindowMs, 8, 80, DEFAULT_VMAX_CONFIG.network.packetWindowMs)),
+        congestionSensitivity: (n.congestionSensitivity === "low_latency" || n.congestionSensitivity === "quality" || n.congestionSensitivity === "balanced")
+          ? n.congestionSensitivity
+          : DEFAULT_VMAX_CONFIG.network.congestionSensitivity,
       },
       customization: {
         statsOverlay: asBoolean(c.statsOverlay, DEFAULT_VMAX_CONFIG.customization.statsOverlay),
@@ -236,6 +277,17 @@ function loadSavedConfig(): VmaXConfig {
 
 export function useVmaXConfig() {
   const [config, setConfig] = useState<VmaXConfig>(() => loadSavedConfig());
+  const [customPresets, setCustomPresets] = useState<SettingsPreset[]>(() => loadCustomPresets());
+  const builtins = useMemo(() => builtinPresets(DEFAULT_VMAX_CONFIG), []);
+  const presets = useMemo(() => [...builtins, ...customPresets], [builtins, customPresets]);
+  // `savePreset` snapshots whatever is live right now, without making the
+  // callback depend on the config object (which would rebuild every consumer).
+  const configRef = useRef(config);
+  configRef.current = config;
+  // Presets are read from a ref inside `applyPreset` so the callback identity is
+  // stable: the modal re-renders on every keystroke and must not rebuild it.
+  const presetsRef = useRef(presets);
+  presetsRef.current = presets;
 
   useEffect(() => {
     try {
@@ -244,6 +296,16 @@ export function useVmaXConfig() {
       // Ignore storage quota errors in restricted WebViews.
     }
   }, [config]);
+
+  useEffect(() => {
+    persistCustomPresets(customPresets);
+  }, [customPresets]);
+
+  /** Which preset, if any, exactly describes the live configuration. */
+  const activePresetId = useMemo(
+    () => presets.find((preset) => presetMatches(preset, config))?.id ?? null,
+    [presets, config],
+  );
 
   const updateVideo = useCallback((patch: Partial<StreamVideoSettings>) => {
     setConfig((prev) => ({
@@ -280,18 +342,29 @@ export function useVmaXConfig() {
     }));
   }, []);
 
-  const applyStreamPreset = useCallback((key: keyof typeof STREAM_PRESETS) => {
-    const { resolution, framerate, bitrateMbps, fec, framePacing } = STREAM_PRESETS[key];
-    setConfig((prev) => ({
-      ...prev,
-      video: {
-        ...prev.video, resolution, framerate, bitrateMbps, framePacing,
-        lockResolution: true,
-        constantFps: true,
-        unlimitedBitrate: key === "quality",
-      },
-      network: { ...prev.network, protocol: "quic", fecRedundancyPct: fec },
-    }));
+  /**
+   * Switches the whole stream configuration to `preset`.
+   *
+   * Every field a preset owns is replaced in one state update, so the user
+   * never sees an intermediate mix of two presets where, say, the FPS is new
+   * but the bitrate is old and the pipeline has to re-plan twice.
+   */
+  const applyPreset = useCallback((id: string) => {
+    setConfig((prev) => {
+      const preset = presetsRef.current.find((entry) => entry.id === id);
+      return preset ? applyPresetToConfig(prev, preset) : prev;
+    });
+  }, []);
+
+  /** Saves the live configuration as a new custom preset. */
+  const savePreset = useCallback((name: string) => {
+    const preset = snapshotPreset(configRef.current, name);
+    setCustomPresets((prev) => [...prev, preset].slice(-MAX_CUSTOM_PRESETS));
+    return preset.id;
+  }, []);
+
+  const deletePreset = useCallback((id: string) => {
+    setCustomPresets((prev) => prev.filter((preset) => preset.id !== id));
   }, []);
 
   const applyAutomaticConfig = useCallback(() => {
@@ -310,7 +383,7 @@ export function useVmaXConfig() {
       network: {
         ...prev.network,
         protocol: "quic",
-        fecRedundancyPct: prev.network.fecRedundancyPct || STREAM_PRESETS.balanced.fec,
+        fecRedundancyPct: prev.network.fecRedundancyPct || 5,
       },
     }));
   }, []);
@@ -338,12 +411,16 @@ export function useVmaXConfig() {
 
   return {
     config,
+    presets,
+    activePresetId,
+    applyPreset,
+    savePreset,
+    deletePreset,
     updateVideo,
     updateAudio,
     updateNetwork,
     updateCustomization,
     resetConfig,
-    applyStreamPreset,
     applyAutomaticConfig,
     applyLongDistanceConfig,
   };

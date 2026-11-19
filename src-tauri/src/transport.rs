@@ -166,6 +166,15 @@ pub struct PacerSnapshot {
 }
 
 impl PacerStats {
+    /// Bytes accepted by the pacer that have not left it yet.
+    ///
+    /// Live: the pacing thread subtracts each shard as it departs, so a reader
+    /// on another thread sees the real queue rather than the value at the last
+    /// completion.
+    pub fn queued_bytes(&self) -> u64 {
+        self.queue_bytes.load(Ordering::Relaxed)
+    }
+
     fn snapshot(&self) -> PacerSnapshot {
         PacerSnapshot {
             sent_packets: self.sent_packets.load(Ordering::Relaxed),
@@ -220,10 +229,29 @@ pub struct PacedSender {
 
 impl PacedSender {
     pub fn spawn(conn: Connection, initial_rate_bps: u32, max_queued_frames: usize) -> Self {
+        Self::spawn_with_stats(
+            conn,
+            initial_rate_bps,
+            max_queued_frames,
+            Arc::new(PacerStats::default()),
+        )
+    }
+
+    /// Same as [`PacedSender::spawn`], but the caller keeps the statistics
+    /// object.
+    ///
+    /// The host capture loop reads the queue through it to decide whether a new
+    /// frame can still fit, so it must be able to observe the pacer's live
+    /// queue rather than a snapshot taken at the last frame boundary.
+    pub fn spawn_with_stats(
+        conn: Connection,
+        initial_rate_bps: u32,
+        max_queued_frames: usize,
+        stats: Arc<PacerStats>,
+    ) -> Self {
         let capacity = max_queued_frames.max(1);
         let (tx, rx) = mpsc::sync_channel(capacity);
         let rate_bps = Arc::new(AtomicU64::new(u64::from(initial_rate_bps.max(1))));
-        let stats = Arc::new(PacerStats::default());
         let sent_log = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
         let thread_rate = Arc::clone(&rate_bps);
         let thread_stats = Arc::clone(&stats);

@@ -18,10 +18,13 @@ use crate::input::gamepad::HostGamepad;
 use crate::input::gamepad_client::ClientGamepad;
 use crate::input::touch_gamepad::{TouchGamepad, TouchGamepadInput};
 use crate::input::{FrontendInputPayload, build_input_packet};
+
+#[cfg(target_os = "windows")]
 use crate::native_client::{NativeD3D11Renderer, SwapChainConfig, VideoCodec as NativeVideoCodec};
+
 use crate::network::{
-    ConnectionPhase, NetworkConfig, NetworkEvent, NetworkTelemetry, OutboundVideoFrame,
-    SessionHandle, SessionRole, SessionTx, TransportProtocol,
+    ConnectionPhase, CongestionSensitivity, NetworkConfig, NetworkEvent, NetworkTelemetry,
+    OutboundVideoFrame, SessionHandle, SessionRole, SessionTx, TransportProtocol,
     start_client_session as net_start_client, start_host_session as net_start_host,
     start_saved_client_session as net_start_saved_client,
 };
@@ -91,6 +94,10 @@ fn default_jitter_window() -> u64 {
     NetworkConfig::default().jitter_window_ms
 }
 
+fn default_congestion_sensitivity() -> CongestionSensitivity {
+    NetworkConfig::default().congestion_sensitivity
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartSessionParams {
     pub stream_computer_audio: Option<bool>,
@@ -145,6 +152,8 @@ pub struct StartSessionParams {
     /// Ignore congestion-driven bitrate reductions and use the whole link.
     #[serde(default = "default_true")]
     pub unlimited_bitrate: bool,
+    #[serde(default = "default_congestion_sensitivity")]
+    pub congestion_sensitivity: CongestionSensitivity,
     #[serde(default)]
     pub nvenc: crate::nvenc::NvencSettings,
 }
@@ -222,6 +231,8 @@ pub struct NetworkSettingsPayload {
     pub hardware_cursor: bool,
     #[serde(default = "default_jitter_window")]
     pub packet_window_ms: u64,
+    #[serde(default = "default_congestion_sensitivity")]
+    pub congestion_sensitivity: CongestionSensitivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +284,7 @@ impl Default for VmaXSettingsPayload {
                 fec_redundancy_pct: 10,
                 packet_window_ms: default_jitter_window(),
                 hardware_cursor: true,
+                congestion_sensitivity: default_congestion_sensitivity(),
             },
             customization: CustomizationSettingsPayload {
                 stats_overlay: true,
@@ -291,6 +303,10 @@ struct HostRuntimeControls {
     force_idr: Arc<AtomicBool>,
     force_intra_refresh: Arc<AtomicU32>,
     target_bitrate_bps: Arc<AtomicU32>,
+    /// Video waiting in the pacer and the QUIC send buffer. When it reaches its
+    /// ceiling, encoding another frame only adds to it, and a dropped encoded
+    /// frame costs the viewer a reference chain.
+    send_backlog: crate::network::VideoBacklog,
     /// The controller's latest "this move is worth an encoder round trip"
     /// verdict. Stored rather than consumed: `RateLatch` in the capture loop
     /// decides when to act on it.
@@ -509,6 +525,7 @@ fn build_network_config(effective_signaling: String, params: &StartSessionParams
         },
         fixed_bitrate: params.unlimited_bitrate,
         fec_group_size: map_fec_group_size(params.fec_redundancy_pct),
+        congestion_sensitivity: params.congestion_sensitivity,
         ..Default::default()
     }
 }
@@ -1136,7 +1153,15 @@ async fn spawn_host_capture_thread(
                 // intra-refresh and is what turns a busy link into visible
                 // pulsing. The viewer sees a brief lower frame rate instead of
                 // an artifact plus a keyframe spike.
-                if video_tx.capacity() == 0 {
+                //
+                // `video_tx.capacity()` only catches a worker that is busy,
+                // which is rare: the worker hands frames to the pacer and
+                // returns. The queue that actually grows is the one between the
+                // pacer and the wire, so that is the one to watch. It is also
+                // the queue whose overflow the sender answers by dropping an
+                // encoded delta, which is precisely the event that turns a
+                // saturated uplink into a stutter.
+                if video_tx.capacity() == 0 || controls.send_backlog.saturated() {
                     pacing.set_fps(pace_fps);
                     pacing.wait_next_frame();
                     continue;
@@ -1424,6 +1449,7 @@ pub fn native_video_state() -> NativeVideoState {
 
 /// Reports the Windows renderer policy without claiming that the WebView
 /// channel has already been replaced by a native decoder.
+#[cfg(target_os = "windows")]
 #[tauri::command]
 pub fn native_d3d11_backend_state() -> crate::native_d3d11::NativeD3D11BackendState {
     crate::native_d3d11::state()
@@ -2433,6 +2459,7 @@ async fn start_host_session_internal(
         force_intra_refresh: Arc::new(AtomicU32::new(0)),
         target_bitrate_bps: Arc::new(AtomicU32::new(initial_bps)),
         reconfigure_recommended: Arc::new(AtomicBool::new(false)),
+        send_backlog: handle.tx.video_backlog(),
         desired_max_w: Arc::new(AtomicU32::new(max_w)),
         desired_max_h: Arc::new(AtomicU32::new(max_h)),
         desired_fps: Arc::new(AtomicU16::new(params.framerate.clamp(30, 144))),
@@ -3745,6 +3772,7 @@ pub async fn init_native_client_renderer(
 }
 
 /// Present a decoded frame via native D3D11 renderer
+#[cfg(target_os = "windows")]
 #[tauri::command]
 pub async fn present_native_frame(
     state: State<'_, AppState>,
@@ -3820,6 +3848,7 @@ pub async fn get_opus_plc_stats(
     Ok(0)
 }
 
+#[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 
 #[cfg(target_os = "windows")]
@@ -3830,4 +3859,55 @@ fn hwnd_from_raw(raw: u64) -> HWND {
 #[cfg(not(target_os = "windows"))]
 fn hwnd_from_raw(_raw: u64) -> u64 {
     0
+}
+
+/// Crash log directory: %TEMP%\VmaX
+fn crash_log_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("VmaX")
+}
+
+fn crash_log_path() -> std::path::PathBuf {
+    crash_log_dir().join("crash.log")
+}
+
+fn startup_log_path() -> std::path::PathBuf {
+    crash_log_dir().join("startup.log")
+}
+
+fn ensure_log_dir() {
+    let _ = std::fs::create_dir_all(crash_log_dir());
+}
+
+/// Read the crash log file if it exists
+#[tauri::command]
+pub async fn get_crash_log() -> Result<Option<String>, String> {
+    let path = crash_log_path();
+    if path.exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Read the startup log file if it exists
+#[tauri::command]
+pub async fn get_startup_log() -> Result<Option<String>, String> {
+    let path = startup_log_path();
+    if path.exists() {
+        let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Clear the crash log file
+#[tauri::command]
+pub async fn clear_crash_log() -> Result<(), String> {
+    let path = crash_log_path();
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

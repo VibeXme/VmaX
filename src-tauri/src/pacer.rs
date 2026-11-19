@@ -30,6 +30,14 @@ pub const SHARD_BYTES: usize = 1150;
 /// Spread a frame's datagrams over 60% of the frame interval, leaving the
 /// remaining 40% idle so a mobile modem queue can drain between frames
 /// instead of growing (bufferbloat).
+///
+/// Tightened from 70% to 60%: on a clean LAN the pacer was holding the last
+/// 30% of every frame interval idle purely so the next frame had somewhere to
+/// land. That idle time is latency the client can see, and on a direct QUIC
+/// path there is no modem queue to protect against — the congestion
+/// controller reacts to the same ACK stream. The 60/40 split keeps the
+/// headroom that prevents bufferbloat on cellular while shaving a tenth of a
+/// frame off the wire for every frame on a fast path.
 pub const PACING_BUDGET_PCT: u32 = 60;
 
 /// Clean-link parity.
@@ -338,12 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn pacer_spreads_shards_across_seventy_percent_of_the_frame() {
+    fn pacer_spreads_shards_across_sixty_percent_of_the_frame() {
         let now = Instant::now();
         let pacer = SubFramePacer::new(20_000_000);
         let shards: Vec<Bytes> = (0..10).map(|_| Bytes::from_static(&[0u8; 1150])).collect();
         let plan = pacer.plan(shards, 60, now);
-        let budget = pacer.budget(60); // 11.66 ms at 70% of 16.66 ms
+        let budget = pacer.budget(60); // 10 ms at 60% of 16.66 ms
         assert!(plan.span() <= budget);
         assert!(plan.span() > Duration::ZERO);
         // Evenly spaced: consecutive gaps are within one tick of each other.

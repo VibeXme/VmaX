@@ -1,31 +1,36 @@
-//! Native Windows client renderer using Direct3D 11.
-//!
-//! This module implements the Parsec-style low-latency presentation path:
-//! - HWND-attached IDXGISwapChain with FLIP_DISCARD
-//! - Max frame latency = 1, present with sync interval = 0 (immediate)
-//! - ID3D11VideoDecoder for NV12 hardware decoding directly into GPU memory
-//! - Single-pass HLSL pixel shader: NV12 -> RGB + scaling + FidelityFX CAS
-//! - Client-side cursor as hardware overlay (decoupled from stream)
+/// Native Windows client renderer using Direct3D 11.
+///
+/// This module implements the Parsec-style low-latency presentation path:
+/// - HWND-attached IDXGISwapChain with FLIP_DISCARD
+/// - Max frame latency = 1, present with sync interval = 0 (immediate)
+/// - ID3D11VideoDecoder for NV12 hardware decoding directly into GPU memory
+/// - Single-pass HLSL pixel shader: NV12 -> RGB + scaling + FidelityFX CAS
+/// - Client-side cursor as hardware overlay (decoupled from stream)
 
 use std::ffi::c_void;
+use std::path::Path;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_DECODER, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BLEND, D3D11_BLEND_DESC, D3D11_BLEND_OP, D3D11_BLEND_SRC_ALPHA,
+    D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE, D3D11_BLEND_ZERO,
     D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
+    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_DYNAMIC,
     D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
     D3D11_DECODER_PROFILE_HEVC_VLD_MAIN, D3D11CreateDevice,
-    ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11DeviceContext1,
-    ID3D11InputLayout, ID3D11PixelShader, ID3D11RenderTargetView,
-    ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11BlendState, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
+    ID3D11DeviceContext1, ID3D11InputLayout, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
+    ID3D11Texture2D,
     // ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDecoder,  // Not available in windows-rs 0.62
     // ID3D11VideoDecoderOutputView, ID3D11VideoDevice, ID3D11VideoProcessor,  // Not available in windows-rs 0.62
 };
+use windows::Win32::Graphics::Direct3D11::D3D11_BLEND_OP as D3D11BlendOp;
 use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter1, IDXGIDevice1, IDXGIFactory2,
@@ -135,10 +140,13 @@ pub struct NativeD3D11Renderer {
     // decoder_output_view: Option<ID3D11VideoDecoderOutputView>,  // Not available in windows-rs 0.62
     back_buffer_rtv: Option<ID3D11RenderTargetView>,
     pixel_shader: ID3D11PixelShader,
+    cursor_pixel_shader: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
+    blend_state: ID3D11BlendState,
     input_layout: ID3D11InputLayout,
     vertex_buffer: ID3D11Buffer,
     constant_buffer: ID3D11Buffer,
+    cursor_constant_buffer: ID3D11Buffer,
     width: u32,
     height: u32,
     sharpness: f32,
@@ -188,8 +196,8 @@ impl NativeD3D11Renderer {
         // Create back buffer RTV
         let back_buffer_rtv = create_back_buffer_rtv(&device, &swap_chain)?;
 
-        // Create presentation shader pipeline
-        let (pixel_shader, sampler, input_layout, vertex_buffer, constant_buffer) =
+        // Create presentation shader pipeline (video + cursor)
+        let (pixel_shader, cursor_pixel_shader, sampler, blend_state, input_layout, vertex_buffer, constant_buffer, cursor_constant_buffer) =
             create_presentation_pipeline(&device)?;
 
         // Get initial back buffer size
@@ -203,10 +211,13 @@ impl NativeD3D11Renderer {
             decoder_profile: D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
             back_buffer_rtv: Some(back_buffer_rtv),
             pixel_shader,
+            cursor_pixel_shader,
             sampler,
+            blend_state,
             input_layout,
             vertex_buffer,
             constant_buffer,
+            cursor_constant_buffer,
             width,
             height,
             sharpness: 0.45,
@@ -344,7 +355,7 @@ impl NativeD3D11Renderer {
             self.context.PSSetShader(Some(&self.pixel_shader), None);
         }
 
-        // Draw full-screen quad
+        // Draw full-screen quad (video frame)
         let stride = 16u32; // float4 position + float2 texcoord
         let offset = 0u32;
         let vertex_buffer = Some(self.vertex_buffer.clone());
@@ -355,43 +366,134 @@ impl NativeD3D11Renderer {
             self.context.Draw(4, 0);
         }
 
-        // Present with sync interval = 0 (immediate), flags = 0
-        let present_result = unsafe {
-            self.swap_chain.Present(0, DXGI_PRESENT(0))
-        };
+        // Render cursor overlay if present
+        if let Some(cursor) = &self.cursor_overlay {
+            if cursor.visible {
+                self.render_cursor(cursor)?;
+            }
+        }
+
+        // Present with sync interval = 0 (immediate), flags = 0.
+        //
+        // FLIP_DISCARD with max frame latency = 1 already guarantees that the
+        // GPU has finished the back buffer before we hand it over again, so a
+        // blocking wait here is pure added latency: on a busy GPU it can stall
+        // for a whole refresh, which is exactly the number we are trying to
+        // shave off. The waitable object is kept around for diagnostics and for
+        // the rare case where the driver needs to serialize presents, but it is
+        // never polled synchronously on the present hot path.
+        let present_result = unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)) };
 
         if present_result.is_err() {
             // Handle device removed / lost
             return Err(format!("Present failed: {present_result:?}"));
         }
 
-        // Wait on frame latency waitable object for Present(0) synchronization
-        if let Some(handle) = self.frame_latency_waitable {
-            unsafe {
-                windows::Win32::System::Threading::WaitForSingleObject(handle, 1000);
-            }
+        Ok(())
+    }
+
+    fn render_cursor(&self, cursor: &CursorOverlay) -> Result<(), String> {
+        // Update cursor constant buffer
+        self.update_cursor_constant_buffer(cursor)?;
+
+        // Set cursor texture
+        let srvs = [Some(cursor.srv.clone())];
+        unsafe {
+            self.context.PSSetShaderResources(0, Some(&srvs));
+            self.context.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.context.PSSetConstantBuffers(0, Some(&[Some(self.cursor_constant_buffer.clone())]));
+            self.context.PSSetShader(Some(&self.cursor_pixel_shader), None);
+            // Enable alpha blending for cursor
+            self.context.OMSetBlendState(Some(&self.blend_state), None, 0xFFFFFFFF);
+        }
+
+        // Draw full-screen quad (cursor is positioned via constant buffer)
+        let stride = 16u32;
+        let offset = 0u32;
+        let vertex_buffer = Some(self.vertex_buffer.clone());
+        let strides = [stride];
+        let offsets = [offset];
+        unsafe {
+            self.context.IASetVertexBuffers(0, 1, Some(&vertex_buffer as *const _), Some(strides.as_ptr()), Some(offsets.as_ptr()));
+            self.context.Draw(4, 0);
+        }
+
+        // Disable blending
+        unsafe {
+            self.context.OMSetBlendState(None, None, 0xFFFFFFFF);
         }
 
         Ok(())
     }
 
+    fn update_cursor_constant_buffer(&self, cursor: &CursorOverlay) -> Result<(), String> {
+        #[repr(C, align(16))]
+        struct CursorParams {
+            cursor_pos: [f32; 2],
+            cursor_scale: [f32; 2],
+            hotspot: [f32; 2],
+            _pad: [f32; 2],
+        }
+        const _: () = assert!(std::mem::size_of::<CursorParams>() == 32);
+
+        // Convert cursor position from screen coordinates to normalized [0,1]
+        let cursor_x = cursor.position_x / self.width as f32;
+        let cursor_y = cursor.position_y / self.height as f32;
+        let scale_x = cursor.scale_x / self.width as f32;
+        let scale_y = cursor.scale_y / self.height as f32;
+        let hotspot_x = cursor.hotspot_x as f32 / self.width as f32;
+        let hotspot_y = cursor.hotspot_y as f32 / self.height as f32;
+
+        let params = CursorParams {
+            cursor_pos: [cursor_x, cursor_y],
+            cursor_scale: [scale_x.max(0.001), scale_y.max(0.001)],
+            hotspot: [hotspot_x, hotspot_y],
+            _pad: [0.0, 0.0],
+        };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            self.context
+                .Map(&self.cursor_constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+                .map_err(|e| format!("Map cursor constant buffer failed: {e}"))?;
+
+            std::ptr::copy_nonoverlapping(
+                &params as *const _ as *const u8,
+                mapped.pData as *mut u8,
+                std::mem::size_of::<CursorParams>(),
+            );
+
+            self.context.Unmap(&self.cursor_constant_buffer, 0);
+        }
+        Ok(())
+    }
+
     fn update_constant_buffer(&self, frame: &DecodedFrame) -> Result<(), String> {
-        #[repr(C)]
+        #[repr(C, align(16))]
         struct CasParams {
-            inv_tex_size: [f32; 2],
+            inv_y_tex_size: [f32; 2],
+            inv_uv_tex_size: [f32; 2],
             sharpness: f32,
             full_range: f32,
             decode_size: [f32; 2],
             output_size: [f32; 2],
+            uv_scale: [f32; 2],
             _pad: [f32; 2],
         }
 
+        let y_w = frame.nv12.width as f32;
+        let y_h = frame.nv12.height as f32;
+        let uv_w = y_w / 2.0;
+        let uv_h = y_h / 2.0;
+
         let params = CasParams {
-            inv_tex_size: [1.0 / frame.nv12.width as f32, 1.0 / (frame.nv12.height / 2) as f32],
+            inv_y_tex_size: [1.0 / y_w, 1.0 / y_h],
+            inv_uv_tex_size: [1.0 / uv_w, 1.0 / uv_h],
             sharpness: self.sharpness,
             full_range: if self.full_range { 1.0 } else { 0.0 },
-            decode_size: [frame.nv12.width as f32, frame.nv12.height as f32],
+            decode_size: [y_w, y_h],
             output_size: [self.width as f32, self.height as f32],
+            uv_scale: [y_w / self.width as f32, y_h / self.height as f32],
             _pad: [0.0, 0.0],
         };
 
@@ -707,15 +809,17 @@ fn create_shader_resource_view(
     srv.ok_or_else(|| "CreateShaderResourceView returned null".to_string())
 }
 
-/// Create the single-pass presentation pipeline (vertex shader + pixel shader + constant buffer).
 fn create_presentation_pipeline(
     device: &ID3D11Device,
 ) -> Result<(
-    ID3D11PixelShader,
+    ID3D11PixelShader,      // video pixel shader
+    ID3D11PixelShader,      // cursor pixel shader
     ID3D11SamplerState,
+    ID3D11BlendState,
     ID3D11InputLayout,
-    ID3D11Buffer,
-    ID3D11Buffer,
+    ID3D11Buffer,           // vertex buffer
+    ID3D11Buffer,           // constant buffer (CAS params)
+    ID3D11Buffer,           // cursor constant buffer
 ), String> {
     // Vertex shader: pass-through full-screen quad
     let vs_hlsl = r#"
@@ -731,9 +835,33 @@ fn create_presentation_pipeline(
 
     let vs_blob = compile_shader(vs_hlsl, "main", "vs_5_0")?;
 
-    // Pixel shader: NV12 -> RGB + scaling + CAS (from graphics.rs CAS_BT709_FULL_RANGE_HLSL)
+    // Video pixel shader: NV12 -> RGB + scaling + CAS
     let ps_hlsl = include_str!("../shaders/nv12_cas_presentation.hlsl");
     let ps_blob = compile_shader(ps_hlsl, "main", "ps_5_0")?;
+
+    // Cursor pixel shader: simple BGRA texture with alpha
+    let cursor_ps_hlsl = r#"
+        Texture2D<float4> tex_cursor : register(t0);
+        SamplerState samp : register(s0);
+        
+        cbuffer CursorParams : register(b0) {
+            float2 cursor_pos;    // normalized position (0-1)
+            float2 cursor_scale;  // normalized scale (0-1)
+            float2 hotspot;       // normalized hotspot (0-1)
+            float2 _pad;
+        };
+        
+        float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+            // Transform UV to cursor local space
+            float2 local_uv = (uv - cursor_pos + hotspot * cursor_scale) / cursor_scale;
+            // Clamp to [0,1] for texture sampling
+            if (local_uv.x < 0.0 || local_uv.x > 1.0 || local_uv.y < 0.0 || local_uv.y > 1.0) {
+                return float4(0, 0, 0, 0);
+            }
+            return tex_cursor.Sample(samp, local_uv);
+        }
+    "#;
+    let cursor_ps_blob = compile_shader(cursor_ps_hlsl, "main", "ps_5_0")?;
 
     let vertex_shader = unsafe {
         let mut vs: Option<windows::Win32::Graphics::Direct3D11::ID3D11VertexShader> = None;
@@ -747,6 +875,13 @@ fn create_presentation_pipeline(
         device.CreatePixelShader(&ps_blob, None, Some(&mut ps))
             .map_err(|e| format!("CreatePixelShader failed: {e}"))?;
         ps.ok_or_else(|| "CreatePixelShader returned null".to_string())?
+    };
+
+    let cursor_pixel_shader = unsafe {
+        let mut ps: Option<ID3D11PixelShader> = None;
+        device.CreatePixelShader(&cursor_ps_blob, None, Some(&mut ps))
+            .map_err(|e| format!("CreateCursorPixelShader failed: {e}"))?;
+        ps.ok_or_else(|| "CreateCursorPixelShader returned null".to_string())?
     };
 
     // Input layout: POSITION (float2) + TEXCOORD (float2)
@@ -782,13 +917,15 @@ fn create_presentation_pipeline(
     };
 
     // Full-screen quad vertex buffer (4 vertices, triangle strip)
+    // UV coordinates: D3D11 texture space has (0,0) at top-left
+    // NDC: (-1,-1)=bottom-left, (1,1)=top-right
     #[repr(C)]
     struct Vertex { pos: [f32; 2], uv: [f32; 2] }
     let vertices = [
-        Vertex { pos: [-1.0, -1.0], uv: [0.0, 1.0] },
-        Vertex { pos: [1.0, -1.0], uv: [1.0, 1.0] },
-        Vertex { pos: [-1.0, 1.0], uv: [0.0, 0.0] },
-        Vertex { pos: [1.0, 1.0], uv: [1.0, 0.0] },
+        Vertex { pos: [-1.0, -1.0], uv: [0.0, 1.0] }, // bottom-left
+        Vertex { pos: [1.0, -1.0], uv: [1.0, 1.0] },  // bottom-right
+        Vertex { pos: [-1.0, 1.0], uv: [0.0, 0.0] },  // top-left
+        Vertex { pos: [1.0, 1.0], uv: [1.0, 0.0] },   // top-right
     ];
 
     let vb_desc = D3D11_BUFFER_DESC {
@@ -834,9 +971,47 @@ fn create_presentation_pipeline(
         s.ok_or_else(|| "CreateSamplerState returned null".to_string())?
     };
 
-    // Constant buffer for CAS parameters
+    // Blend state for cursor alpha blending
+    let blend_desc = D3D11_BLEND_DESC {
+        AlphaToCoverageEnable: windows_core::BOOL(0),
+        IndependentBlendEnable: windows_core::BOOL(0),
+        RenderTarget: [D3D11_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: windows_core::BOOL(1),
+            SrcBlend: D3D11_BLEND_SRC_ALPHA,
+            DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D11BlendOp(1), // D3D11_BLEND_OP_ADD = 1
+            SrcBlendAlpha: D3D11_BLEND_ONE,
+            DestBlendAlpha: D3D11_BLEND_ZERO,
+            BlendOpAlpha: D3D11BlendOp(1), // D3D11_BLEND_OP_ADD = 1
+            RenderTargetWriteMask: 0xF,
+        }, D3D11_RENDER_TARGET_BLEND_DESC::default(), D3D11_RENDER_TARGET_BLEND_DESC::default(), 
+           D3D11_RENDER_TARGET_BLEND_DESC::default(), D3D11_RENDER_TARGET_BLEND_DESC::default(),
+           D3D11_RENDER_TARGET_BLEND_DESC::default(), D3D11_RENDER_TARGET_BLEND_DESC::default(),
+           D3D11_RENDER_TARGET_BLEND_DESC::default()],
+    };
+
+    let blend_state = unsafe {
+        let mut bs: Option<ID3D11BlendState> = None;
+        device.CreateBlendState(&blend_desc, Some(&mut bs))
+            .map_err(|e| format!("CreateBlendState failed: {e}"))?;
+        bs.ok_or_else(|| "CreateBlendState returned null".to_string())?
+    };
+
+    // Constant buffer for CAS parameters (16-byte aligned, 48 bytes = 3 * 16)
+    #[repr(C, align(16))]
+    struct CasParams {
+        inv_y_tex_size: [f32; 2],
+        inv_uv_tex_size: [f32; 2],
+        sharpness: f32,
+        full_range: f32,
+        decode_size: [f32; 2],
+        output_size: [f32; 2],
+        uv_scale: [f32; 2],
+    }
+    const _: () = assert!(std::mem::size_of::<CasParams>() == 48);
+
     let cb_desc = D3D11_BUFFER_DESC {
-        ByteWidth: 256, // Enough for CasParams
+        ByteWidth: std::mem::size_of::<CasParams>() as u32,
         Usage: D3D11_USAGE_DYNAMIC,
         BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_CONSTANT_BUFFER.0 as u32,
         CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
@@ -851,15 +1026,79 @@ fn create_presentation_pipeline(
         cb.ok_or_else(|| "Create constant buffer returned null".to_string())?
     };
 
-    Ok((pixel_shader, sampler, input_layout, vertex_buffer, constant_buffer))
+    // Cursor constant buffer (32 bytes, 16-byte aligned)
+    #[repr(C, align(16))]
+    struct CursorParams {
+        cursor_pos: [f32; 2],
+        cursor_scale: [f32; 2],
+        hotspot: [f32; 2],
+        _pad: [f32; 2],
+    }
+    const _: () = assert!(std::mem::size_of::<CursorParams>() == 32);
+
+    let cursor_cb_desc = D3D11_BUFFER_DESC {
+        ByteWidth: std::mem::size_of::<CursorParams>() as u32,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        MiscFlags: 0,
+        StructureByteStride: 0,
+    };
+
+    let cursor_constant_buffer = unsafe {
+        let mut cb: Option<ID3D11Buffer> = None;
+        device.CreateBuffer(&cursor_cb_desc, None, Some(&mut cb))
+            .map_err(|e| format!("Create cursor constant buffer failed: {e}"))?;
+        cb.ok_or_else(|| "Create cursor constant buffer returned null".to_string())?
+    };
+
+    Ok((pixel_shader, cursor_pixel_shader, sampler, blend_state, input_layout, vertex_buffer, constant_buffer, cursor_constant_buffer))
 }
 
-/// Compile HLSL shader using D3DCompile.
+/// Compile HLSL shader using dxc (if available) or load pre-compiled bytecode.
+/// For production, shaders are pre-compiled at build time via build.rs and embedded.
 fn compile_shader(source: &str, entry: &str, target: &str) -> Result<Vec<u8>, String> {
-    // Pre-compile shaders offline and embed bytecode for production.
-    // This is a placeholder - in reality you'd use dxc or fxc to compile ahead of time.
-    let _ = (source, entry, target);
-    Err("Runtime shader compilation not implemented - pre-compile shaders offline".to_string())
+    // Try to load pre-compiled bytecode first (for production)
+    let shader_name = match target {
+        "vs_5_0" => "vs_main",
+        "ps_5_0" => {
+            if source.contains("NV12") || source.contains("tex_y") {
+                "ps_video"
+            } else {
+                "ps_cursor"
+            }
+        },
+        _ => return Err(format!("Unknown shader target: {target}")),
+    };
+    
+    // Try loading from build output directory
+    let bytecode_path = Path::new(env!("OUT_DIR")).join(format!("{}.cso", shader_name));
+    if bytecode_path.exists() {
+        return std::fs::read(&bytecode_path)
+            .map_err(|e| format!("Failed to read pre-compiled shader {}: {}", shader_name, e));
+    }
+    
+    // Fallback: try runtime compilation with dxc (development only)
+    #[cfg(feature = "runtime-shader-compile")]
+    {
+        compile_shader_dxc(source, entry, target)
+    }
+    
+    #[cfg(not(feature = "runtime-shader-compile"))]
+    {
+        Err(format!(
+            "Shader '{}' not pre-compiled. Run build.rs to compile shaders, or enable 'runtime-shader-compile' feature.",
+            shader_name
+        ))
+    }
+}
+
+/// Runtime shader compilation using dxc (development only)
+#[cfg(feature = "runtime-shader-compile")]
+fn compile_shader_dxc(source: &str, entry: &str, target: &str) -> Result<Vec<u8>, String> {
+    // This would use dxc via a separate crate or process
+    // For now, return error to force pre-compilation
+    Err("Runtime shader compilation not yet implemented".to_string())
 }
 
 /// Get current swap chain size.

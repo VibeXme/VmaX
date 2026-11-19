@@ -40,6 +40,10 @@ export function CloudAccounts({ section, canHost, hostParams, join, active, cont
   const [loadError, setLoadError] = useState("");
   const [notice, setNotice] = useState("");
   const [queuedLink, setQueuedLink] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<Profile[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [waiting, setWaiting] = useState("");
 
   async function refresh() {
     try {
@@ -69,10 +73,33 @@ export function CloudAccounts({ section, canHost, hostParams, join, active, cont
     try { await action(); } catch (error) { setError(String(error)); }
     finally { setBusy(false); }
   }
-  async function connect(target: string, invite?: string) {
-    const route = await invoke<string>("cloud_connect", { target, invite });
-    await join(route);
+  async function connect(target: string, invite?: string, label = "the host") {
+    setWaiting(label);
+    try {
+      const route = await invoke<string>("cloud_connect", { target, invite });
+      await join(route);
+    } finally {
+      setWaiting("");
+    }
   }
+
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!data || section !== "friends" || trimmed.length < 2) {
+      setHits([]);
+      setSearching(false);
+      return;
+    }
+    let current = true;
+    setSearching(true);
+    const timer = window.setTimeout(() => {
+      invoke<Profile[]>("cloud_search", { query: trimmed })
+        .then((found) => { if (current) setHits(found); })
+        .catch((error) => { if (current) setError(String(error)); })
+        .finally(() => { if (current) setSearching(false); });
+    }, 250);
+    return () => { current = false; clearTimeout(timer); };
+  }, [query, section, data]);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -118,7 +145,7 @@ export function CloudAccounts({ section, canHost, hostParams, join, active, cont
           {online(device) ? device.status.replace("_", " ") : "Offline"} · {device.platform}
         </small></div>
         {device.device_id !== data?.device_id && device.can_host && online(device) &&
-          <button className="vmax-primary" disabled={busy || active} onClick={() => void run(() => connect(device.device_id))}>{label}</button>}
+          <button className="vmax-primary" disabled={busy || active} onClick={() => void run(() => connect(device.device_id, undefined, device.device_name))}>{label}</button>}
       </div>
     ));
   }
@@ -142,6 +169,7 @@ export function CloudAccounts({ section, canHost, hostParams, join, active, cont
       {error && <p role="alert" className="text-rose-300">{error}</p>}
       {loadError && <p role="alert" className="text-rose-300">{loadError}</p>}
       {notice && <p role="status">{notice}</p>}
+      {waiting && <p role="status">Waiting for {waiting} to accept the join request…</p>}
       {project === undefined ? <p role="status">Checking account setup…</p> :
         (project === null || configure) ? <form className="grid gap-2" onSubmit={(event) => {
           event.preventDefault();
@@ -224,6 +252,18 @@ export function CloudAccounts({ section, canHost, hostParams, join, active, cont
             })}>{copied ? "Link copied" : "Copy Invite Link"}</button>
           </div>}
         </> : <>
+          <input aria-label="Search people" placeholder="Search by username" value={query} onChange={(event) => setQuery(event.target.value)} />
+          {searching && <p role="status">Searching…</p>}
+          {!searching && query.trim().length >= 2 && hits.length === 0 && <p role="status">No accounts match that name.</p>}
+          {hits.map((hit) => <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-zinc-800 p-3" key={hit.id}>
+            <span>{hit.username}#{hit.tag}</span>
+            <button className="vmax-primary" disabled={busy} onClick={() => void run(async () => {
+              await invoke("cloud_friend", { action: "add", value: `${hit.username}#${hit.tag}` });
+              setHits((all) => all.filter((item) => item.id !== hit.id));
+              setQuery("");
+              await refresh();
+            })}>Add friend</button>
+          </div>)}
           <form className="flex flex-wrap gap-2" onSubmit={(event) => {
             event.preventDefault();
             void run(async () => {

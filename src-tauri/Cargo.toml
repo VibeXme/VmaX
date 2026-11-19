@@ -11,6 +11,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+semver = "1.0"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -35,6 +36,7 @@ bytes = "1"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
+getrandom = "0.2"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -84,6 +86,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Power",
     "Win32_Security_Cryptography",
     "Win32_System_Variant",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     "Win32_UI_HiDpi",
     "Win32_UI_Accessibility",
     "Win32_UI_Input_KeyboardAndMouse",

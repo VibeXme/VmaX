@@ -201,11 +201,14 @@ export interface AudioSettings {
   bitrateKbps: AudioBitrateKbps;
 }
 
+export type CongestionSensitivity = "balanced" | "low_latency" | "quality";
+
 export interface NetworkSettings {
   protocol: TransportProtocol;
   fecRedundancyPct: number;
   hardwareCursor: boolean;
   packetWindowMs: number;
+  congestionSensitivity: CongestionSensitivity;
 }
 
 export interface CustomizationSettings {

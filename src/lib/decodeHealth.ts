@@ -27,17 +27,22 @@
 
 /**
  * Queue depth at which the decoder is no longer keeping up with real time.
- * Eight frames is ~133 ms at 60 FPS: past the point where dropping the
- * backlog costs less than showing it.
+ * Six frames is ~100 ms at 60 FPS: past the point where dropping the
+ * backlog costs less than showing it. Kept at six rather than eight because
+ * every frame held in the decode queue is glass-to-glass latency that the
+ * presenter cannot shed — the presenter drops *decoded* frames, not queued
+ * ones, so a queue that is still draining is pure added delay.
  */
-export const BACKLOG_RESET_FRAMES = 8;
+export const BACKLOG_RESET_FRAMES = 6;
 
 /**
  * A queued decoder that has produced nothing for this long is stuck rather
- * than busy. Hardware decoders answer in 1-3 ms, so a quarter of a second of
- * silence with work outstanding cannot be transient.
+ * than busy. Hardware decoders answer in 1-3 ms, so a fifth of a second of
+ * silence with work outstanding cannot be transient. Tightened from 250 ms to
+ * 200 ms: a stall is already a failure, and shortening the wait removes up to
+ * one frame interval of frozen picture before the recovery path runs.
  */
-export const STALL_RESET_MS = 250;
+export const STALL_RESET_MS = 200;
 
 export type DecodeAction = "ok" | "reset";
 

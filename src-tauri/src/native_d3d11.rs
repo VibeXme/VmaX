@@ -15,7 +15,7 @@ pub const FRAME_LATENCY_WAITABLE_OBJECT: bool = true;
 pub const HIDDEN_STREAM_CURSOR: bool = true;
 pub const LOCAL_CURSOR_OVERLAY: bool = true;
 pub const VIDEO_DECODE_SURFACE: &str = "NV12 ID3D11Texture2D";
-pub const DECODER_API: &str = "ID3D11VideoDecoder";
+pub const DECODER_API: &str = "MediaFoundation/NVDEC";
 
 /// Shader inputs used by the native one-pass presentation pipeline.
 #[derive(Debug, Clone, Copy, Serialize)]

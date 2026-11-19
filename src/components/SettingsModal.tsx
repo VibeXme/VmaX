@@ -28,7 +28,8 @@ import type {
   VmaXConfig,
 } from "../types";
 import { SpeedometerSvg } from "./BitrateGauge";
-import { MAX_STREAM_BITRATE_MBPS, STREAM_FRAMERATES, STREAM_PRESETS } from "../config/defaults";
+import { MAX_STREAM_BITRATE_MBPS, STREAM_FRAMERATES } from "../config/defaults";
+import type { SettingsPreset } from "../config/presets";
 
 type SettingsTab = "general" | "video" | "network_audio" | "customization" | "connections" | "advanced" | "controller";
 
@@ -45,7 +46,13 @@ interface SettingsModalProps {
   onAutomaticConfig: () => void;
   onLongDistanceConfig: () => void;
   buildVersion: string | null;
-  onPreset: (preset: keyof typeof STREAM_PRESETS) => void;
+  /** Built-in presets followed by the user's own, in display order. */
+  presets: readonly SettingsPreset[];
+  /** Id of the preset that exactly matches the live configuration, if any. */
+  activePresetId: string | null;
+  onApplyPreset: (id: string) => void;
+  onSavePreset: (name: string) => void;
+  onDeletePreset: (id: string) => void;
   savedConnections: React.ReactNode;
 }
 
@@ -303,13 +310,19 @@ export function SettingsModal({
   onUpdateNetwork,
   onUpdateCustomization,
   onReset,
-  onPreset,
+  presets,
+  activePresetId,
+  onApplyPreset,
+  onSavePreset,
+  onDeletePreset,
   onAutomaticConfig,
   onLongDistanceConfig,
   buildVersion,
   savedConnections,
 }: SettingsModalProps) {
   const desktop = !/Android|iPhone|iPad/i.test(navigator.userAgent);
+  const [presetName, setPresetName] = useState("");
+  const activePreset = presets.find((preset) => preset.id === activePresetId) ?? null;
   const [autostart, setAutostart] = useState(false);
   const [autostartError, setAutostartError] = useState("");
   useEffect(() => {
@@ -470,18 +483,106 @@ export function SettingsModal({
 
           {/* Content Area */}
           <div className="vmax-settings-content flex-1 min-w-0 min-h-0 overflow-y-auto overscroll-contain p-4 sm:p-8 space-y-5">
-            {activeTab === "general" && (desktop ? (
-              <SettingRow title="Start minimized to tray on boot" hint="Keep VmaX available from the Windows or desktop tray.">
-                <input type="checkbox" aria-label="Start minimized to tray on boot" checked={autostart}
-                  onChange={(event) => {
-                    const enabled = event.target.checked;
-                    setAutostartError("");
-                    void invoke("set_autostart", { enabled }).then(() => setAutostart(enabled))
-                      .catch((error) => setAutostartError(String(error)));
-                  }} />
-                {autostartError && <span role="alert">{autostartError}</span>}
-              </SettingRow>
-            ) : <p>Autostart is available on desktop.</p>)}
+            {activeTab === "general" && (
+              <>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-zinc-500">
+                    <Settings className="h-3.5 w-3.5 text-zinc-400" />
+                    <span>General</span>
+                  </div>
+                </div>
+
+                <section className="vmax-preset-panel" aria-label="Settings presets">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-white">Presets</p>
+                      <p className="text-xs text-zinc-500">
+                        One click sets resolution, FPS, bitrate, pacing, FEC, packet window, audio and the overlay together.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        aria-label="New preset name"
+                        placeholder="Name this setup"
+                        value={presetName}
+                        maxLength={40}
+                        onChange={(event) => setPresetName(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key !== "Enter") return;
+                          event.preventDefault();
+                          onSavePreset(presetName);
+                          setPresetName("");
+                        }}
+                        className="min-w-0 rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-white"
+                      />
+                      <button
+                        type="button"
+                        className="vmax-secondary"
+                        onClick={() => {
+                          onSavePreset(presetName);
+                          setPresetName("");
+                        }}
+                      >
+                        Save current
+                      </button>
+                    </div>
+                  </div>
+                  <div className="vmax-chip-row vmax-preset-row mt-3">
+                    {presets.map((preset) => (
+                      <span
+                        key={preset.id}
+                        className="vmax-preset-chip"
+                      >
+                        <button
+                          type="button"
+                          aria-pressed={preset.id === activePresetId}
+                          title={preset.summary}
+                          onClick={() => onApplyPreset(preset.id)}
+                        >
+                          {preset.name}
+                        </button>
+                        {!preset.builtin && (
+                          <button
+                            type="button"
+                            className="vmax-preset-remove"
+                            aria-label={`Delete preset ${preset.name}`}
+                            title="Delete this preset"
+                            onClick={() => onDeletePreset(preset.id)}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                  {activePreset ? (
+                    <p className="vmax-status mt-3" role="status">
+                      {activePreset.summary}
+                    </p>
+                  ) : (
+                    <p className="vmax-status mt-3" role="status">
+                      Custom settings — save them as a preset to come back to them later.
+                    </p>
+                  )}
+                </section>
+                <div className="space-y-3.5">
+                  {desktop ? (
+                    <SettingRow title="Start minimized to tray on boot" hint="Keep VmaX available from the Windows or desktop tray.">
+                      <input type="checkbox" aria-label="Start minimized to tray on boot" checked={autostart}
+                        onChange={(event) => {
+                          const enabled = event.target.checked;
+                          setAutostartError("");
+                          void invoke("set_autostart", { enabled }).then(() => setAutostart(enabled))
+                            .catch((error) => setAutostartError(String(error)));
+                        }} />
+                      {autostartError && <span role="alert">{autostartError}</span>}
+                    </SettingRow>
+                  ) : (
+                    <p>Autostart is available on desktop.</p>
+                  )}
+                </div>
+              </>
+            )}
             {activeTab === "video" && (
               <>
                 <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-zinc-500">
@@ -805,13 +906,6 @@ export function SettingsModal({
               </>
             )}
 
-            {activeTab === "video" && (
-              <div className="vmax-chip-row" aria-label="Quick presets">
-                {Object.entries(STREAM_PRESETS).map(([key, preset]) => (
-                  <button key={key} type="button" className="vmax-secondary" onClick={() => onPreset(key as keyof typeof STREAM_PRESETS)}>{preset.label}</button>
-                ))}
-              </div>
-            )}
             {activeTab === "controller" && (
               <div className="space-y-3.5">
                 <div className="space-y-2 rounded-xl border border-zinc-500/30 p-3">

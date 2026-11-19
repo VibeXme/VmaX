@@ -403,7 +403,23 @@ pub fn is_lan_signaling_url(raw: &str) -> bool {
         })
 }
 
+/// Installs the rustls `ring` crypto provider exactly once per process.
+///
+/// Both the `ring` and `aws-lc-rs` rustls features are enabled through
+/// transitive dependencies, so rustls cannot infer a default provider from its
+/// crate features and panics ("Could not automatically determine the
+/// process-level CryptoProvider") the first time a TLS config is built. Every
+/// rustls entry point calls this first; repeated calls are a cheap no-op.
+pub(crate) fn ensure_rustls_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub(crate) async fn connect_signaling(url: &str) -> Result<ClientSocket, SignalingError> {
+    ensure_rustls_provider();
     let parsed = validate_signaling_url(url)?;
     let host = parsed.host_str().unwrap_or_default();
     let port = parsed

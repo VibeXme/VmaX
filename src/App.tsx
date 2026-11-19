@@ -28,7 +28,7 @@ import { SavedConnectionsPanel } from "./components/SavedConnectionsPanel";
 import { QrScanner } from "./components/QrScanner";
 import { StreamViewer } from "./components/StreamViewer";
 import { TitleBar } from "./components/TitleBar";
-import { MAX_STREAM_BITRATE_MBPS, STREAM_FRAMERATES, STREAM_PRESETS, useVmaXConfig } from "./config/defaults";
+import { MAX_STREAM_BITRATE_MBPS, STREAM_FRAMERATES, useVmaXConfig } from "./config/defaults";
 import type {
   DiscoveredHost,
   HardwareTelemetry,
@@ -107,12 +107,16 @@ export function App() {
   const canChangeStreamWindow = !isAndroid && hasTauriRuntime();
   const {
     config,
+    presets,
+    activePresetId,
+    applyPreset,
+    savePreset,
+    deletePreset,
     updateVideo,
     updateAudio,
     updateNetwork,
     updateCustomization,
     resetConfig,
-    applyStreamPreset,
     applyAutomaticConfig,
     applyLongDistanceConfig,
   } = useVmaXConfig();
@@ -1026,8 +1030,11 @@ export function App() {
                         <legend>Quality</legend>
                         <div className="vmax-chip-row">
                           <button type="button" className="vmax-secondary" onClick={applyAutomaticConfig}>Auto configure</button>
-                          {(["latency", "balanced", "quality", "mobile"] as const).map((key) => (
-                            <button type="button" className="vmax-secondary" key={key} onClick={() => applyStreamPreset(key)}>{STREAM_PRESETS[key].label}</button>
+                          {presets.map((preset) => (
+                            <button type="button" className="vmax-secondary" key={preset.id}
+                              aria-pressed={preset.id === activePresetId}
+                              title={preset.summary}
+                              onClick={() => applyPreset(preset.id)}>{preset.name}</button>
                           ))}
                         </div>
                         <div className="vmax-chip-row">
@@ -1080,7 +1087,11 @@ export function App() {
         onUpdateNetwork={updateNetwork}
         onUpdateCustomization={updateCustomization}
         onReset={resetConfig}
-        onPreset={applyStreamPreset}
+        presets={presets}
+        activePresetId={activePresetId}
+        onApplyPreset={applyPreset}
+        onSavePreset={savePreset}
+        onDeletePreset={deletePreset}
         onAutomaticConfig={applyAutomaticConfig}
         onLongDistanceConfig={applyLongDistanceConfig}
         buildVersion={buildVersion}

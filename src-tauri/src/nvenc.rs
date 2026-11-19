@@ -46,7 +46,12 @@ impl Default for NvencSettings {
             // B-frames and the VBV is a rate budget, not a reorder queue.
             vbv_frames: 2,
             aq_strength: 8,
-            min_qp: 5,
+            // A floor of 5 is where 4:2:0 text stops sharpening: the rate
+            // controller refuses to spend more bits on a static screen, so
+            // letters keep a soft edge forever. 3 lets a detailed frame use
+            // the VBR headroom (2x average peak, 2-frame VBV) and then repay
+            // it, which is exactly the read-a-page case.
+            min_qp: 3,
             quarter_pass: true,
             intra_refresh: true,
             // One refreshing row per frame: the intra band is thin enough to

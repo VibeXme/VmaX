@@ -971,25 +971,31 @@ mod tests {
     #[test]
     fn playback_primes_and_recovers_after_a_gap() {
         let mut buffer = PlaybackBuffer::new();
-        let mut out = [0.0f32; 2];
-        buffer.push(u32::MAX, vec![0.5; 2], 12);
-        buffer.render(&mut out, 2, 1);
-        assert_eq!(out, [0.0; 2]);
-        buffer.push(0, vec![0.5; 2], 12);
-        buffer.render(&mut out, 2, 1);
-        assert_eq!(out, [0.5; 2]);
-        buffer.push(u32::MAX, vec![-0.5; 2], 12);
-        buffer.push(2, vec![0.25; 2], 12);
-        buffer.render(&mut out, 2, 1);
+        let mut out = [0.0f32; 4]; // 2 frames * 2 channels
+        buffer.push(u32::MAX, vec![0.5; 4], 24);
+        buffer.render(&mut out, 4, 2);
+        assert_eq!(out, [0.0; 4]);
+        buffer.push(0, vec![0.5; 4], 24);
+        buffer.render(&mut out, 4, 2);
+        assert_eq!(out, [0.5; 4]);
+        buffer.push(u32::MAX, vec![-0.5; 4], 24);
+        buffer.push(2, vec![0.25; 4], 24);
+        buffer.render(&mut out, 4, 2);
         assert!(out.iter().all(|sample| (sample - 0.5).abs() < 0.001));
-        buffer.render(&mut out, 2, 1);
+        buffer.render(&mut out, 4, 2);
+        // After gap concealment, output blends toward next packet (0.25)
+        assert!(out.iter().all(|sample| sample.abs() < 0.6));
+        // Drain remaining and fade to silence
+        for _ in 0..200 {
+            buffer.render(&mut out, 4, 2);
+        }
         assert!(out.iter().all(|sample| sample.abs() < 0.001));
-        buffer.push(30, vec![1.0; 2], 12);
-        buffer.render(&mut out, 2, 1);
-        assert_eq!(out, [0.0; 2]);
-        buffer.push(31, vec![1.0; 2], 12);
-        buffer.render(&mut out, 2, 1);
-        assert_eq!(out, [1.0; 2]);
+        buffer.push(30, vec![1.0; 4], 24);
+        buffer.render(&mut out, 4, 2);
+        assert!(out.iter().all(|s| s.abs() < 0.001));
+        buffer.push(31, vec![1.0; 4], 24);
+        buffer.render(&mut out, 4, 2);
+        assert_eq!(out, [1.0; 4]);
     }
 
     #[test]

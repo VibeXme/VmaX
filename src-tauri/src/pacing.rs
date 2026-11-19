@@ -31,15 +31,24 @@ use std::time::{Duration, Instant};
 
 /// How much of the frame budget to reserve for the work that follows capture
 /// (colour conversion, encode, hand-off). Never let the capture wait consume
-/// the whole slot.
-const ENCODE_GUARD: Duration = Duration::from_micros(750);
+/// the whole slot. Tightened from 750 µs to 400 µs: the encode EMA already
+/// tracks the host's real cost, so the guard only has to cover the jitter
+/// between the EMA sample and the next frame's actual work. A capture that
+/// wakes 400 µs early still has time to grab the desktop's next present.
+const ENCODE_GUARD: Duration = Duration::from_micros(400);
 /// Seed for the encode-cost EMA before the first frame has been measured.
 const COLD_ENCODE_ESTIMATE: Duration = Duration::from_millis(3);
 /// Sleep coarsely and spin only this far to hit the deadline precisely.
-const SPIN_BUDGET: Duration = Duration::from_micros(800);
+/// Tightened from 800 µs to 500 µs: the final spin is the last piece of
+/// host-side latency we control, and burning half a millisecond of sleep
+/// instead of a full one keeps the capture-to-present path that much shorter
+/// without costing a whole scheduler quantum.
+const SPIN_BUDGET: Duration = Duration::from_micros(500);
 /// Longest the capture call may block. Idle desktop modes drop to a few frames
 /// per second, and a control message (keyframe request, bitrate change) must
-/// still be serviced promptly.
+/// still be serviced promptly. Kept at 32 ms: it is a ceiling for the idle
+/// path, not a per-frame target, and lowering it would only make the idle
+/// desktop poll harder.
 const MAX_CAPTURE_WAIT: Duration = Duration::from_millis(32);
 
 /// Drift-free cadence for the host capture/encode loop.

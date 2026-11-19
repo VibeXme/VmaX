@@ -1,53 +1,88 @@
 <#
 .SYNOPSIS
-    Finds the Android JDK, SDK and NDK for VmaX and installs the Rust ARM64 target.
+    Configures the Android SDK and JDK environment for the VmaX Android build.
 .DESCRIPTION
-    Honors JAVA_HOME, ANDROID_HOME and NDK_HOME. Uses the standard Android SDK
-    path or a local VmaXBuildTools directory when those variables are unset.
+    Discovers the Android SDK and a JDK (preferring the toolchains bundled with
+    Android Studio) and exports ANDROID_HOME, ANDROID_SDK_ROOT, JAVA_HOME and
+    appends the relevant tool directories to PATH for the current process.
+    Call this before any Android build step. It warns (rather than fails) when a
+    toolchain cannot be located so the caller can decide how to proceed.
 #>
-$ErrorActionPreference = 'Stop'
-$toolsDir = Join-Path $env:LOCALAPPDATA 'VmaXBuildTools'
+param()
 
-if (-not $env:JAVA_HOME) {
-    $jdk = Get-ChildItem $toolsDir -Directory -Filter 'jdk-*' -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path (Join-Path $_.FullName 'bin\java.exe') } |
-        Sort-Object Name -Descending | Select-Object -First 1
-    $env:JAVA_HOME = if ($jdk) { $jdk.FullName } else { 'C:\Program Files\Android\Android Studio\jbr' }
-}
-if (-not (Test-Path (Join-Path $env:JAVA_HOME 'bin\java.exe'))) {
-    throw 'Set JAVA_HOME to an installed JDK.'
-}
-
-if (-not $env:ANDROID_HOME) {
-    $env:ANDROID_HOME = $env:ANDROID_SDK_ROOT
-}
-if (-not $env:ANDROID_HOME) {
-    $env:ANDROID_HOME = @(
-        (Join-Path $env:LOCALAPPDATA 'Android\Sdk'),
-        (Join-Path $toolsDir 'android-sdk')
-    ) | Where-Object { Test-Path (Join-Path $_ 'platforms') } | Select-Object -First 1
-}
-if (-not $env:ANDROID_HOME -or -not (Test-Path $env:ANDROID_HOME)) {
-    throw 'Set ANDROID_HOME to an installed Android SDK.'
+function Find-AndroidSdk {
+    $candidates = @(
+        $env:ANDROID_HOME,
+        $env:ANDROID_SDK_ROOT,
+        "$env:LOCALAPPDATA\Android\Sdk",
+        'C:\Program Files\Android\Sdk',
+        'C:\Program Files\Android\Android Studio\sdk',
+        "$env:LOCALAPPDATA\Programs\Android\Android Studio\sdk",
+        'C:\Android\sdk',
+        'D:\Android\sdk'
+    ) | Where-Object { $_ -and $_ -ne '' }
+    foreach ($c in $candidates) {
+        if (Test-Path (Join-Path $c 'platform-tools\adb.exe')) {
+            return $c
+        }
+    }
+    return $null
 }
 
-if (-not $env:NDK_HOME) {
-    $env:NDK_HOME = $env:ANDROID_NDK_HOME
+function Find-JavaHome {
+    if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME 'bin\java.exe'))) {
+        return $env:JAVA_HOME
+    }
+    $roots = @(
+        'C:\Program Files\Android\Android Studio\jbr',
+        'C:\Program Files\Android\Android Studio\jre',
+        'C:\Program Files\Java',
+        'C:\Program Files (x86)\Java',
+        "$env:LOCALAPPDATA\Programs\Android\Android Studio\jbr"
+    )
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        if (Test-Path (Join-Path $root 'bin\java.exe')) { return $root }
+        $dirs = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^jdk' } | Sort-Object Name -Descending)
+        foreach ($d in $dirs) {
+            if (Test-Path (Join-Path $d.FullName 'bin\java.exe')) { return $d.FullName }
+        }
+    }
+    return $null
 }
-if (-not $env:NDK_HOME) {
-    $ndk = Get-ChildItem (Join-Path $env:ANDROID_HOME 'ndk') -Directory -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path (Join-Path $_.FullName 'source.properties') } |
-        Sort-Object { [version]($_.Name -split '-')[0] } -Descending | Select-Object -First 1
-    if ($ndk) { $env:NDK_HOME = $ndk.FullName }
-}
-if (-not $env:NDK_HOME -or -not (Test-Path (Join-Path $env:NDK_HOME 'source.properties'))) {
-    throw 'Install the Android NDK and set NDK_HOME to its directory.'
-}
-$env:ANDROID_NDK_HOME = $env:NDK_HOME
-$env:PATH = "$env:JAVA_HOME\bin;$env:ANDROID_HOME\platform-tools;$env:PATH"
 
-$target = 'aarch64-linux-android'
-if ((& rustup target list --installed) -notcontains $target) {
-    & rustup target add $target
-    if ($LASTEXITCODE) { throw "Could not install the Rust target $target." }
+$sdk = Find-AndroidSdk
+if ($sdk) {
+    $env:ANDROID_HOME = $sdk
+    $env:ANDROID_SDK_ROOT = $sdk
+    Write-Host "Using Android SDK: $sdk"
+
+    $pathAdds = New-Object System.Collections.Generic.List[string]
+    $pathAdds.Add((Join-Path $sdk 'platform-tools'))
+    $cmdToolsLatest = Join-Path (Join-Path $sdk 'cmdline-tools') 'latest'
+    $cmdToolsLatest = Join-Path $cmdToolsLatest 'bin'
+    if (Test-Path $cmdToolsLatest) { $pathAdds.Add($cmdToolsLatest) }
+    $toolsBin = Join-Path (Join-Path $sdk 'tools') 'bin'
+    if (Test-Path $toolsBin) { $pathAdds.Add($toolsBin) }
+    $buildToolsDir = Join-Path $sdk 'build-tools'
+    if (Test-Path $buildToolsDir) {
+        $latest = @(Get-ChildItem -LiteralPath $buildToolsDir -Directory -ErrorAction SilentlyContinue |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1)
+        if ($latest) { $pathAdds.Add($latest.FullName) }
+    }
+    foreach ($p in $pathAdds) {
+        if (Test-Path $p) { $env:PATH = "$p;$env:PATH" }
+    }
+} else {
+    Write-Warning 'Android SDK not found. Set ANDROID_HOME to the SDK location before building Android.'
+}
+
+$jdk = Find-JavaHome
+if ($jdk) {
+    $env:JAVA_HOME = $jdk
+    $env:PATH = "$(Join-Path $jdk 'bin');$env:PATH"
+    Write-Host "Using JDK: $jdk"
+} else {
+    Write-Warning 'JDK not found. Set JAVA_HOME to a JDK location before building Android.'
 }

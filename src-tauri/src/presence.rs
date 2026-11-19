@@ -591,6 +591,27 @@ pub async fn cloud_friend(
     Ok(())
 }
 
+/// Username search, so a friend can be found by typing their name instead of
+/// scanning a QR code or opening an invite link. Blocked pairs and the caller
+/// are filtered in the database function; the page is capped there too.
+#[tauri::command]
+pub async fn cloud_search(app: AppHandle, query: String) -> Result<Value, String> {
+    let cloud = Cloud::configured(&app)?;
+    let active = session(&app, &cloud).await?;
+    let trimmed = query.trim();
+    if trimmed.chars().count() < 2 {
+        return Ok(json!([]));
+    }
+    cloud
+        .post(
+            "/rest/v1/rpc/search_vmax_profiles",
+            &active,
+            json!({"p_query": trimmed}),
+            "",
+        )
+        .await
+}
+
 #[tauri::command]
 pub async fn cloud_host_available(
     app: AppHandle,

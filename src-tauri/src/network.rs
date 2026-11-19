@@ -45,7 +45,14 @@ const DEFAULT_FEC_GROUP_SIZE: u8 = 10;
 const MAX_QUEUED_DELTA_BYTES: usize = 512 * 1024;
 const RELAY_STARTUP_BITRATE_BPS: u32 = 4_000_000;
 const HIGH_RTT_STARTUP_BITRATE_BPS: u32 = 6_000_000;
-const MAX_CAPTURE_QUEUE_AGE: Duration = Duration::from_millis(65);
+/// A frame that waited longer than this is already too old to present on
+/// time, so sending it only adds delay behind it. 30 ms is under two frames
+/// at 60 FPS: long enough that a scheduling hiccup does not cost the picture,
+/// short enough that a backlog cannot build up. Tightened from 45 ms: the
+/// capture loop already skips slots before the queue forms, so this is the
+/// last line of defense, and every millisecond it allows is latency the
+/// client has to present.
+const MAX_CAPTURE_QUEUE_AGE: Duration = Duration::from_millis(30);
 const LAN_PROBE_HEAD_START: Duration = Duration::from_millis(125);
 const NETWORK_RTT_TARGET: Duration = Duration::from_millis(35);
 
@@ -105,7 +112,7 @@ fn pending_video_cap(
     let budget = NETWORK_RTT_TARGET
         .saturating_sub(rtt / 2)
         .max(frame_time)
-        .min(Duration::from_millis(55))
+        .min(Duration::from_millis(40))
         + recovery_allowance;
     ((target_bps as f64 / 8.0 * budget.as_secs_f64()) as usize)
         .clamp(64 * 1024, MAX_QUEUED_DELTA_BYTES)
@@ -241,6 +248,22 @@ pub enum TransportProtocol {
     RawUdp,
 }
 
+/// Congestion control sensitivity profile.
+/// Matches `congestion::GccController::Sensitivity`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CongestionSensitivity {
+    Balanced,
+    LowLatency,
+    Quality,
+}
+
+impl Default for CongestionSensitivity {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     pub signaling_url: String,
@@ -260,6 +283,8 @@ pub struct NetworkConfig {
     pub target_fps: u16,
     pub jitter_window_ms: u64,
     pub hole_punch_timeout_ms: u64,
+    #[serde(default)]
+    pub congestion_sensitivity: CongestionSensitivity,
     #[serde(skip)]
     pub identity_file: Option<PathBuf>,
     #[serde(skip)]
@@ -295,6 +320,7 @@ impl Default for NetworkConfig {
             // ordinary Wi-Fi/cellular jitter without adding latency.
             jitter_window_ms: 32,
             hole_punch_timeout_ms: 4_500,
+            congestion_sensitivity: CongestionSensitivity::Balanced,
             identity_file: None,
             profile_endpoint: None,
             saved_clients: None,
@@ -443,6 +469,9 @@ struct RuntimeOverrides {
     fec_group_size: Arc<AtomicU8>,
     bitrate_policy: Arc<AtomicU32>,
     client_limit_bps: Arc<AtomicU32>,
+    /// Shared with the host capture loop, which reads it to slow down before a
+    /// frame has to be dropped.
+    backlog: VideoBacklog,
 }
 
 impl RuntimeOverrides {
@@ -479,6 +508,61 @@ impl RuntimeOverrides {
     }
 }
 
+/// Live view of the video send queue, shared with the host capture loop.
+///
+/// A queue is the only place a frame can be discarded without hurting the
+/// stream, and only *before* it is encoded. Dropping an encoded delta leaves a
+/// hole in the reference chain, which forces an IDR and turns a saturated
+/// uplink into a visible freeze followed by a bitrate spike. Publishing the
+/// queue lets the capture loop skip one slot instead: that costs a frame of
+/// cadence and nothing else.
+///
+/// The pacer side is read directly from its own counter, so the value never
+/// goes stale when frames stop flowing. Only the QUIC-side contribution has to
+/// be published, because only the sender may ask the connection.
+#[derive(Debug, Clone, Default)]
+pub struct VideoBacklog {
+    pacer: Arc<crate::transport::PacerStats>,
+    quic_bytes: Arc<AtomicU64>,
+    cap_bytes: Arc<AtomicU64>,
+}
+
+impl VideoBacklog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The pacer's statistics object, so `PacedSender::spawn_with_stats` can
+    /// share its live queue with this view.
+    pub fn pacer_stats(&self) -> Arc<crate::transport::PacerStats> {
+        Arc::clone(&self.pacer)
+    }
+
+    /// Bytes queued between the pacer and the wire.
+    pub fn queued_bytes(&self) -> u64 {
+        self.pacer.queued_bytes() + self.quic_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The ceiling above which the sender drops a frame.
+    pub fn cap_bytes(&self) -> u64 {
+        self.cap_bytes.load(Ordering::Relaxed)
+    }
+
+    /// True when another encoded frame would not fit.
+    pub fn saturated(&self) -> bool {
+        let cap = self.cap_bytes();
+        cap > 0 && self.queued_bytes() >= cap
+    }
+
+    fn note_quic_bytes(&self, bytes: u64) {
+        self.quic_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    fn set_cap_bytes(&self, bytes: usize) {
+        self.cap_bytes.store(bytes as u64, Ordering::Relaxed);
+    }
+}
+
 /// Non-blocking sender handles for pushing video, audio, input, and control into the active QUIC loop.
 #[derive(Clone)]
 pub struct SessionTx {
@@ -512,6 +596,12 @@ impl SessionTx {
         self.overrides
             .client_limit_bps
             .store(max_bps, Ordering::Relaxed);
+    }
+
+    /// Live view of the video send queue. The host capture thread holds one to
+    /// stop encoding frames the wire cannot carry yet.
+    pub fn video_backlog(&self) -> VideoBacklog {
+        self.overrides.backlog.clone()
     }
 }
 
@@ -588,7 +678,7 @@ pub(crate) async fn friend_relay_command(
     };
     use tokio_tungstenite::tungstenite::Message;
 
-    ensure_rustls_provider();
+    crate::signaling::ensure_rustls_provider();
     let identity = load_identity(Some(identity_path))?;
     let rng = SystemRandom::new();
     let key = EcdsaKeyPair::from_pkcs8(
@@ -649,10 +739,6 @@ pub(crate) async fn friend_relay_command(
     timeout(Duration::from_secs(12), exchange)
         .await
         .map_err(|_| SignalingError::TimedOut)?
-}
-
-fn ensure_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn generate_ephemeral_identity() -> Result<EphemeralIdentity, NetworkError> {
@@ -1008,7 +1094,7 @@ async fn spawn_session(
     mut config: NetworkConfig,
     invite: Option<ParsedInvite>,
 ) -> Result<SessionHandle, NetworkError> {
-    ensure_rustls_provider();
+    crate::signaling::ensure_rustls_provider();
 
     if let Some(ref inv) = invite {
         config.signaling_url = inv.signaling_url.clone();
@@ -1042,6 +1128,7 @@ async fn spawn_session(
             (config.max_bitrate_bps << 1) | u32::from(config.fixed_bitrate),
         )),
         client_limit_bps: Arc::new(AtomicU32::new(0)),
+        backlog: VideoBacklog::new(),
     };
     let loop_overrides = overrides.clone();
 
@@ -2015,6 +2102,7 @@ fn fixed_bitrate_uses_the_host_target_and_honors_the_viewer_limit() {
         fec_group_size: Arc::new(AtomicU8::new(0)),
         bitrate_policy: Arc::new(AtomicU32::new((200_000_000 << 1) | 1)),
         client_limit_bps: Arc::new(AtomicU32::new(0)),
+        backlog: VideoBacklog::new(),
     };
     assert_eq!(overrides.target_bitrate(4_000_000), 200_000_000);
     overrides
@@ -2026,6 +2114,25 @@ fn fixed_bitrate_uses_the_host_target_and_honors_the_viewer_limit() {
         .store(80_000_000 << 1, Ordering::Relaxed);
     assert_eq!(overrides.target_bitrate(16_000_000), 16_000_000);
     assert_eq!(overrides.target_bitrate(40_000_000), 35_000_000);
+}
+
+#[cfg(test)]
+#[test]
+fn backlog_reports_saturation_only_against_a_known_cap() {
+    let backlog = VideoBacklog::new();
+    // No cap published yet: the sender has not decided what fits, so nothing
+    // may be treated as over budget.
+    assert!(!backlog.saturated());
+    backlog.set_cap_bytes(64 * 1024);
+    assert_eq!(backlog.cap_bytes(), 64 * 1024);
+    assert!(!backlog.saturated());
+    // The QUIC side alone can fill the budget while the pacer is empty; the
+    // capture loop must still see the queue as full.
+    backlog.note_quic_bytes(64 * 1024);
+    assert_eq!(backlog.queued_bytes(), 64 * 1024);
+    assert!(backlog.saturated());
+    backlog.note_quic_bytes(0);
+    assert!(!backlog.saturated());
 }
 
 #[cfg(test)]
@@ -2304,8 +2411,15 @@ async fn run_quic_multiplex_loop(
         BitrateController::new(config.initial_bitrate_bps, config.max_bitrate_bps);
     let mut last_max_bitrate_bps = config.max_bitrate_bps;
     let mut reported_target = config.initial_bitrate_bps;
-    let mut gcc =
-        crate::congestion::GccController::new(config.initial_bitrate_bps, config.max_bitrate_bps);
+    let mut gcc = crate::congestion::GccController::with_sensitivity(
+        config.initial_bitrate_bps,
+        config.max_bitrate_bps,
+        match config.congestion_sensitivity {
+            CongestionSensitivity::Balanced => crate::congestion::GccSensitivity::Balanced,
+            CongestionSensitivity::LowLatency => crate::congestion::GccSensitivity::LowLatency,
+            CongestionSensitivity::Quality => crate::congestion::GccSensitivity::Quality,
+        },
+    );
     let mut adaptive_fec = crate::transport::AdaptiveFec::with_group_size(config.fec_group_size);
     let mut recovery =
         crate::encoder_recovery::RecoveryController::new(crate::encoder_recovery::RecoveryConfig {
@@ -2317,13 +2431,14 @@ async fn run_quic_multiplex_loop(
     let mut last_feedback: Option<Instant> = None;
     let mut gcc_decision: Option<BitrateDecision> = None;
     let mut live_fec_group = config.fec_group_size;
-    let pacer = crate::transport::PacedSender::spawn(
+    let pacer = crate::transport::PacedSender::spawn_with_stats(
         conn.clone(),
         crate::transport::paced_wire_rate(
             config.initial_bitrate_bps,
             adaptive_fec.current().parity_permille(),
         ),
         3,
+        overrides.backlog.pacer_stats(),
     );
     let mut last_pacer_errors = 0u64;
     let mut last_path_packets = (0u64, 0u64);
@@ -2384,6 +2499,12 @@ async fn run_quic_multiplex_loop(
                 } else {
                     pending_video_cap(target_bitrate as usize, frame.fps, conn.rtt(), direct, recovery_allowance)
                 };
+                // Publish the queue before deciding anything: the capture loop
+                // uses it to stop producing frames that would be dropped here.
+                overrides
+                    .backlog
+                    .note_quic_bytes(QUIC_DATAGRAM_BUFFER_BYTES.saturating_sub(conn.datagram_send_buffer_space()) as u64);
+                overrides.backlog.set_cap_bytes(dynamic_cap);
                 let gap = last_video_frame.is_some_and(|id| id.wrapping_add(1) != frame.frame_id);
                 let max_frame_age = if frame.is_keyframe {
                     Duration::from_millis(500)
@@ -2554,6 +2675,12 @@ async fn run_quic_multiplex_loop(
             }
             _ = telemetry_tick.tick() => {
                 let qstats = conn.stats();
+                // Keep the QUIC side of the published backlog fresh even while
+                // the capture loop is skipping slots and no video frame is
+                // arriving to refresh it.
+                overrides
+                    .backlog
+                    .note_quic_bytes(QUIC_DATAGRAM_BUFFER_BYTES.saturating_sub(conn.datagram_send_buffer_space()) as u64);
                 let sent = qstats.path.sent_packets.saturating_sub(last_path_packets.0);
                 let lost = qstats.path.lost_packets.saturating_sub(last_path_packets.1);
                 if sent >= 10 {

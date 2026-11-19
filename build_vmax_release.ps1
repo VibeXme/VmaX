@@ -1,23 +1,81 @@
 <#
 .SYNOPSIS
-    Builds the x64 Windows executable and ARM64 Android APK at the workspace root.
+    Builds the x64 Windows executable, NSIS installer, and ARM64 Android APK at the workspace root.
 .DESCRIPTION
-    Run from PowerShell with Visual Studio C++ Build Tools and the Android SDK
+    Run from PowerShell with Visual Studio C++ Build Tools, NSIS, and the Android SDK
     available. Use -SkipWindows or -SkipAndroid to build a single platform.
     If Gradle produces an unsigned APK, it is signed with a local development key.
 #>
 param(
     [switch]$SkipWindows,
-    [switch]$SkipAndroid
+    [switch]$SkipAndroid,
+    [switch]$SkipInstaller
 )
 
 $ErrorActionPreference = 'Stop'
 $toolsDir = Join-Path $env:LOCALAPPDATA 'VmaXBuildTools'
 $errors = [System.Collections.Generic.List[string]]::new()
+$script:WindowsBuildSucceeded = $false
+
+# Prerequisite download URLs (version-pinned for reproducibility)
+$VC_REDIST_X64_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+# NSIS is installed via winget (NSIS.NSIS) - no download needed
 
 function Invoke-Tauri([string[]]$Arguments) {
     & npm.cmd run tauri -- @Arguments
     if ($LASTEXITCODE) { throw "Tauri $($Arguments[0]) failed with exit code $LASTEXITCODE." }
+}
+
+function Stop-RunningVmax {
+    $processes = Get-Process -Name 'VmaX' -ErrorAction SilentlyContinue
+    if ($processes) {
+        Write-Host 'Stopping running VmaX.exe instances to release file locks...'
+        $processes | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        $processes | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
+        $still = Get-Process -Name 'VmaX' -ErrorAction SilentlyContinue
+        if ($still) { throw 'Could not stop running VmaX.exe instances; close them manually and retry.' }
+    }
+}
+
+function Remove-LockedDirectory([string]$Path, [int]$Retries = 5) {
+    if (-not (Test-Path $Path)) { return }
+    $lastError = $null
+    for ($i = 0; $i -lt $Retries; $i++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch [System.IO.IOException] {
+            $lastError = $_
+            Start-Sleep -Seconds 2
+        }
+    }
+    throw "Could not remove locked directory '$Path': $lastError"
+}
+
+function Download-Prerequisites {
+    $prereqDir = Join-Path $PSScriptRoot 'src-tauri\windows\nsis'
+    New-Item -ItemType Directory -Force -Path $prereqDir | Out-Null
+
+    # VC++ Redistributable 2015-2022 x64 (for installer)
+    $vcRedistPath = Join-Path $prereqDir 'vc_redist.x64.exe'
+    if (-not (Test-Path $vcRedistPath)) {
+        Write-Host "Downloading VC++ Redistributable..."
+        try {
+            Invoke-WebRequest -Uri $VC_REDIST_X64_URL -OutFile $vcRedistPath -UseBasicParsing
+            if ($LASTEXITCODE) { throw "VC++ Redist download failed with exit code $LASTEXITCODE." }
+        } catch { throw "Failed to download VC++ Redistributable: $_" }
+    }
+
+    # NSIS (installed via winget - NSIS.NSIS)
+    $makensisPath = "C:\Program Files (x86)\NSIS\Bin\makensis.exe"
+    if (-not (Test-Path $makensisPath)) {
+        $makensisPath = "C:\Program Files\NSIS\Bin\makensis.exe"
+    }
+    if (-not (Test-Path $makensisPath)) {
+        throw "NSIS not found. Install with: winget install --id NSIS.NSIS --source winget"
+    }
+    $script:MAKE_NSIS = $makensisPath
 }
 
 function Initialize-WindowsBuild {
@@ -60,6 +118,7 @@ function Get-CargoTargetDirectory {
 }
 
 function Build-Windows {
+    Stop-RunningVmax
     $target = 'x86_64-pc-windows-msvc'
     Invoke-Tauri @('build', '--ci', '--no-bundle', '--target', $target, '--', '--locked')
     $exe = Join-Path (Get-CargoTargetDirectory) "$target\release\vmax.exe"
@@ -83,6 +142,44 @@ function Build-Windows {
         }
     }
     Write-Host "Windows executable at $PSScriptRoot\VmaX.exe"
+    $script:WindowsBuildSucceeded = $true
+}
+
+function Build-WindowsInstaller {
+    if ($SkipInstaller) { return }
+
+    # Stage app files for NSIS
+    $target = 'x86_64-pc-windows-msvc'
+    $exe = Join-Path (Get-CargoTargetDirectory) "$target\release\vmax.exe"
+    if (-not (Test-Path $exe)) { throw "Windows executable not found at $exe. Run Build-Windows first." }
+
+    $stagingDir = Join-Path $PSScriptRoot 'src-tauri\windows\nsis\app'
+    Remove-LockedDirectory $stagingDir
+    New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+
+    # Copy the executable and any companion files (none expected, but be safe)
+    Copy-Item -LiteralPath $exe -Destination (Join-Path $stagingDir 'VmaX.exe') -Force
+
+    # Also copy WebView2/VC++ bootstrappers to staging (NSIS embeds them)
+    $prereqDir = Join-Path $PSScriptRoot 'src-tauri\windows\nsis'
+    Copy-Item -LiteralPath (Join-Path $prereqDir 'MicrosoftEdgeWebview2Setup.exe') -Destination $stagingDir -Force
+    Copy-Item -LiteralPath (Join-Path $prereqDir 'vc_redist.x64.exe') -Destination $stagingDir -Force
+
+    # Run NSIS
+    $nsiScript = Join-Path $PSScriptRoot 'src-tauri\windows\nsis\vmax.nsi'
+    Write-Host "Building NSIS installer..."
+    & $script:MAKE_NSIS $nsiScript
+    if ($LASTEXITCODE) { throw "NSIS build failed with exit code $LASTEXITCODE." }
+
+    # Move installer to repo root
+    $installer = Join-Path $PSScriptRoot 'src-tauri\windows\nsis\VmaX-Setup.exe'
+    if (-not (Test-Path $installer)) { throw "NSIS installer not produced at $installer." }
+    $destination = Join-Path $PSScriptRoot 'VmaX-Setup.exe'
+    Copy-Item -LiteralPath $installer -Destination $destination -Force
+    Write-Host "Windows installer at $destination"
+
+    # Cleanup staging
+    Remove-LockedDirectory $stagingDir
 }
 
 function Build-Android {
@@ -95,6 +192,14 @@ function Build-Android {
     $androidDir = Join-Path $PSScriptRoot 'src-tauri\gen\android'
     if (-not (Test-Path (Join-Path $androidDir 'gradlew.bat'))) {
         Invoke-Tauri @('android', 'init', '--ci')
+    }
+
+    # gen/android is gitignored and recreated by `tauri android init`, so the
+    # launcher icons cannot live in source control: they are derived from the
+    # master artwork here, after the tree exists and before Gradle packages it.
+    & (Join-Path $PSScriptRoot 'tools\make_android_icons.ps1')
+    if ($LASTEXITCODE) {
+        throw "Android launcher icon generation failed with exit code $LASTEXITCODE."
     }
 
     $log = New-TemporaryFile
@@ -180,8 +285,21 @@ try {
         }
     }
 
+    # Download prerequisites early (needed for Windows + installer)
+    if (-not $SkipWindows) {
+        Download-Prerequisites
+    }
+
     if (-not $SkipWindows) {
         try { Build-Windows } catch { $errors.Add("Windows build: $_") }
+        # Installer needs the Windows exe, so build it only after a successful Windows build.
+        if (-not $SkipInstaller) {
+            if ($script:WindowsBuildSucceeded) {
+                try { Build-WindowsInstaller } catch { $errors.Add("Windows installer: $_") }
+            } else {
+                Write-Host 'Skipping Windows installer because the Windows build did not succeed.'
+            }
+        }
     }
     if (-not $SkipAndroid) {
         try { Build-Android } catch { $errors.Add("Android build: $_") }

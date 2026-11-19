@@ -33,8 +33,24 @@ pub const MAX_ARRIVAL_SAMPLES: usize = 12;
 /// increase is caught before the modem buffer fills and packets drop.
 pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Minimum bitrate floor — 2 Mbps keeps text readable on thin links.
 pub const DEFAULT_MIN_BITRATE_BPS: u32 = 2_000_000;
 pub const DEFAULT_MAX_BITRATE_BPS: u32 = crate::bitrate::MAX_VIDEO_BITRATE_BPS;
+
+/// How many consecutive feedback intervals with no samples before the
+/// delay gradient is considered stale and reset. At 10 ms/interval,
+/// 8 = 80 ms (≈5 frames at 60 FPS). Longer than a frame but short
+/// enough that idle-screen pauses don't keep stale queue evidence.
+const IDLE_SAMPLE_RESET_INTERVALS: u32 = 8;
+
+/// Delay gradient threshold (ms/s) for declaring Overusing.
+/// WebRTC uses ~12.5; we use 9.0 for delay-sensitive game streaming.
+/// Lower = more sensitive to queue buildup, earlier backoff.
+const DEFAULT_DELAY_THRESHOLD_MS_PER_S: f64 = 9.0;
+
+/// Hold time before a state transition commits. Prevents single-sample
+/// fluctuations from triggering backoff/backon cycles.
+const DEFAULT_STATE_HOLD: Duration = Duration::from_millis(10);
 
 /// The client has packets missing from `nack_bitmap`.
 pub const FLAG_NACK: u8 = 1 << 0;
@@ -326,21 +342,30 @@ pub struct DelayGradient {
     threshold_ms_per_s: f64,
     hold: Duration,
     last_trend_ms_per_s: f64,
+    /// Count of consecutive feedback intervals with no arrival samples.
+    /// Used to reset stale delay evidence when the stream goes idle.
+    idle_intervals: u32,
 }
 
 impl DelayGradient {
     pub fn new() -> Self {
+        Self::with_params(DEFAULT_DELAY_THRESHOLD_MS_PER_S, DEFAULT_STATE_HOLD)
+    }
+
+    /// Create with custom sensitivity for different network profiles.
+    /// - `threshold_ms_per_s`: lower = more sensitive to queue buildup (earlier backoff)
+    /// - `hold`: minimum time in a state before transitioning
+    pub fn with_params(threshold_ms_per_s: f64, hold: Duration) -> Self {
         Self {
             window: VecDeque::with_capacity(24),
             accumulated_delay_us: 0.0,
             previous: None,
             state: DelayState::Normal,
             state_since: None,
-            // WebRTC's trendline threshold is ~12.5 ms/s; start slightly
-            // tighter because game traffic is delay sensitive.
-            threshold_ms_per_s: 9.0,
-            hold: Duration::from_millis(10),
+            threshold_ms_per_s,
+            hold,
             last_trend_ms_per_s: 0.0,
+            idle_intervals: 0,
         }
     }
 
@@ -351,6 +376,7 @@ impl DelayGradient {
         self.state = DelayState::Normal;
         self.state_since = None;
         self.last_trend_ms_per_s = 0.0;
+        self.idle_intervals = 0;
     }
 
     /// Feed a pair of timestamps in microseconds.  `send_us` and `arrival_us`
@@ -649,8 +675,33 @@ pub struct GccController {
     ceiling_clean_ticks: u32,
 }
 
+/// Network sensitivity profile for the delay gradient.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum GccSensitivity {
+    /// Standard WebRTC-like sensitivity (~9 ms/s threshold).
+    /// Good for general streaming on Wi-Fi/cellular.
+    #[default]
+    Balanced,
+    /// Higher sensitivity (~6 ms/s threshold, shorter hold).
+    /// Catches queue buildup earlier for competitive gaming / esports.
+    LowLatency,
+    /// Lower sensitivity (~14 ms/s threshold, longer hold).
+    /// Tolerates more jitter for maximum quality on stable links.
+    Quality,
+}
+
 impl GccController {
-    pub fn new(initial_bps: u32, max_bps: u32) -> Self {
+    /// Create with a sensitivity profile.
+    pub fn with_sensitivity(
+        initial_bps: u32,
+        max_bps: u32,
+        sensitivity: GccSensitivity,
+    ) -> Self {
+        let (threshold, hold) = match sensitivity {
+            GccSensitivity::LowLatency => (6.0, Duration::from_millis(5)),
+            GccSensitivity::Balanced => (DEFAULT_DELAY_THRESHOLD_MS_PER_S, DEFAULT_STATE_HOLD),
+            GccSensitivity::Quality => (14.0, Duration::from_millis(20)),
+        };
         let max_bps = max_bps.clamp(1, DEFAULT_MAX_BITRATE_BPS);
         let min_bps = DEFAULT_MIN_BITRATE_BPS.min(max_bps);
         Self {
@@ -658,7 +709,7 @@ impl GccController {
             max_bps,
             current_bps: initial_bps.clamp(min_bps, max_bps),
             last_notified_bps: initial_bps.clamp(min_bps, max_bps),
-            delay: DelayGradient::new(),
+            delay: DelayGradient::with_params(threshold, hold),
             sends: SendHistory::new(),
             ack_loss: AckLossTracker::new(),
             throughput: ThroughputEstimator::new(),
@@ -673,6 +724,10 @@ impl GccController {
             probe_ceiling_bps: None,
             ceiling_clean_ticks: 0,
         }
+    }
+
+    pub fn new(initial_bps: u32, max_bps: u32) -> Self {
+        Self::with_sensitivity(initial_bps, max_bps, GccSensitivity::Balanced)
     }
 
     pub fn current_bitrate_bps(&self) -> u32 {
@@ -724,18 +779,15 @@ impl GccController {
         let has_samples = !pairs.is_empty();
         if !has_samples {
             // No shard arrived during this window: the screen is idle, the
-            // sender paused, or every packet was lost. The last trend is
-            // stale, and holding an Overusing state here would keep cutting
-            // the encoder on each report while nothing is queued. Loss
-            // backoff above still covers the total-loss case.
-            if self
-                .last_feedback_samples
-                .is_some_and(|last| now.saturating_duration_since(last) > Duration::from_millis(80))
-            {
+            // sender paused, or every packet was lost. Track consecutive
+            // empty reports and reset the delay gradient after a short
+            // idle period so stale queue evidence doesn't cause false backoff.
+            self.delay.idle_intervals = self.delay.idle_intervals.saturating_add(1);
+            if self.delay.idle_intervals >= IDLE_SAMPLE_RESET_INTERVALS {
                 self.delay.reset();
             }
-        }
-        if has_samples {
+        } else {
+            self.delay.idle_intervals = 0;
             self.last_feedback_samples = Some(now);
         }
         for pair in pairs {

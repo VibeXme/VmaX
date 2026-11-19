@@ -656,7 +656,9 @@ impl OpusHostAudioProcessor {
     fn new(src_rate: u32, src_channels: usize, source_is_loopback: bool, bitrate_kbps: u32) -> Self {
         let mut encoder = OpusEncoder::new(OPUS_SAMPLE_RATE, Channels::Stereo, Application::Audio)
             .expect("Failed to create Opus encoder");
-        encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new((bitrate_kbps * 1000) as u32).unwrap()));
+        encoder.set_bitrate(Bitrate::BitsPerSecond(
+            NonZeroU32::new((bitrate_kbps * 1000) as u32).unwrap_or(NonZeroU32::new(128_000).unwrap()),
+        ));
         encoder.set_signal(Signal::Auto);
         let _ = encoder.set_complexity(5);
         encoder.set_inband_fec(InbandFec::On);
@@ -945,7 +947,7 @@ mod tests {
     #[test]
     fn opus_encode_decode_roundtrip() {
         let mut encoder = OpusEncoder::new(OPUS_SAMPLE_RATE, Channels::Stereo, Application::Audio).unwrap();
-        encoder.set_bitrate(Bitrate::BitsPerSecond(128_000)).unwrap();
+        encoder.set_bitrate(Bitrate::BitsPerSecond(NonZeroU32::new(128_000).unwrap()));
         
         let mut decoder = OpusDecoder::new(OPUS_SAMPLE_RATE, Channels::Stereo).unwrap();
         
@@ -959,11 +961,11 @@ mod tests {
         }
         
         let mut opus_data = vec![0u8; 4000];
-        let bytes_written = encoder.encode(&pcm, &mut opus_data).unwrap();
+        let bytes_written = encoder.encode(&pcm, OPUS_FRAME_SIZE, &mut opus_data).unwrap();
         opus_data.truncate(bytes_written);
         
         let mut decoded = vec![0.0f32; OPUS_FRAME_SIZE * 2];
-        let decoded_samples = decoder.decode(&opus_data, &mut decoded).unwrap();
-        assert_eq!(decoded_samples, OPUS_FRAME_SIZE * 2);
+        let decoded_samples = decoder.decode(&opus_data, OPUS_FRAME_SIZE, &mut decoded).unwrap();
+        assert_eq!(decoded_samples, OPUS_FRAME_SIZE);
     }
 }
