@@ -3022,6 +3022,15 @@ mod tests {
     use crate::protocol::{AudioCodec, AudioPacketHeader, InputEvent, VideoCodec, audio_flags};
     use crate::signaling::LocalSignalingServer;
 
+    #[test]
+    fn capture_queue_age_tracks_frame_rate() {
+        assert_eq!(max_capture_queue_age(60), Duration::from_millis(30));
+        let at_120 = max_capture_queue_age(120);
+        assert!(at_120 >= Duration::from_millis(16));
+        assert!(at_120 <= Duration::from_millis(17));
+        assert_eq!(max_capture_queue_age(144), Duration::from_millis(13));
+    }
+
     #[tokio::test]
     async fn quic_rebind_preserves_the_connection_and_datagrams() {
         let identity = load_identity(None).unwrap();
