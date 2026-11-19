@@ -1791,10 +1791,15 @@ fn register_session<'a>(
                                         crate::android_jni::FrameRoute::WebView => false,
                                         crate::android_jni::FrameRoute::Native => true,
                                         crate::android_jni::FrameRoute::NativeBacklog => {
+                                            // The access unit was not queued, so the decoder's
+                                            // reference chain is now discontinuous. Naming the
+                                            // dropped frame as "last good" incorrectly asks the
+                                            // host for intra-refresh and can leave MediaCodec
+                                            // decoding stale references. Request a full IDR.
                                             let _ = session_tx.control_tx.try_send(
                                                 ControlMessage::RequestKeyframe {
-                                                    last_good_frame_id: Some(frame.frame_id),
-                                                    reason: "android decoder backlog".to_string(),
+                                                    last_good_frame_id: None,
+                                                    reason: "android decoder backlog dropped a reference frame".to_string(),
                                                 },
                                             );
                                             true
