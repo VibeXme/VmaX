@@ -163,7 +163,11 @@ pub struct StartSessionParams {
     #[serde(default = "default_true")]
     pub constant_fps: bool,
     /// Ignore congestion-driven bitrate reductions and use the whole link.
-    #[serde(default = "default_true")]
+    ///
+    /// Missing/legacy settings must remain adaptive. Treating an omitted field
+    /// as unlimited silently disabled congestion control and let weak WAN/relay
+    /// paths build queueing delay.
+    #[serde(default)]
     pub unlimited_bitrate: bool,
     #[serde(default = "default_congestion_sensitivity")]
     pub congestion_sensitivity: CongestionSensitivity,
@@ -223,7 +227,9 @@ pub struct VideoSettingsPayload {
     #[serde(default = "default_true")]
     pub constant_fps: bool,
     /// Use the full configured bitrate and ignore congestion back-off.
-    #[serde(default = "default_true")]
+    ///
+    /// Keep legacy configs adaptive when this newer field is absent.
+    #[serde(default)]
     pub unlimited_bitrate: bool,
     #[serde(default)]
     pub nvenc: crate::nvenc::NvencSettings,
