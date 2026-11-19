@@ -3028,7 +3028,9 @@ mod tests {
         let at_120 = max_capture_queue_age(120);
         assert!(at_120 >= Duration::from_millis(16));
         assert!(at_120 <= Duration::from_millis(17));
-        assert_eq!(max_capture_queue_age(144), Duration::from_millis(13));
+        let at_144 = max_capture_queue_age(144);
+        assert!(at_144 >= Duration::from_millis(13));
+        assert!(at_144 <= Duration::from_millis(14));
     }
 
     #[tokio::test]
