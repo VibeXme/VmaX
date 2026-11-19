@@ -29,9 +29,7 @@ channel, so neither side trusts an unverified peer.
 | --- | --- |
 | ![Quick Connect](docs/screenshots/home.png) | ![Network options](docs/screenshots/network-options.png) |
 
-| Streaming settings | Settings presets |
-| --- | --- |
-| ![Streaming settings](docs/screenshots/settings.png) | ![General settings](docs/screenshots/settings-general.png) |
+![Streaming settings](docs/screenshots/settings.png)
 
 ## Downloads
 
