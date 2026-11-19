@@ -27,13 +27,11 @@
 
 /**
  * Queue depth at which the decoder is no longer keeping up with real time.
- * Six frames is ~100 ms at 60 FPS: past the point where dropping the
- * backlog costs less than showing it. Kept at six rather than eight because
- * every frame held in the decode queue is glass-to-glass latency that the
- * presenter cannot shed — the presenter drops *decoded* frames, not queued
- * ones, so a queue that is still draining is pure added delay.
+ * Four queued frames is ~67 ms at 60 FPS and ~33 ms at 120 FPS. A three-frame
+ * burst is still tolerated, but a fourth means the decoder itself has become
+ * the latency buffer; resetting is cheaper than displaying stale frames.
  */
-export const BACKLOG_RESET_FRAMES = 6;
+export const BACKLOG_RESET_FRAMES = 4;
 
 /**
  * A queued decoder that has produced nothing for this long is stuck rather
