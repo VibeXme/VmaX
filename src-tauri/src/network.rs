@@ -2588,12 +2588,25 @@ async fn run_quic_multiplex_loop(
             }
             Some(input) = input_rx.recv() => {
                 let bytes = input.encode();
-                let controller = matches!(input.event, crate::protocol::InputEvent::GamepadState { .. });
-                if controller || input.is_high_frequency_motion() && conn.max_datagram_size().is_some_and(|m| m >= bytes.len()) {
-                    if conn.send_datagram(bytes).is_ok() {
+                let datagram_fits = conn.max_datagram_size().is_some_and(|m| m >= bytes.len());
+                let lossy_realtime = matches!(
+                    input.event,
+                    crate::protocol::InputEvent::GamepadState { .. }
+                ) || input.is_high_frequency_motion();
+
+                if lossy_realtime {
+                    if datagram_fits && conn.send_datagram(bytes).is_ok() {
                         counters.input_events_tx.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
+                    // Critical transitions (keys/buttons/wheel/text) take a
+                    // datagram fast path so packet loss on the reliable stream
+                    // cannot add head-of-line input lag. The same sequence is
+                    // still written to the reliable stream as loss recovery;
+                    // the host deduplicates whichever copy arrives second.
+                    if datagram_fits {
+                        let _ = conn.send_datagram(bytes.clone());
+                    }
                     let mut framed = BytesMut::with_capacity(4 + bytes.len());
                     framed.put_u32(bytes.len() as u32);
                     framed.extend_from_slice(&bytes);
