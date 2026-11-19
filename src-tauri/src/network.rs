@@ -45,14 +45,15 @@ const DEFAULT_FEC_GROUP_SIZE: u8 = 10;
 const MAX_QUEUED_DELTA_BYTES: usize = 512 * 1024;
 const RELAY_STARTUP_BITRATE_BPS: u32 = 4_000_000;
 const HIGH_RTT_STARTUP_BITRATE_BPS: u32 = 6_000_000;
-/// A frame that waited longer than this is already too old to present on
-/// time, so sending it only adds delay behind it. 30 ms is under two frames
-/// at 60 FPS: long enough that a scheduling hiccup does not cost the picture,
-/// short enough that a backlog cannot build up. Tightened from 45 ms: the
-/// capture loop already skips slots before the queue forms, so this is the
-/// last line of defense, and every millisecond it allows is latency the
-/// client has to present.
-const MAX_CAPTURE_QUEUE_AGE: Duration = Duration::from_millis(30);
+/// Maximum age of an encoded delta frame before it is considered stale.
+///
+/// Scale this with the negotiated frame rate instead of using a fixed 30 ms:
+/// at 120/144 FPS a 30 ms queue is 3-4 frames of avoidable latency. Two frame
+/// intervals keeps enough scheduler slack without allowing a deep backlog.
+fn max_capture_queue_age(fps: u16) -> Duration {
+    (Duration::from_secs_f64(2.0 / f64::from(fps.max(1))))
+        .clamp(Duration::from_millis(12), Duration::from_millis(30))
+}
 const LAN_PROBE_HEAD_START: Duration = Duration::from_millis(125);
 const NETWORK_RTT_TARGET: Duration = Duration::from_millis(35);
 
@@ -102,10 +103,9 @@ fn pending_video_cap(
     // doesn't trigger false keyframe spirals.
     let frame_time = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
     if !direct {
-        // A TCP relay already adds its own queues. Limit the backlog in front of
-        // it to roughly two frames so controls can still reach the host promptly.
-        let budget = (frame_time * 2).clamp(Duration::from_millis(20), Duration::from_millis(45))
-            + recovery_allowance;
+        // A TCP relay already has its own queue. Reassembly slack belongs on the
+        // receiver only; adding it here lets stale video sit in front of input.
+        let budget = (frame_time * 2).clamp(Duration::from_millis(16), Duration::from_millis(32));
         return ((target_bps as f64 / 8.0 * budget.as_secs_f64()) as usize)
             .clamp(12 * 1024, MAX_QUEUED_DELTA_BYTES);
     }
@@ -1106,9 +1106,10 @@ async fn spawn_session(
             .as_ref()
             .is_some_and(|invite| invite.room_code.starts_with("saved-"));
     let (video_tx, video_rx) = mpsc::channel::<OutboundVideoFrame>(2);
-    // 32 slots (~160ms headroom) prevents silent audio packet drops during brief Wi-Fi bursts
-    let (audio_tx, audio_rx) = mpsc::channel::<AudioPacket>(32);
-    let (input_tx, input_rx) = mpsc::channel::<InputPacket>(256);
+    // Keep realtime queues shallow. Audio/input producers already use try_send
+    // for high-frequency traffic, so large queues only preserve stale data.
+    let (audio_tx, audio_rx) = mpsc::channel::<AudioPacket>(8);
+    let (input_tx, input_rx) = mpsc::channel::<InputPacket>(32);
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(64);
     let (haptics_tx, haptics_rx) = watch::channel(crate::haptics::Rumble::default());
     let (event_tx, event_rx) = mpsc::unbounded_channel::<NetworkEvent>();
@@ -2235,7 +2236,6 @@ async fn run_quic_multiplex_loop(
     let recovery_allowance = jitter_window
         .saturating_sub(Duration::from_millis(18))
         .min(Duration::from_millis(35));
-    let delta_send_deadline = MAX_CAPTURE_QUEUE_AGE + recovery_allowance;
     let dgram_task = tokio::spawn(async move {
         let mut reassembler = VideoReassembler::new(jitter_window);
         let mut rtt = dgram_conn.rtt();
@@ -2506,6 +2506,7 @@ async fn run_quic_multiplex_loop(
                     .note_quic_bytes(QUIC_DATAGRAM_BUFFER_BYTES.saturating_sub(conn.datagram_send_buffer_space()) as u64);
                 overrides.backlog.set_cap_bytes(dynamic_cap);
                 let gap = last_video_frame.is_some_and(|id| id.wrapping_add(1) != frame.frame_id);
+                let delta_send_deadline = max_capture_queue_age(frame.fps);
                 let max_frame_age = if frame.is_keyframe {
                     Duration::from_millis(500)
                 } else {
