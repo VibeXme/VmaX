@@ -43,6 +43,17 @@ jobs:
           cargo update --workspace --manifest-path src-tauri/Cargo.toml
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+      - name: Fetch and verify required Windows tunnel helper
+        shell: pwsh
+        run: |
+          $path = 'src-tauri/resources/cloudflared.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
+          $url = 'https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-windows-amd64.exe'
+          Invoke-WebRequest -Uri $url -OutFile $path -MaximumRedirection 10
+          $actual = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+          $expected = '2493dbc168923bb3e59e5e7716f71deced92992eea9acd6e9d74f84ac7751343'
+          if ($actual -ne $expected) { throw "cloudflared.exe checksum mismatch: $actual" }
+
       - name: Build Windows executable
         shell: pwsh
         run: |
