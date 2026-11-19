@@ -19,6 +19,9 @@ $script:WindowsBuildSucceeded = $false
 
 # Prerequisite download URLs (version-pinned for reproducibility)
 $VC_REDIST_X64_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+$WEBVIEW2_BOOTSTRAPPER_URL = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
+$CLOUDFLARED_VERSION = '2026.10.7'
+$CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-windows-amd64.exe"
 # NSIS is installed via winget (NSIS.NSIS) - no download needed
 
 function Invoke-Tauri([string[]]$Arguments) {
@@ -63,8 +66,31 @@ function Download-Prerequisites {
         Write-Host "Downloading VC++ Redistributable..."
         try {
             Invoke-WebRequest -Uri $VC_REDIST_X64_URL -OutFile $vcRedistPath -UseBasicParsing
-            if ($LASTEXITCODE) { throw "VC++ Redist download failed with exit code $LASTEXITCODE." }
         } catch { throw "Failed to download VC++ Redistributable: $_" }
+    }
+
+    # WebView2 Evergreen Runtime bootstrapper (for installer)
+    $webview2Path = Join-Path $prereqDir 'MicrosoftEdgeWebview2Setup.exe'
+    if (-not (Test-Path $webview2Path)) {
+        Write-Host "Downloading WebView2 bootstrapper..."
+        try {
+            Invoke-WebRequest -Uri $WEBVIEW2_BOOTSTRAPPER_URL -OutFile $webview2Path -UseBasicParsing
+        } catch { throw "Failed to download WebView2 bootstrapper: $_" }
+    }
+
+    # cloudflared is embedded in the Windows build and must exist before Cargo compiles.
+    $resourcesDir = Join-Path $PSScriptRoot 'src-tauri\resources'
+    New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
+    $cloudflaredPath = Join-Path $resourcesDir 'cloudflared.exe'
+    if (-not (Test-Path $cloudflaredPath) -or (Get-Item $cloudflaredPath).Length -lt 1MB) {
+        Write-Host "Downloading cloudflared $CLOUDFLARED_VERSION..."
+        try {
+            Invoke-WebRequest -Uri $CLOUDFLARED_URL -OutFile $cloudflaredPath -UseBasicParsing
+        } catch { throw "Failed to download cloudflared: $_" }
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $cloudflaredPath
+    if ($signature.Status -ne 'Valid') {
+        throw "cloudflared Authenticode signature is invalid: $($signature.StatusMessage)"
     }
 
     # NSIS (installed via winget - NSIS.NSIS)
