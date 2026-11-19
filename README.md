@@ -1,6 +1,10 @@
-# VmaX
+<p align="center">
+  <img src="public/vmax-mark.png" width="112" height="112" alt="VmaX logo" />
+</p>
 
-**Ultra-low-latency peer-to-peer remote desktop and game streaming for Windows and Android.**
+<h1 align="center">VmaX</h1>
+
+<p align="center"><strong>Ultra-low-latency peer-to-peer remote desktop and game streaming for Windows and Android.</strong></p>
 
 VmaX connects a **host** (the machine being streamed) to a **client** over a direct
 QUIC/UDP path when possible, and automatically falls back to an authenticated relay.
