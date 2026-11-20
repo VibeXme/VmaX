@@ -3,7 +3,7 @@
 ; then unpacks the app. Run from build_vmax_release.ps1 after tauri build.
 
 !define PRODUCT_NAME "VmaX"
-!define PRODUCT_VERSION "5.1.0"
+!define PRODUCT_VERSION "5.3.1"
 !define PRODUCT_PUBLISHER "VmaX"
 !define PRODUCT_WEB_SITE "https://github.com/your-repo/vmax"
 !define APP_EXE "VmaX.exe"

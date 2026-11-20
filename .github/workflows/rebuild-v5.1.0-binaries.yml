@@ -1,4 +1,4 @@
-name: Rebuild v5.1.0 binaries
+name: Rebuild v5.3.1 binaries
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: vmax-v5.1.0-release-${{ github.ref }}
+  group: vmax-v5.3.1-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
       - name: Reconcile Cargo.lock with Cargo.toml
         shell: pwsh
         run: |
-          # The v5.1.0 source manifest changed after the lockfile was generated.
+          # The v5.3.1 source manifest changed after the lockfile was generated.
           # Resolve only workspace packages to avoid gratuitously upgrading all
           # third-party dependencies, then keep --locked for both builds.
           cargo update --workspace --manifest-path src-tauri/Cargo.toml
@@ -83,9 +83,9 @@ jobs:
           if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
           if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
 
-      - name: Replace v5.1.0 EXE and APK
+      - name: Replace v5.3.1 EXE and APK
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload v5.1.0 VmaX.exe VmaX-Android-arm64.apk --clobber --repo VibeXme/VmaX
+          gh release upload v5.3.1 VmaX.exe VmaX-Android-arm64.apk --clobber --repo VibeXme/VmaX
