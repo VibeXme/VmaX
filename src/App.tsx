@@ -201,6 +201,7 @@ export function App() {
   });
   const [pingHistory, setPingHistory] = useState<number[]>([]);
   const [logs, setLogs] = useState<PacketLogEntry[]>([]);
+  const [playerNotices, setPlayerNotices] = useState<{ id: number; text: string; expires: number }[]>([]);
   const [uiError, setUiError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState<SavedConnections>(EMPTY_SAVED);
@@ -338,6 +339,16 @@ export function App() {
       return;
     }
 
+    let nextNotice = 0;
+    const unlistenPresence = listen<{ slot: number; joined: boolean }>("vmax://player-presence", ({ payload }) => {
+      const notice = {
+        id: nextNotice++,
+        text: `Player ${payload.slot + 1} ${payload.joined ? "joined" : "left"}`,
+        expires: Date.now() + 4_000,
+      };
+      setPlayerNotices((previous) => [...previous.slice(-7), notice]);
+    });
+
     const unlistenTel = listen<NetworkTelemetry>("vmax://telemetry", (event) => {
       if (stopping.current) return;
       telemetryRevision.current += 1;
@@ -400,12 +411,23 @@ export function App() {
     });
 
     return () => {
+      unlistenPresence.then((f) => f()).catch(() => {});
       unlistenTel.then((f) => f()).catch(() => {});
       unlistenHw.then((f) => f()).catch(() => {});
       unlistenLog.then((f) => f()).catch(() => {});
       unlistenRelay.then((f) => f()).catch(() => {});
     };
   }, []);
+
+  const nextNoticeExpiry = playerNotices[0]?.expires;
+  useEffect(() => {
+    if (nextNoticeExpiry === undefined) return;
+    const timer = window.setTimeout(() => {
+      const now = Date.now();
+      setPlayerNotices((previous) => previous.filter(({ expires }) => expires > now));
+    }, Math.max(0, nextNoticeExpiry - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [nextNoticeExpiry]);
 
   const livePingMs = isConnected ? telemetry.rtt_ms : 0;
 
@@ -773,6 +795,13 @@ export function App() {
 
   return (
     <>
+      <div role="log" aria-label="Player activity" className="pointer-events-none fixed inset-x-4 top-14 z-[80] flex flex-col items-end gap-2">
+        {playerNotices.map(({ id, text }) => (
+          <div key={id} className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 shadow-lg">
+            {text}
+          </div>
+        ))}
+      </div>
       <CloudAccounts section={view !== "streaming" && (page === "friends" || page === "computers" || page === "accounts") ? page : null}
         container={accountPanel} canHost={canHost} active={busy || isSessionActive}
         hostParams={() => buildStartSessionParams(signalingUrl)}

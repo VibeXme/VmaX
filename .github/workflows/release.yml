@@ -1,4 +1,4 @@
-name: Rebuild v5.3.4 binaries
+name: Rebuild v5.3.5 binaries
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: vmax-v5.3.4-release-${{ github.ref }}
+  group: vmax-v5.3.5-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -111,17 +111,18 @@ jobs:
           if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
           if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
 
-      - name: Publish v5.3.4 release after all builds succeed
+      - name: Publish v5.3.5 release after all builds succeed
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = @'
-          ## VmaX 5.3.4 — Authenticated UDP relay
+          ## VmaX 5.3.5
 
-          - Add an optional authenticated TURN route between direct UDP and the WebSocket fallback.
-          - Verify UDP paths using keys derived from the end-to-end QUIC connection.
-          - Display an active TURN route as UDP Relay in connection telemetry.
+          - Simplify the main workspace and show player join and leave notices.
+          - Recover stalled WebView video when encoded frames are still arriving.
+          - Keep keyboard and mouse button transitions in order.
+          - Verify input ordering during concurrent direct and relay streams.
 
           ### Downloads
           - VmaX.exe — Windows portable
@@ -130,6 +131,6 @@ jobs:
 
           Relay hosting and bandwidth are supplied by the operator. Actual latency depends on the network path and devices.
           '@
-          $notes | Set-Content -Encoding utf8 'release-v5.3.4.md'
-          gh release create v5.3.4 VmaX.exe VmaX-Android-arm64.apk VmaX-Relay-Linux-x86_64.tar.gz --target "${{ github.sha }}" --title 'VmaX 5.3.4' --notes-file release-v5.3.4.md --repo VibeXme/VmaX
+          $notes | Set-Content -Encoding utf8 'release-v5.3.5.md'
+          gh release create v5.3.5 VmaX.exe VmaX-Android-arm64.apk VmaX-Relay-Linux-x86_64.tar.gz --target "${{ github.sha }}" --title 'VmaX 5.3.5' --notes-file release-v5.3.5.md --repo VibeXme/VmaX
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

@@ -225,13 +225,18 @@ function normalizeBinaryFrame(payload: unknown): Uint8Array | null {
   return null;
 }
 
+let inputTransitions: Promise<void> = Promise.resolve();
+
 function dispatchRemoteInput(input: RemoteInputPayload) {
   if (!hasTauriRuntime()) {
     return Promise.resolve();
   }
-  return invoke<void>("send_input_event", { input }).catch(() => {
-    // Session might be disconnecting; ignore transient IPC rejection.
-  });
+  const send = () => invoke<void>("send_input_event", { input }).catch(() => {});
+  if (input.kind === "key" || input.kind === "mouse_button") {
+    inputTransitions = inputTransitions.then(send);
+    return inputTransitions;
+  }
+  return send();
 }
 
 function isLocalSystemKey(event: KeyboardEvent) {
@@ -325,7 +330,7 @@ export function StreamViewer({
   const [overlayVisible, setOverlayVisible] = useState(false);
   const [hostEncodeMs, setHostEncodeMs] = useState<number | null>(null);
   const [parsecTelemetry, setParsecTelemetry] = useState<ParsecTelemetryPayload | null>(null);
-  const [recoverStalls, setRecoverStalls] = useState(false);
+  const [recoverStalls, setRecoverStalls] = useState(true);
   const recoverStallsRef = useRef(recoverStalls);
   recoverStallsRef.current = recoverStalls;
   const [activeCodecLabel, setActiveCodecLabel] = useState<string>("H.265");
@@ -753,6 +758,8 @@ export function StreamViewer({
     let videoBytes = 0;
     let drawnFrames = 0;
     let lastDrawnAt = 0;
+    let lastVideoPacketAt = 0;
+    let lastStallResetAt = -Infinity;
     let decodeSamples = 0;
     let decodeTotalMs = 0;
     let lastPlaybackSample = performance.now();
@@ -808,12 +815,17 @@ export function StreamViewer({
         requestSyncKeyframe("awaiting_first_frame");
       }
       if (
-        receivedFirstFrame &&
+        connectedRef.current &&
         !nativeVideoRef.current &&
         !document.hidden &&
+        lastVideoPacketAt > 0 &&
+        now - lastVideoPacketAt < 1_000 &&
         now - lastDrawnAt >= 1_000 &&
+        now - lastStallResetAt >= 2_000 &&
         recoverStallsRef.current
       ) {
+        lastStallResetAt = now;
+        resetDecoder();
         requestSyncKeyframe("video_stalled");
       }
       lastPlaybackSample = now;
@@ -1041,6 +1053,7 @@ export function StreamViewer({
           return;
         }
 
+        lastVideoPacketAt = performance.now();
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         const frameId = view.getUint32(0, false);
         const tsUs = Number(view.getBigUint64(4, false));
@@ -1163,6 +1176,7 @@ export function StreamViewer({
   }, []);
 
   useEffect(() => {
+    if (!connected || inputBlocked) return;
     const pressedScancodes = new Set<number>();
 
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1240,12 +1254,20 @@ export function StreamViewer({
     const releaseOnHidden = () => {
       if (document.hidden) onBlur();
     };
+    const releaseOnUnlock = () => {
+      if (document.pointerLockElement !== canvasRef.current) {
+        releaseHeldKeys();
+        releaseMouse();
+      }
+    };
+    document.addEventListener("pointerlockchange", releaseOnUnlock);
     document.addEventListener("visibilitychange", releaseOnHidden);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", onBlur);
     window.addEventListener("mouseup", onMouseUp, true);
     return () => {
+      document.removeEventListener("pointerlockchange", releaseOnUnlock);
       document.removeEventListener("visibilitychange", releaseOnHidden);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
@@ -1253,7 +1275,7 @@ export function StreamViewer({
       window.removeEventListener("mouseup", onMouseUp, true);
       onBlur();
     };
-  }, [releaseKeyboardCapture, releaseMouse]);
+  }, [connected, inputBlocked, releaseKeyboardCapture, releaseMouse]);
 
   const handleCanvasPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.pointerType === "touch") {
@@ -1326,7 +1348,7 @@ export function StreamViewer({
       sourceCapabilities?: { firesTouchEvents?: boolean };
     };
     if (nativeEvent.sourceCapabilities?.firesTouchEvents) return;
-    if (inputBlocked || event.button < 0 || event.button > 4) return;
+    if (!connected || inputBlocked || event.button < 0 || event.button > 4) return;
     event.preventDefault();
     pressedMouse.current.add(event.button);
     void dispatchRemoteInput({ kind: "mouse_button", button: event.button, pressed: true });

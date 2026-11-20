@@ -377,3 +377,62 @@ input:is([type="range"], [type="checkbox"]), input[type="radio"] { accent-color:
   .vmax-workspace-content .vmax-panel { gap: 12px; }
   .vmax-home { padding-bottom: 12px; }
 }
+
+/* Keep navigation quiet and give the connection form a readable width. */
+.vmax-workspace-content .vmax-panel {
+  max-width: 760px;
+  gap: 24px;
+}
+.vmax-workspace .vmax-nav {
+  gap: 4px;
+  padding-inline: 14px;
+}
+.vmax-workspace .vmax-nav button {
+  border-color: transparent;
+  background: transparent;
+  color: #a1a1aa;
+  font-weight: 550;
+}
+.vmax-workspace .vmax-nav button:hover {
+  background: var(--vmax-card);
+  color: #fafafa;
+}
+.vmax-workspace .vmax-nav button[aria-pressed="true"] {
+  background: var(--vmax-card);
+  border-color: var(--vmax-line);
+  color: var(--vmax-accent);
+}
+.vmax-home {
+  gap: 16px;
+  padding-bottom: 24px;
+}
+.vmax-brand {
+  gap: 14px;
+}
+.vmax-brand-logo {
+  width: 48px;
+  height: 48px;
+  box-shadow: none;
+}
+.vmax-brand h1 {
+  font-size: clamp(1.45rem, 3vw, 1.9rem);
+  letter-spacing: -.025em;
+}
+.vmax-home > .vmax-secondary {
+  min-height: 40px;
+}
+.vmax-workspace-content .vmax-switch {
+  max-width: 440px;
+}
+.vmax-workspace-content .vmax-form {
+  gap: 12px;
+}
+.vmax-workspace-content .vmax-form > .vmax-primary {
+  min-height: 46px;
+}
+@media (max-width: 760px), (pointer: coarse) {
+  .vmax-workspace-content .vmax-panel { gap: 18px; }
+  .vmax-workspace .vmax-nav { padding-inline: 6px; }
+  .vmax-home { padding-bottom: 16px; }
+  .vmax-brand-logo { width: 40px; height: 40px; }
+}

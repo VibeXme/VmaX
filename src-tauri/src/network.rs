@@ -2671,14 +2671,7 @@ async fn run_quic_multiplex_loop(
                         counters.input_events_tx.fetch_add(1, Ordering::Relaxed);
                     }
                 } else {
-                    // Critical transitions (keys/buttons/wheel/text) take a
-                    // datagram fast path so packet loss on the reliable stream
-                    // cannot add head-of-line input lag. The same sequence is
-                    // still written to the reliable stream as loss recovery;
-                    // the host deduplicates whichever copy arrives second.
-                    if datagram_fits {
-                        let _ = conn.send_datagram(bytes.clone());
-                    }
+                    // Preserve transition order so a release cannot overtake its press.
                     let mut framed = BytesMut::with_capacity(4 + bytes.len());
                     framed.put_u32(bytes.len() as u32);
                     framed.extend_from_slice(&bytes);
@@ -3594,9 +3587,28 @@ mod tests {
                 let payload = Bytes::from(vec![0x35; 24_000]);
                 let video_tx = host.tx.video_tx.clone();
                 let audio_tx = host.tx.audio_tx.clone();
+                let input_tx = client.tx.input_tx.clone();
+                const TRANSITIONS: u32 = 64;
+                let input_event = |id: u32| {
+                    let pressed = id % 2 == 0;
+                    if id % 4 < 2 {
+                        crate::protocol::InputEvent::Key { scan_code: 30, pressed, modifiers: 0 }
+                    } else {
+                        crate::protocol::InputEvent::MouseButton { button: 0, pressed }
+                    }
+                };
                 let produce = async move {
                     for id in 0..480u32 {
                         cadence.tick().await;
+                        if id % 6 == 0 && id / 6 < TRANSITIONS {
+                            let number = id / 6;
+                            input_tx.send(InputPacket {
+                                seq: u64::from(number) + 1,
+                                client_ts_us: u64::from(id) * 16_667,
+                                event: input_event(number),
+                            }).await.unwrap();
+                        }
+
                         // Skip one reference frame each second. A new keyframe
                         // after the gap models the host's recovery response.
                         if id % 60 != 48 {
@@ -3674,8 +3686,19 @@ mod tests {
                         "a replacement keyframe was lost, relayed={relay_only}"
                     );
                 };
+                let collect_input = async {
+                    for number in 0..TRANSITIONS {
+                        loop {
+                            if let NetworkEvent::InputEventReceived(packet) = host.event_rx.recv().await.unwrap() {
+                                assert_eq!(packet.seq, u64::from(number) + 1);
+                                assert_eq!(packet.event, input_event(number));
+                                break;
+                            }
+                        }
+                    }
+                };
                 timeout(Duration::from_secs(15), async {
-                    tokio::join!(produce, consume);
+                    tokio::join!(produce, consume, collect_input);
                 })
                 .await
                 .expect("stream stalled under load");

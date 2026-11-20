@@ -1492,6 +1492,7 @@ fn register_session<'a>(
         #[cfg(target_os = "android")]
         let touch = state.touch_gamepad.clone();
         let forwarder = tauri::async_runtime::spawn(async move {
+            let mut guest_connected = false;
             let mut video_rx_count: u64 = 0;
             let mut audio_rx_count: u64 = 0;
             let mut input_rx_count: u64 = 0;
@@ -1689,6 +1690,13 @@ fn register_session<'a>(
                             format!("Phase -> {phase:?}"),
                         );
                         let is_live = phase == ConnectionPhase::Connected;
+                        if ctx.role == SessionRole::Host && guest_connected != is_live {
+                            guest_connected = is_live;
+                            let _ = ctx.app.emit(
+                                "vmax://player-presence",
+                                serde_json::json!({ "slot": 0, "joined": is_live }),
+                            );
+                        }
                         #[cfg(target_os = "windows")]
                         if ctx.role == SessionRole::Host {
                             gamepad = is_live.then(HostGamepad::default);
@@ -2090,6 +2098,12 @@ fn register_session<'a>(
                 haptics::deliver_android(Rumble::default(), false);
             }
             if ctx.role == SessionRole::Host {
+                if guest_connected {
+                    let _ = ctx.app.emit(
+                        "vmax://player-presence",
+                        serde_json::json!({ "slot": 0, "joined": false }),
+                    );
+                }
                 let app_rehost = ctx.app.clone();
                 tauri::async_runtime::spawn(async move {
                     let state = app_rehost.state::<AppState>();
