@@ -155,7 +155,7 @@ mod desktop {
 #[cfg(target_os = "windows")]
 pub use desktop::InternetTunnel;
 
-/// Prefer a consistently fast configured relay before creating a temporary tunnel.
+/// Select a configured relay that can carry media before creating a temporary tunnel.
 #[cfg(target_os = "windows")]
 pub async fn preferred_public_relay(
     preferred: Option<&str>,
@@ -165,49 +165,18 @@ pub async fn preferred_public_relay(
         .ok()
         .or_else(|| option_env!("VMAX_PUBLIC_RELAY_URLS").map(str::to_owned))
         .unwrap_or_default();
-    let mut checks = tokio::task::JoinSet::new();
     let mut seen = std::collections::HashSet::new();
-    for endpoint in preferred
+    let endpoints = preferred
         .into_iter()
         .chain(additional.iter().map(String::as_str))
         .chain(configured.split(','))
-        .map(str::trim)
-    {
-        if let Ok(url) = crate::signaling::validate_signaling_url(endpoint)
-            && url.scheme() == "wss"
-            && seen.insert(url.to_string())
-        {
-            let endpoint = url.to_string();
-            checks.spawn(async move {
-                let mut timings = Vec::with_capacity(3);
-                for _ in 0..3 {
-                    let started = std::time::Instant::now();
-                    let result = tokio::time::timeout(
-                        std::time::Duration::from_millis(900),
-                        crate::signaling::list_relay_rooms(&endpoint),
-                    )
-                    .await;
-                    if matches!(result, Ok(Ok(_))) {
-                        timings.push(started.elapsed());
-                    }
-                }
-                timings.sort_unstable();
-                (timings.len() >= 2).then(|| (timings[timings.len() / 2], endpoint))
-            });
-            if seen.len() == 8 {
-                break;
-            }
-        }
-    }
-    let mut best = None;
-    while let Some(result) = checks.join_next().await {
-        if let Ok(Some(candidate)) = result
-            && best.as_ref().is_none_or(|current| candidate < *current)
-        {
-            best = Some(candidate);
-        }
-    }
-    best.map(|(_, endpoint)| endpoint)
+        .filter_map(|endpoint| crate::signaling::validate_signaling_url(endpoint.trim()).ok())
+        .filter(|url| url.scheme() == "wss")
+        .map(|url| url.to_string())
+        .filter(|endpoint| seen.insert(endpoint.clone()))
+        .take(8)
+        .collect();
+    crate::relay_probe::select(endpoints).await
 }
 
 fn endpoint_from_log(line: &str) -> Option<String> {

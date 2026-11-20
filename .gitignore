@@ -25,6 +25,7 @@ dist-ssr
 
 # Rust / Tauri build output
 src-tauri/target
+relay-server/target
 src-tauri/gen/android
 src-tauri/gen/schemas
 

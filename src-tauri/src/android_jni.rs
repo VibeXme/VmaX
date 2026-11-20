@@ -414,6 +414,10 @@ fn decoder_thread(
         let now = Instant::now();
         if let Some(frame) = consumer.next(now) {
             if let Err(err) = deliver_frame(&mut env, &target.class, &frame) {
+                consumer.decoder_rejected_frame();
+                if consumer.take_keyframe_request() {
+                    NEEDS_KEYFRAME.store(true, Ordering::Release);
+                }
                 failures += 1;
                 if failures == 1 || failures % 240 == 0 {
                     tracing::warn!(

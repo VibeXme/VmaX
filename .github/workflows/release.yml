@@ -1,4 +1,4 @@
-name: Rebuild v5.3.2 binaries
+name: Rebuild v5.3.3 binaries
 
 on:
   push:
@@ -9,12 +9,19 @@ permissions:
   contents: write
 
 concurrency:
-  group: vmax-v5.3.2-release-${{ github.ref }}
+  group: vmax-v5.3.3-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  relay-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --manifest-path relay-server/Cargo.toml --locked
+
   rebuild-release-binaries:
-    if: github.repository == 'VibeXme/VmaX'
+    needs: relay-tests
+    if: github.repository == 'VibeXme/VmaX' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     timeout-minutes: 90
 
@@ -37,15 +44,6 @@ jobs:
         run: |
           rustup target add x86_64-pc-windows-msvc
           rustup target add aarch64-linux-android
-
-      - name: Reconcile Cargo.lock with Cargo.toml
-        shell: pwsh
-        run: |
-          # The v5.3.2 source manifest changed after the lockfile was generated.
-          # Resolve only workspace packages to avoid gratuitously upgrading all
-          # third-party dependencies, then keep --locked for both builds.
-          cargo update --workspace --manifest-path src-tauri/Cargo.toml
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Fetch and verify required Windows tunnel helper
         shell: pwsh
@@ -89,25 +87,24 @@ jobs:
           if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
           if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
 
-      - name: Publish v5.3.2 release after both builds succeed
+      - name: Publish v5.3.3 release after both builds succeed
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = @'
-          ## VmaX 5.3.2 — Device identity security update
+          ## VmaX 5.3.3 — Relay selection and stream recovery
 
-          - Protect Windows Ed25519 device identity seeds using Windows DPAPI.
-          - Migrate existing Windows plaintext identity files without changing device IDs or public keys.
-          - Retain existing authenticated Supabase account sessions and direct QUIC certificate pinning.
-          - Validate Rust unit tests and both release binaries before publishing.
+          - Select configured relays using bidirectional media packet round trips.
+          - Run the standalone VmaX relay behind a TLS reverse proxy in regions near your players.
+          - Resume Android decoding from a keyframe when the native frame handoff fails.
 
           ### Downloads
           - VmaX.exe — Windows portable
           - VmaX-Android-arm64.apk — Android ARM64
 
-          Note: Android identity continues to use app-private storage. The Windows identity migration is one-way; back up app data before moving a device identity between Windows accounts.
+          Relay hosting and bandwidth are supplied by the operator. Actual latency depends on the network path and devices.
           '@
-          $notes | Set-Content -Encoding utf8 'release-v5.3.2.md'
-          gh release create v5.3.2 VmaX.exe VmaX-Android-arm64.apk --target "${{ github.sha }}" --title 'VmaX 5.3.2' --notes-file release-v5.3.2.md --repo VibeXme/VmaX
+          $notes | Set-Content -Encoding utf8 'release-v5.3.3.md'
+          gh release create v5.3.3 VmaX.exe VmaX-Android-arm64.apk --target "${{ github.sha }}" --title 'VmaX 5.3.3' --notes-file release-v5.3.3.md --repo VibeXme/VmaX
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

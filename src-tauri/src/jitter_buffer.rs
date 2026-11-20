@@ -399,6 +399,12 @@ impl JitterConsumer {
         }
     }
 
+    /// Resume from a keyframe after the downstream decoder rejects a frame.
+    pub fn decoder_rejected_frame(&mut self) {
+        self.awaiting_keyframe = true;
+        self.needs_keyframe = true;
+    }
+
     pub fn take_keyframe_request(&mut self) -> bool {
         std::mem::take(&mut self.needs_keyframe)
     }
@@ -487,6 +493,21 @@ mod tests {
         assert!(!consumer.take_keyframe_request());
         assert!(producer.push(frame(6, t0, true)));
         assert_eq!(consumer.next(due).map(|frame| frame.frame_id), Some(6));
+    }
+
+    #[test]
+    fn decoder_error_requests_a_keyframe_and_drops_dependent_frames() {
+        let t0 = Instant::now();
+        let (mut producer, mut consumer) = JitterProducer::new(t0, 8);
+        for (id, key) in [(1, true), (2, false), (3, true), (4, false)] {
+            assert!(producer.push(frame(id, t0, key)));
+        }
+        let due = t0 + Duration::from_millis(20);
+        assert_eq!(consumer.next(due).unwrap().frame_id, 1);
+        consumer.decoder_rejected_frame();
+        assert!(consumer.take_keyframe_request());
+        assert_eq!(consumer.next(due).unwrap().frame_id, 3);
+        assert_eq!(consumer.next(due).unwrap().frame_id, 4);
     }
 
     #[test]

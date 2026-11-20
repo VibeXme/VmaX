@@ -105,6 +105,37 @@ Output: `VmaX-Android-arm64.apk`
 > the build script copies the compiled `libvmax_lib.so` into the Gradle project
 > before packaging.
 
+## Internet relay
+
+VmaX prefers a direct QUIC path when the peers can establish one. For internet
+hosting, the Windows app can automatically select from configured VmaX
+WebSocket relays. It verifies bidirectional packet forwarding and ranks the
+working relays by the median of three packet round trips measured from the
+host. This is a host-side comparison, so it does not predict the viewer's
+network path or capture-to-display latency.
+
+To run a relay on a machine near your players:
+
+```sh
+cargo build --manifest-path relay-server/Cargo.toml --release --locked
+VMAX_RELAY_PORT=8787 ./relay-server/target/release/vmax-relay
+```
+
+The relay listens on loopback. Put a TLS reverse proxy with WebSocket support
+in front of it. For example, use this Caddy configuration with your own DNS name:
+
+```caddyfile
+relay.example.com {
+    reverse_proxy 127.0.0.1:8787
+}
+```
+
+Run one instance per region and add the resulting `wss://` URLs in Network
+options or as a comma-separated `VMAX_PUBLIC_RELAY_URLS` value on the Windows
+host. Use a regional DNS name for each instance so both peers reach the same
+relay when using an invite. The relay software has no usage fee. Infrastructure
+and bandwidth depend on your hosting provider.
+
 ## Development
 
 ```powershell
