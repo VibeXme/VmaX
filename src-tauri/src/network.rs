@@ -2175,9 +2175,10 @@ fn jitter_extends_recovery_without_changing_the_stable_path_window() {
     assert_eq!(quic_startup_bitrate(20_000_000, false, ms(64)), 6_000_000);
     assert_eq!(quic_startup_bitrate(20_000_000, true, ms(8)), 4_000_000);
     assert_eq!(quic_startup_bitrate(2_500_000, false, ms(64)), 2_500_000);
+    // Two 60 FPS frames would exceed the relay's 32 ms sender queue ceiling.
     assert_eq!(
         pending_video_cap(4_000_000, 60, ms(100), false, Duration::ZERO),
-        16_666
+        16_000
     );
     assert_eq!(
         pending_video_cap(4_000_000, 60, ms(100), true, Duration::ZERO),
