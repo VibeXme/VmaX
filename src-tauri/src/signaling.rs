@@ -366,6 +366,10 @@ pub struct PeerMatch {
 }
 
 pub(crate) trait DatagramRoute: Send + Sync {
+    fn has_path(&self) -> bool {
+        false
+    }
+
     fn try_send(&self, packet: &[u8]) -> impl Future<Output = bool> + Send;
 }
 
@@ -581,6 +585,7 @@ impl RelayConnection {
     ) -> Result<(), SignalingError> {
         let (mut send, mut recv) = self.0.split();
         let mut buf = [0; MAX_RELAY_PACKET];
+        let websocket_closed = std::sync::atomic::AtomicBool::new(false);
         let to_relay = async {
             loop {
                 let len = udp
@@ -589,6 +594,9 @@ impl RelayConnection {
                     .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
                 if route.try_send(&buf[..len]).await {
                     continue;
+                }
+                if websocket_closed.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(SignalingError::Closed);
                 }
                 send.send(Message::Binary(bytes::Bytes::copy_from_slice(&buf[..len])))
                     .await?;
@@ -608,9 +616,18 @@ impl RelayConnection {
             }
             Ok(())
         };
+        tokio::pin!(to_relay);
         tokio::select! {
-            result = to_relay => result,
-            result = from_relay => result,
+            result = &mut to_relay => result,
+            result = from_relay => {
+                if route.has_path() {
+                    websocket_closed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // The QUIC session can continue on the validated UDP path.
+                    to_relay.await
+                } else {
+                    result
+                }
+            }
         }
     }
 }

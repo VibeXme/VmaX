@@ -262,6 +262,11 @@ function Build-Android {
     }
     & $apksigner verify $signed
     if ($LASTEXITCODE) { throw 'APK signature verification failed.' }
+    $aapt = Join-Path $buildTools.FullName 'aapt.exe'
+    $permissions = & $aapt dump permissions $signed
+    if ($LASTEXITCODE -or -not ($permissions -match "android\.permission\.CAMERA")) {
+        throw 'Android APK is missing the camera permission required by the invite QR scanner.'
+    }
     Copy-Item -LiteralPath $signed -Destination (Join-Path $PSScriptRoot 'VmaX-Android-arm64.apk') -Force
     Write-Host "Android APK at $PSScriptRoot\VmaX-Android-arm64.apk"
 }

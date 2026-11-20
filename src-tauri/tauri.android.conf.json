@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VmaX",
-  "version": "5.3.5",
+  "version": "5.3.6",
   "identifier": "com.vmax.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node tools/configure-android-camera.mjs && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "node tools/configure-android-camera.mjs && npm run build",
     "frontendDist": "../dist"
   },
   "app": {

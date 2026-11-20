@@ -2498,6 +2498,20 @@ async fn run_quic_multiplex_loop(
         3,
         overrides.backlog.pacer_stats(),
     );
+    // QUIC flow control can suspend a reliable input write. Keep it off the
+    // media loop so a blocked transition cannot stall audio or recovery work.
+    let (reliable_input_tx, mut reliable_input_rx) = mpsc::channel::<Bytes>(32);
+    let (input_writer_done, mut input_writer_result) = oneshot::channel();
+    let input_counters = Arc::clone(&counters);
+    let _input_writer = RelayTask(tokio::spawn(async move {
+        while let Some(packet) = reliable_input_rx.recv().await {
+            if let Err(error) = input_stream.write_all(&packet).await {
+                let _ = input_writer_done.send(error);
+                return;
+            }
+            input_counters.input_events_tx.fetch_add(1, Ordering::Relaxed);
+        }
+    }));
     let mut last_pacer_errors = 0u64;
     let mut last_path_packets = (0u64, 0u64);
     let mut path_loss_permille = 0u16;
@@ -2658,7 +2672,13 @@ async fn run_quic_multiplex_loop(
                     counters.audio_packets_tx.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Some(input) = input_rx.recv() => {
+            Ok(error) = &mut input_writer_result => {
+                break Err(NetworkError::Io(io::Error::other(error)));
+            }
+            Some((input, permit)) = async {
+                let permit = reliable_input_tx.reserve().await.ok()?;
+                Some((input_rx.recv().await?, permit))
+            } => {
                 let bytes = input.encode();
                 let datagram_fits = conn.max_datagram_size().is_some_and(|m| m >= bytes.len());
                 let lossy_realtime = matches!(
@@ -2675,11 +2695,7 @@ async fn run_quic_multiplex_loop(
                     let mut framed = BytesMut::with_capacity(4 + bytes.len());
                     framed.put_u32(bytes.len() as u32);
                     framed.extend_from_slice(&bytes);
-                    input_stream
-                        .write_all(&framed)
-                        .await
-                        .map_err(|e| NetworkError::Io(io::Error::other(e)))?;
-                    counters.input_events_tx.fetch_add(1, Ordering::Relaxed);
+                    permit.send(framed.freeze());
                 }
             }
             Ok(()) = haptics_rx.changed(), if role == SessionRole::Host => {
@@ -3279,6 +3295,8 @@ mod tests {
             })
             .await
             .expect("peers did not upgrade the live connection");
+            relay.stop();
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let relayed = matches!(route, TestRoute::UnreachableUdp | TestRoute::RelayOnly);
         assert_eq!(host.telemetry.lock().await.relayed, relayed);

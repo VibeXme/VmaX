@@ -31,6 +31,12 @@ pub(crate) struct UdpRoutes {
 }
 
 impl crate::signaling::DatagramRoute for UdpRoutes {
+    fn has_path(&self) -> bool {
+        [&self.direct, &self.turn]
+            .iter()
+            .any(|(socket, path)| socket.is_some() && path.borrow().is_some())
+    }
+
     async fn try_send(&self, packet: &[u8]) -> bool {
         for (socket, path) in [&self.direct, &self.turn] {
             let address = *path.borrow();

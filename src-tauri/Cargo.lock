@@ -6204,7 +6204,7 @@ dependencies = [
 
 [[package]]
 name = "vmax"
-version = "5.3.5"
+version = "5.3.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

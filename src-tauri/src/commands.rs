@@ -848,19 +848,17 @@ async fn spawn_host_capture_thread(
                 let max_h = controls.desired_max_h.load(Ordering::Relaxed);
                 let max_fps = controls.desired_fps.load(Ordering::Relaxed).clamp(30, 144);
                 let constant_fps = crate::capture::is_constant_fps();
-                let (next_max_w, next_max_h, next_fps) = controls
-                    .client_display
-                    .lock()
-                    .ok()
-                    .and_then(|display| *display)
-                    .map_or((max_w, max_h, max_fps), |display| {
-                        let (width, height, display_fps) = display.constrain(max_w, max_h, max_fps);
-                        // The client's refresh rate is the rate it can actually
-                        // present. Encoding above it only wastes bandwidth and
-                        // makes the presenter discard every second picture, so
-                        // the cadence follows the panel in both modes.
-                        (width, height, display_fps)
-                    });
+                let lock_resolution = crate::capture::is_lock_resolution();
+                let next_fps = if constant_fps {
+                    max_fps
+                } else {
+                    controls
+                        .client_display
+                        .lock()
+                        .ok()
+                        .and_then(|display| *display)
+                        .map_or(max_fps, |display| display.constrain(max_w, max_h, max_fps).2)
+                };
                 let now = Instant::now();
                 let pace_fps = if constant_fps {
                     // Constant FPS holds the configured rate; the bitrate
@@ -869,29 +867,23 @@ async fn spawn_host_capture_thread(
                 } else {
                     cadence.fps(now, desired_bps, next_fps, frame_pacing)
                 };
-                let (next_max_w, next_max_h) = if crate::capture::is_lock_resolution() {
+                let (next_max_w, next_max_h) = if lock_resolution {
                     // Resolution is fixed by settings: never downscale for
                     // bandwidth, keep encoding the host's configured size.
-                    (next_max_w, next_max_h)
+                    (max_w, max_h)
                 } else {
-                    adaptive_resolution.ceiling(
-                        now,
-                        desired_bps,
-                        pace_fps,
-                        next_max_w,
-                        next_max_h,
-                        frame_pacing,
-                    )
+                    adaptive_resolution.ceiling(now, desired_bps, pace_fps, max_w, max_h, frame_pacing)
                 };
-                // Smoothness guard: when this host cannot encode the configured
-                // pixel count at the configured cadence, frame rate wins and
-                // resolution gives way. Both settings paths (locked and
-                // adaptive) end up here, because a stutter is never acceptable
-                // on any device class. Steps are coarse and rate-limited so a
-                // reconfigure can never turn into churn.
+                // Only adaptive resolution can trade pixels for encode time.
+                if lock_resolution {
+                    encode_fps_scale = 1.0;
+                    over_budget_since = None;
+                    under_budget_since = None;
+                    last_scale_change = now;
+                }
                 let frame_budget_ms = 1000.0 / f32::from(pace_fps.max(1));
-                let over_budget = ema_encode_ms > frame_budget_ms;
-                let well_under = ema_encode_ms > 0.0 && ema_encode_ms < frame_budget_ms * 0.55;
+                let over_budget = !lock_resolution && ema_encode_ms > frame_budget_ms;
+                let well_under = !lock_resolution && ema_encode_ms > 0.0 && ema_encode_ms < frame_budget_ms * 0.55;
                 if over_budget {
                     over_budget_since.get_or_insert(now);
                     under_budget_since = None;
@@ -962,7 +954,8 @@ async fn spawn_host_capture_thread(
                 let reconfigure_requested = controls
                     .pending_reconfigure
                     .swap(false, Ordering::AcqRel)
-                    || active_ceiling != next_ceiling;
+                    || active_ceiling != next_ceiling
+                    || target_fps != next_fps;
                 active_ceiling = next_ceiling;
                 if retry_capture || reconfigure_requested {
                     let next_mode = encoder_mode_from_u8(

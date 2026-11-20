@@ -972,13 +972,13 @@ export function SettingsModal({
                 </SettingRow>
                 <SettingRow
                   title="Resolution and reconstruction"
-                  hint="The host encodes exactly the resolution selected above. The client upscales and sharpens at its own display resolution, so nothing is softened before it reaches the screen."
+                  hint="The host fits the capture to the selected resolution. The client scales and sharpens the picture for its display."
                 >
                   <span className="font-mono text-xs text-zinc-500">Client-side</span>
                 </SettingRow>
                 <SettingRow
                   title="Lock resolution"
-                  hint="Keep the negotiated frame size and disable bandwidth-based scaling."
+                  hint="Keep the selected frame size within the host display’s limits."
                 >
                   <ToggleSwitch
                     checked={config.video.lockResolution}

@@ -130,8 +130,8 @@ impl FrameCadence {
     ///
     /// `next_deadline` is the end of the slot that just ran. When the slot is
     /// still open, the returned instant is when the loop should start the next
-    /// one. When the slot has already been missed the grid re-anchors to
-    /// `now + interval` and returns `None`: one skipped slot, never a burst.
+    /// one. Small overruns retain the grid. Larger overruns re-anchor to
+    /// `now + interval` and return `None` without a catch-up burst.
     pub fn advance(&mut self, now: Instant) -> Option<Instant> {
         if now < self.next_deadline {
             let deadline = self.next_deadline;
@@ -145,7 +145,13 @@ impl FrameCadence {
                 .skipped_slots
                 .saturating_add((lateness.as_nanos() / self.interval.as_nanos().max(1)) as u64);
         }
-        self.next_deadline = now + self.interval;
+        // A small scheduler overrun can be absorbed by the next slot. Keep
+        // the original grid so repeated small overruns don't lower cadence.
+        if lateness <= self.interval / 4 {
+            self.next_deadline += self.interval;
+        } else {
+            self.next_deadline = now + self.interval;
+        }
         None
     }
 
@@ -233,6 +239,19 @@ mod tests {
         };
         assert!(error <= Duration::from_millis(1), "drifted by {error:?}");
         assert_eq!(cadence.late_slots(), 0);
+    }
+
+    #[test]
+    fn repeated_small_overruns_keep_the_frame_grid() {
+        let start = t0();
+        let mut cadence = FrameCadence::new(start, 60);
+        let interval = cadence.interval();
+        for slot in 1..=60 {
+            let now = start + interval * slot + Duration::from_millis(1);
+            assert!(cadence.advance(now).is_none());
+        }
+        assert_eq!(cadence.next_deadline, start + interval * 61);
+        assert_eq!(cadence.skipped_slots(), 0);
     }
 
     #[test]

@@ -80,9 +80,15 @@ export function QrScanner({ onClose, onInvite }: { onClose: () => void; onInvite
         setCameraReady(true);
         setMessage("Point at a VmaX invite QR.");
         void scanFrame();
-      } catch {
+      } catch (error) {
         stream?.getTracks().forEach((track) => track.stop());
-        if (!cancelled) setMessage("Camera unavailable. Choose a QR image.");
+        if (!cancelled) {
+          if (player) player.srcObject = null;
+          const denied = error instanceof DOMException && error.name === "NotAllowedError";
+          setMessage(denied
+            ? "Allow camera access in your app settings, or choose a QR image."
+            : "Camera unavailable. Choose a QR image.");
+        }
       }
     }
     void startCamera();
