@@ -29,7 +29,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -1918,6 +1918,21 @@ fn now_unix_us() -> u64 {
         .as_micros() as u64
 }
 
+/// Returns a stable timestamp for the local Ping/Pong exchange.
+///
+/// Wall-clock time can move backwards when Windows applies a time correction.
+/// A Ping stamped just before that correction would then be rejected by the
+/// sender because `now < client_ts_us`, making the live ping value stick until
+/// the clock catches up. The timestamp is echoed only by the originating
+/// process, so it does not need to be comparable between peers.
+fn now_monotonic_us() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
 fn handle_inbound_media_datagram(
     dgram: &[u8],
     reassembler: &mut VideoReassembler,
@@ -2855,11 +2870,11 @@ async fn run_raw_udp_loop(
                                     ControlMessage::Ping { client_ts_us } => {
                                         let _ = internal_ctrl_tx.try_send(ControlMessage::Pong {
                                             client_ts_us: *client_ts_us,
-                                            peer_ts_us: now_unix_us(),
+                                            peer_ts_us: now_monotonic_us(),
                                         });
                                     }
                                     ControlMessage::Pong { client_ts_us, .. } => {
-                                        let now = now_unix_us();
+                                        let now = now_monotonic_us();
                                         if now >= *client_ts_us {
                                             let rtt = Duration::from_micros((now - *client_ts_us).max(100));
                                             last_rtt = rtt;
@@ -2971,7 +2986,7 @@ async fn run_raw_udp_loop(
                 if last_peer_seen.elapsed() > Duration::from_secs(10) {
                     return Err(NetworkError::HolePunchTimeout);
                 }
-                if let Ok(ping) = (ControlMessage::Ping { client_ts_us: now_unix_us() }).encode_datagram() {
+                if let Ok(ping) = (ControlMessage::Ping { client_ts_us: now_monotonic_us() }).encode_datagram() {
                     let _ = socket.send(&ping).await;
                 }
 
@@ -3044,6 +3059,14 @@ mod tests {
         let at_144 = max_capture_queue_age(144);
         assert!(at_144 >= Duration::from_millis(13));
         assert!(at_144 <= Duration::from_millis(14));
+    }
+
+    #[test]
+    fn ping_clock_is_monotonic() {
+        let first = now_monotonic_us();
+        std::thread::sleep(Duration::from_micros(100));
+        let second = now_monotonic_us();
+        assert!(second >= first);
     }
 
     #[tokio::test]
