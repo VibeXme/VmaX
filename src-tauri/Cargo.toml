@@ -1,6 +1,6 @@
 [package]
 name = "vmax"
-version = "5.3.3"
+version = "5.3.4"
 description = "VmaX — Ultra-low-latency P2P remote desktop and game streaming"
 authors = ["VmaX Contributors"]
 edition = "2024"
@@ -40,6 +40,8 @@ getrandom = "0.2"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
+turn = "0.17.3"
+webrtc-util = { version = "0.17.1", default-features = false, features = ["conn"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 base64 = "0.22"

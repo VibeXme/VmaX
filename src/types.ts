@@ -1,7 +1,8 @@
 export type SessionRole = "host" | "client";
-export type ConnectionPath = "direct_lan" | "direct_internet" | "relay";
+export type ConnectionPath = "direct_lan" | "direct_internet" | "turn" | "relay";
 
 export function connectionPathLabel(path: ConnectionPath | null | undefined, relayed: boolean) {
+  if (path === "turn") return "UDP Relay";
   if (relayed || path === "relay") return "Relay";
   if (path === "direct_lan") return "Direct LAN";
   if (path === "direct_internet") return "Direct Internet";

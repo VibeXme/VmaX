@@ -46,6 +46,7 @@ async fn check_inner(endpoint: &str) -> io::Result<Duration> {
         code.clone(),
         "a".repeat(64),
         vec![],
+        None,
         false,
         Some(vec![PROBE_CLIENT_FINGERPRINT.into()]),
         None,

@@ -26,3 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server.stop();
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../src-tauri/src/relay_upgrade.rs"]
+mod relay_upgrade;
+#[cfg(test)]
+#[path = "../../src-tauri/src/turn_relay.rs"]
+mod turn_relay;

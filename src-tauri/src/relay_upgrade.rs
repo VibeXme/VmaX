@@ -24,8 +24,9 @@ fn probe(key: &hmac::Key, side: u8, response: bool, nonce: [u8; 8]) -> [u8; PROB
 }
 
 pub(crate) struct RelayUpgrade {
-    pub udp: std::sync::Arc<UdpSocket>,
+    pub udp: std::sync::Arc<dyn webrtc_util::Conn + Send + Sync>,
     pub candidates: Vec<SocketAddr>,
+    pub fallback_candidate: Option<SocketAddr>,
     pub host: bool,
     pub key: watch::Receiver<Option<[u8; 32]>>,
     pub path: watch::Sender<Option<SocketAddr>>,
@@ -43,7 +44,7 @@ impl RelayUpgrade {
             .expect("key supplied");
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key);
         let side = u8::from(self.host);
-        let ipv6 = self.udp.local_addr()?.is_ipv6();
+        let ipv6 = self.udp.local_addr().map_err(io::Error::other)?.is_ipv6();
         let mut timer = interval(PROBE_INTERVAL);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut recent = [(None, [0; 8]); 4];
@@ -64,10 +65,10 @@ impl RelayUpgrade {
                     recent[next_nonce] = (Some(now), nonce);
                     next_nonce = (next_nonce + 1) % recent.len();
                     let packet = probe(&key, side, false, nonce);
-                    if let Some((address, _)) = validated {
+                    if let Some((address, _)) = validated.filter(|(address, _)| Some(canonical_addr(*address)) != self.fallback_candidate) {
                         let _ = self.udp.send_to(&packet, address).await;
                     } else {
-                        for address in self.candidates.iter().copied().take(16).map(|addr| socket_target(addr, ipv6))
+                        for address in self.candidates.iter().copied().take(16).chain(self.fallback_candidate).map(|addr| socket_target(addr, ipv6))
                             .chain(peers.iter().map(|(addr, _)| *addr))
                         {
                             let _ = self.udp.send_to(&packet, address).await;
@@ -77,8 +78,8 @@ impl RelayUpgrade {
                 packet = self.udp.recv_from(&mut buf) => {
                     let (len, from) = match packet {
                         Ok(packet) => packet,
-                        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => continue,
-                        Err(error) => return Err(error),
+                        Err(webrtc_util::Error::Io(error)) if error.0.kind() == io::ErrorKind::ConnectionReset => continue,
+                        Err(error) => return Err(io::Error::other(error)),
                     };
                     let packet = &buf[..len];
                     if packet.starts_with(PROBE_MAGIC) {
@@ -101,12 +102,16 @@ impl RelayUpgrade {
                             1 if recent.iter().any(|(sent, n)| *n == nonce
                                 && sent.is_some_and(|ts| now.duration_since(ts) < PATH_LEASE)) =>
                             {
-                                if validated.is_none_or(|(address, _)| canonical_addr(address) == canonical_addr(from)) {
+                                if validated.is_none_or(|(address, _)| {
+                                    canonical_addr(address) == canonical_addr(from)
+                                        || (Some(canonical_addr(address)) == self.fallback_candidate
+                                            && Some(canonical_addr(from)) != self.fallback_candidate)
+                                }) {
                                     // Consume a response once so duplicates cannot renew the lease.
                                     if let Some((sent, _)) = recent.iter_mut().find(|(sent, n)| sent.is_some() && *n == nonce) {
                                         *sent = None;
                                     }
-                                    if validated.is_none() { self.path.send_replace(Some(from)); }
+                                    if validated.is_none_or(|(address, _)| address != from) { self.path.send_replace(Some(from)); }
                                     validated = Some((from, now));
                                 }
                             }
@@ -146,6 +151,7 @@ mod tests {
             RelayUpgrade {
                 udp: left.clone(),
                 candidates: vec![right_addr],
+                fallback_candidate: None,
                 host: true,
                 key: key_rx.clone(),
                 path: left_path,
@@ -156,6 +162,7 @@ mod tests {
             RelayUpgrade {
                 udp: right.clone(),
                 candidates: vec![left_addr],
+                fallback_candidate: None,
                 host: false,
                 key: key_rx,
                 path: right_path,

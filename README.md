@@ -114,6 +114,27 @@ working relays by the median of three packet round trips measured from the
 host. This is a host-side comparison, so it does not predict the viewer's
 network path or capture-to-display latency.
 
+### Optional TURN over UDP
+
+With a VmaX 5.3.4 or later host, viewer and signaling server, the Windows
+host can use an authenticated IPv4 TURN allocation. Set these variables in
+the host application's launch environment:
+
+- `VMAX_TURN_SERVER` — UDP TURN endpoint as `hostname:port`, such as
+  `turn.cloudflare.com:3478`.
+- `VMAX_TURN_USERNAME` and `VMAX_TURN_PASSWORD` — TURN client credentials
+  issued by your provider. For a managed service, use scoped, short-lived
+  credentials. Keep the provider's credential-issuing API token on your backend.
+
+The viewer does not need those credentials. VmaX verifies the UDP route with
+authenticated packets before switching traffic to it. Direct UDP takes
+priority, and WebSocket forwarding remains available when UDP is blocked
+or the TURN allocation is unavailable. Update self-hosted signaling servers
+so they can pass TURN addresses in session setup. Endpoint availability,
+bandwidth charges and latency depend on the operator and network.
+
+### Self-host a WebSocket signaling relay
+
 To run a relay on a machine near your players:
 
 ```sh

@@ -163,6 +163,7 @@ fn bind_media_socket(address: SocketAddr, public_signaling: bool) -> io::Result<
 pub enum ConnectionPath {
     DirectLan,
     DirectInternet,
+    Turn,
     Relay,
 }
 
@@ -1268,6 +1269,10 @@ async fn run_p2p_session(
     std_socket.set_nonblocking(true)?;
     let udp_socket = UdpSocket::from_std(std_socket)?;
 
+    let mut turn_task = (role == SessionRole::Host
+        && public_signaling
+        && config.protocol == TransportProtocol::Quic)
+        .then(|| tokio::spawn(crate::turn_relay::TurnRelay::configured()));
     let candidates: IceCandidates = if relay_only {
         IceCandidates {
             local_addr: udp_socket.local_addr()?,
@@ -1286,6 +1291,16 @@ async fn run_p2p_session(
         Vec::new()
     } else {
         candidates.ordered_targets()
+    };
+    let turn = match turn_task.as_mut() {
+        Some(task) => tokio::select! {
+            _ = shutdown_rx.wait_for(|stopped| *stopped) => {
+                task.abort();
+                return Err(NetworkError::Cancelled);
+            }
+            result = &mut *task => result.ok().flatten(),
+        },
+        None => None,
     };
 
     {
@@ -1333,6 +1348,7 @@ async fn run_p2p_session(
                 room_clone,
                 fp,
                 cands,
+                turn.as_ref().and_then(|allocation| allocation.local_addr()),
                 config.protocol == TransportProtocol::RawUdp,
                 config
                     .invited_client
@@ -1467,6 +1483,7 @@ async fn run_p2p_session(
         hash.update(client.as_bytes());
         hash.finalize().into()
     });
+    let peer_turn = peer_match.turn_candidate.map(canonical_addr).filter(|addr| crate::turn_relay::is_public_peer(*addr));
     let candidates: Vec<_> = peer_match
         .peer_candidates
         .into_iter()
@@ -1535,7 +1552,7 @@ async fn run_p2p_session(
         mutual_auth,
         peer_candidates: &candidates,
     };
-    let probe_socket = (!relay_only && !candidates.is_empty() && relay.is_some())
+    let probe_socket = (!relay_only && (!candidates.is_empty() || peer_turn.is_some()) && relay.is_some())
         .then(|| {
             socket2::SockRef::from(&udp_socket)
                 .try_clone()
@@ -1545,6 +1562,7 @@ async fn run_p2p_session(
         .flatten();
     let (probe_key, probe_key_rx) = watch::channel(None);
     let (direct_path, direct_path_rx) = watch::channel(None);
+    let (turn_path, turn_path_rx) = watch::channel(None);
     let mut attempt = None;
     if let Some(signaling) = relay.as_mut() {
         if agree_direct(signaling, direct.is_ok(), &mut shutdown_rx).await? {
@@ -1584,35 +1602,62 @@ async fn run_p2p_session(
         let bridge_addr = bridge.local_addr()?;
         bridge.connect(socket.local_addr()?).await?;
         let relay_path_rx = direct_path_rx.clone();
+        let relay_turn_rx = turn_path_rx.clone();
         let probe_candidates = candidates.clone();
+        let direct_candidates = candidates.clone();
         let task = RelayTask(tokio::spawn(async move {
-            let result = if let Some(udp) = probe_socket {
-                let bridge = Arc::new(bridge);
-                let udp = Arc::new(udp);
-                let upgrade = crate::relay_upgrade::RelayUpgrade {
-                    udp: udp.clone(),
-                    candidates: probe_candidates,
-                    host: role == SessionRole::Host,
-                    key: probe_key_rx,
-                    path: direct_path.clone(),
-                };
-                let direct_receive = async {
-                    let result = upgrade.receive(bridge.clone()).await;
-                    direct_path.send_replace(None);
-                    if let Err(error) = result {
-                        debug!(%error, "direct path probe stopped");
-                    }
-                    std::future::pending::<()>().await;
-                };
-                tokio::select! {
-                    _ = direct_receive => unreachable!(),
-                    result = signaling.forward_routes(&bridge, Some((&udp, relay_path_rx))) => result,
-                }
-            } else {
-                signaling.forward(bridge).await
+            use crate::relay_upgrade::RelayUpgrade;
+            use webrtc_util::Conn;
+
+            let bridge = Arc::new(bridge);
+            let udp = probe_socket.map(|socket| Arc::new(socket) as Arc<dyn Conn + Send + Sync>);
+            let turn_conn = turn.as_ref().map(|turn| turn.conn());
+            let probe = |socket, candidates, fallback_candidate, path: watch::Sender<_>| RelayUpgrade {
+                udp: socket,
+                candidates,
+                fallback_candidate,
+                host: role == SessionRole::Host,
+                key: probe_key_rx.clone(),
+                path,
             };
-            if let Err(error) = result {
-                debug!(%error, "relay stopped");
+            let direct_receive = async {
+                if let Some(socket) = udp.clone() {
+                    let _ = probe(socket, direct_candidates, peer_turn, direct_path.clone())
+                        .receive(bridge.clone()).await;
+                    direct_path.send_replace(None);
+                }
+                std::future::pending::<()>().await;
+            };
+            let turn_receive = async {
+                if let Some(socket) = turn_conn.clone() {
+                    let public_peers = probe_candidates.iter().copied()
+                        .filter(|addr| crate::turn_relay::is_public_peer(*addr))
+                        .collect();
+                    let _ = probe(socket, public_peers, None, turn_path.clone())
+                        .receive(bridge.clone()).await;
+                    turn_path.send_replace(None);
+                }
+                std::future::pending::<()>().await;
+            };
+            let forward = signaling.forward_routes(&bridge, async |packet| {
+                for (socket, path) in [(&udp, &relay_path_rx), (&turn_conn, &relay_turn_rx)] {
+                    let address = *path.borrow();
+                    if let (Some(socket), Some(address)) = (socket, address)
+                        && matches!(timeout(Duration::from_millis(20), socket.send_to(packet, address)).await, Ok(Ok(sent)) if sent == packet.len())
+                    {
+                        return true;
+                    }
+                }
+                false
+            });
+            tokio::select! {
+                _ = direct_receive => {}
+                _ = turn_receive => {}
+                result = forward => {
+                    if let Err(error) = result {
+                        debug!(%error, "relay stopped");
+                    }
+                }
             }
         }));
         let (endpoint, connection) = quic
@@ -1764,6 +1809,8 @@ async fn run_p2p_session(
         if mutual_auth { resume_key } else { None },
         _relay_task.is_none(),
         direct_path_rx,
+        turn_path_rx,
+        peer_turn,
     )
     .await;
 
@@ -2203,6 +2250,8 @@ async fn run_quic_multiplex_loop(
     resume_key: Option<String>,
     originally_direct: bool,
     mut direct_path: watch::Receiver<Option<SocketAddr>>,
+    mut turn_path: watch::Receiver<Option<SocketAddr>>,
+    peer_turn: Option<SocketAddr>,
 ) -> Result<(), NetworkError> {
     let counters = Arc::new(SessionCounters::default());
 
@@ -2485,13 +2534,27 @@ async fn run_quic_multiplex_loop(
                     break Ok(());
                 }
             }
-            Ok(()) = direct_path.changed(), if !originally_direct => {
+            Some(()) = async {
+                tokio::select! {
+                    result = direct_path.changed() => result.ok(),
+                    result = turn_path.changed() => result.ok(),
+                }
+            }, if !originally_direct => {
                 let peer = *direct_path.borrow_and_update();
-                direct = peer.is_some();
+                let turn = *turn_path.borrow_and_update();
+                direct = peer.is_some() || turn.is_some();
                 let mut stats = telemetry.lock().await;
-                stats.relayed = !direct;
-                stats.connection_path = Some(peer.map_or(ConnectionPath::Relay, ConnectionPath::direct));
-                stats.active_peer_addr = Some(canonical_addr(peer.unwrap_or_else(|| conn.remote_address())));
+                let is_peer_turn = peer.is_some_and(|addr| Some(canonical_addr(addr)) == peer_turn);
+                stats.relayed = peer.is_none() || is_peer_turn;
+                stats.connection_path = Some(match (peer, turn) {
+                    (Some(_), _) if is_peer_turn => ConnectionPath::Turn,
+                    (Some(peer), _) => ConnectionPath::direct(peer),
+                    (_, Some(_)) => ConnectionPath::Turn,
+                    _ => ConnectionPath::Relay,
+                });
+                stats.active_peer_addr = Some(canonical_addr(
+                    peer.or(turn).unwrap_or_else(|| conn.remote_address())
+                ));
             }
             Some(frame) = video_rx.recv() => {
                 let queued = QUIC_DATAGRAM_BUFFER_BYTES.saturating_sub(conn.datagram_send_buffer_space())

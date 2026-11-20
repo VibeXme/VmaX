@@ -1,4 +1,4 @@
-name: Rebuild v5.3.3 binaries
+name: Rebuild v5.3.4 binaries
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: vmax-v5.3.3-release-${{ github.ref }}
+  group: vmax-v5.3.4-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -18,6 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo test --manifest-path relay-server/Cargo.toml --locked
+      - name: Build Linux x86-64 signaling relay
+        run: |
+          cargo build --manifest-path relay-server/Cargo.toml --release --locked
+          tar -C relay-server/target/release -czf VmaX-Relay-Linux-x86_64.tar.gz vmax-relay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmax-relay-linux
+          path: VmaX-Relay-Linux-x86_64.tar.gz
+          if-no-files-found: error
 
   rebuild-release-binaries:
     needs: relay-tests
@@ -91,31 +100,36 @@ jobs:
             throw 'Android APK was not produced.'
           }
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: vmax-relay-linux
+
       - name: Verify release files
         shell: pwsh
         run: |
-          Get-Item VmaX.exe, VmaX-Android-arm64.apk | Format-Table Name,Length,LastWriteTime
+          Get-Item VmaX.exe, VmaX-Android-arm64.apk, VmaX-Relay-Linux-x86_64.tar.gz | Format-Table Name,Length,LastWriteTime
           if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
           if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
 
-      - name: Publish v5.3.3 release after both builds succeed
+      - name: Publish v5.3.4 release after all builds succeed
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = @'
-          ## VmaX 5.3.3 — Relay selection and stream recovery
+          ## VmaX 5.3.4 — Authenticated UDP relay
 
-          - Select configured relays using bidirectional media packet round trips.
-          - Run the standalone VmaX relay behind a TLS reverse proxy in regions near your players.
-          - Resume Android decoding from a keyframe when the native frame handoff fails.
+          - Add an optional authenticated TURN route between direct UDP and the WebSocket fallback.
+          - Verify UDP paths using keys derived from the end-to-end QUIC connection.
+          - Display an active TURN route as UDP Relay in connection telemetry.
 
           ### Downloads
           - VmaX.exe — Windows portable
           - VmaX-Android-arm64.apk — Android ARM64
+          - VmaX-Relay-Linux-x86_64.tar.gz — standalone Linux signaling relay
 
           Relay hosting and bandwidth are supplied by the operator. Actual latency depends on the network path and devices.
           '@
-          $notes | Set-Content -Encoding utf8 'release-v5.3.3.md'
-          gh release create v5.3.3 VmaX.exe VmaX-Android-arm64.apk --target "${{ github.sha }}" --title 'VmaX 5.3.3' --notes-file release-v5.3.3.md --repo VibeXme/VmaX
+          $notes | Set-Content -Encoding utf8 'release-v5.3.4.md'
+          gh release create v5.3.4 VmaX.exe VmaX-Android-arm64.apk VmaX-Relay-Linux-x86_64.tar.gz --target "${{ github.sha }}" --title 'VmaX 5.3.4' --notes-file release-v5.3.4.md --repo VibeXme/VmaX
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

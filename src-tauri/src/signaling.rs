@@ -70,6 +70,8 @@ pub enum SignalingMessage {
         room_code: String,
         cert_fingerprint: String,
         candidates: Vec<SocketAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_candidate: Option<SocketAddr>,
         #[serde(default)]
         relay: bool,
         #[serde(default)]
@@ -99,6 +101,8 @@ pub enum SignalingMessage {
         role: String,
         peer_fingerprint: String,
         peer_candidates: Vec<SocketAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_candidate: Option<SocketAddr>,
         #[serde(default)]
         relay: bool,
         #[serde(default)]
@@ -356,6 +360,7 @@ pub struct PeerMatch {
     pub room_code: String,
     pub peer_fingerprint: String,
     pub peer_candidates: Vec<SocketAddr>,
+    pub turn_candidate: Option<SocketAddr>,
     pub relay: Option<RelayConnection>,
     pub raw_udp: Option<bool>,
 }
@@ -554,13 +559,13 @@ impl RelayConnection {
     /// Relays opaque QUIC packets between a connected loopback socket and the paired WebSocket.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn forward(self, udp: tokio::net::UdpSocket) -> Result<(), SignalingError> {
-        self.forward_routes(&udp, None).await
+        self.forward_routes(&udp, async |_| false).await
     }
 
     pub(crate) async fn forward_routes(
         self,
         udp: &UdpSocket,
-        direct: Option<(&UdpSocket, tokio::sync::watch::Receiver<Option<SocketAddr>>)>,
+        try_udp: impl AsyncFn(&[u8]) -> bool,
     ) -> Result<(), SignalingError> {
         let (mut send, mut recv) = self.0.split();
         let mut buf = [0; MAX_RELAY_PACKET];
@@ -570,13 +575,8 @@ impl RelayConnection {
                     .recv(&mut buf)
                     .await
                     .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
-                if let Some((socket, path)) = &direct {
-                    let selected = *path.borrow();
-                    if let Some(address) = selected
-                        && socket.send_to(&buf[..len], address).await.is_ok()
-                    {
-                        continue;
-                    }
+                if try_udp(&buf[..len]).await {
+                    continue;
                 }
                 send.send(Message::Binary(bytes::Bytes::copy_from_slice(&buf[..len])))
                     .await?;
@@ -609,6 +609,7 @@ pub async fn signal_as_host(
     room_code: String,
     cert_fingerprint: String,
     local_candidates: Vec<SocketAddr>,
+    turn_candidate: Option<SocketAddr>,
     raw_udp: bool,
     allowed_clients: Option<Vec<String>>,
     host_name: Option<String>,
@@ -619,6 +620,7 @@ pub async fn signal_as_host(
         room_code: room_code.clone(),
         cert_fingerprint,
         candidates: local_candidates,
+        turn_candidate,
         relay: true,
         raw_udp: Some(raw_udp),
         allowed_clients,
@@ -655,6 +657,7 @@ pub async fn signal_as_host(
             SignalingMessage::PeerMatched {
                 peer_fingerprint,
                 peer_candidates,
+                turn_candidate,
                 relay,
                 raw_udp,
                 ..
@@ -663,6 +666,7 @@ pub async fn signal_as_host(
                     room_code,
                     peer_fingerprint,
                     peer_candidates,
+                    turn_candidate,
                     relay: relay.then_some(RelayConnection(ws)),
                     raw_udp,
                 });
@@ -719,6 +723,7 @@ pub async fn signal_as_client(
             SignalingMessage::PeerMatched {
                 peer_fingerprint,
                 peer_candidates,
+                turn_candidate,
                 relay,
                 raw_udp,
                 ..
@@ -727,6 +732,7 @@ pub async fn signal_as_client(
                     room_code,
                     peer_fingerprint,
                     peer_candidates,
+                    turn_candidate,
                     relay: relay.then_some(RelayConnection(ws)),
                     raw_udp,
                 });
@@ -971,6 +977,7 @@ async fn handle_relay_conn(
             room_code,
             cert_fingerprint,
             mut candidates,
+            turn_candidate,
             relay,
             raw_udp,
             allowed_clients,
@@ -1058,6 +1065,7 @@ async fn handle_relay_conn(
                     role: "host".to_string(),
                     peer_fingerprint: peer.fingerprint,
                     peer_candidates: peer.candidates,
+                    turn_candidate: None,
                     relay,
                     raw_udp,
                 },
@@ -1069,6 +1077,7 @@ async fn handle_relay_conn(
                     role: "client".to_string(),
                     peer_fingerprint: cert_fingerprint,
                     peer_candidates: candidates,
+                    turn_candidate,
                     relay,
                     raw_udp,
                 },
@@ -1661,6 +1670,7 @@ mod tests {
                 "TEST-9999".to_string(),
                 "host-fp".to_string(),
                 vec!["127.0.0.1:50001".parse().unwrap()],
+                Some("192.0.2.20:50003".parse().unwrap()),
                 false,
                 None,
                 Some("Test bench".to_string()),
@@ -1683,6 +1693,8 @@ mod tests {
         .unwrap();
 
         let host_match = host_task.await.unwrap();
+        assert_eq!(client_match.turn_candidate, Some("192.0.2.20:50003".parse().unwrap()));
+        assert_eq!(host_match.turn_candidate, None);
         assert_eq!(client_match.peer_fingerprint, "host-fp");
         assert_eq!(host_match.peer_fingerprint, "client-fp");
         assert_eq!(
@@ -1708,6 +1720,7 @@ mod tests {
                 host_room,
                 "host-fp".into(),
                 Vec::new(),
+                None,
                 true,
                 None,
                 None,
@@ -1776,6 +1789,7 @@ mod tests {
                 "LIST-0001".into(),
                 "host-fp".into(),
                 Vec::new(),
+                None,
                 false,
                 None,
                 Some("Gaming Rig".into()),
@@ -1803,6 +1817,7 @@ mod tests {
                 "saved-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 "host-fp".into(),
                 Vec::new(),
+                None,
                 false,
                 Some(vec!["b".repeat(64)]),
                 None,

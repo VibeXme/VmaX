@@ -41,6 +41,7 @@ pub mod quality;
 pub mod recovery_jitter;
 mod relay_probe;
 mod relay_upgrade;
+mod turn_relay;
 pub mod signaling;
 pub mod stun;
 pub mod telemetry;
