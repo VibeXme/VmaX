@@ -284,41 +284,20 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 
-#[cfg(target_os = "android")]
-struct RemoteKeyboard(tauri::plugin::PluginHandle<tauri::Wry>);
-
 #[tauri::command]
 async fn set_remote_keyboard(app: tauri::AppHandle, visible: bool) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        app.state::<RemoteKeyboard>()
-            .0
-            .run_mobile_plugin_async(if visible { "show" } else { "hide" }, ())
-            .await
-            .map_err(|err| err.to_string())
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = (app, visible);
-        Ok(())
-    }
+    // The optional Android keyboard plugin is not bundled with the app. Keep
+    // this command harmless so startup does not depend on a missing Java class.
+    let _ = (app, visible);
+    Ok(())
 }
 
 #[tauri::command]
 async fn set_stream_immersive(app: tauri::AppHandle, active: bool) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        app.state::<RemoteKeyboard>()
-            .0
-            .run_mobile_plugin_async(if active { "enterStream" } else { "leaveStream" }, ())
-            .await
-            .map_err(|err| err.to_string())
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = (app, active);
-        Ok(())
-    }
+    // Immersive mode is best-effort; the WebView remains usable without the
+    // optional native plugin, including on Android builds without that class.
+    let _ = (app, active);
+    Ok(())
 }
 
 #[tauri::command]
@@ -490,18 +469,6 @@ pub fn run() {
             let _ = window.set_focus();
         }
     }));
-    #[cfg(target_os = "android")]
-    let builder = builder.plugin(
-        tauri::plugin::Builder::<tauri::Wry>::new("remote-keyboard")
-            .setup(|app, api| {
-                app.manage(RemoteKeyboard(
-                    api.register_android_plugin("com.vmax.app", "RemoteKeyboardPlugin")?,
-                ));
-                Ok(())
-            })
-            .build(),
-    );
-
     #[cfg(desktop)]
     let builder = builder
         .plugin(
