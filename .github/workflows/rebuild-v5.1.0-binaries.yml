@@ -1,4 +1,4 @@
-name: Rebuild v5.3.1 binaries
+name: Rebuild v5.3.2 binaries
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: vmax-v5.3.1-release-${{ github.ref }}
+  group: vmax-v5.3.2-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
       - name: Reconcile Cargo.lock with Cargo.toml
         shell: pwsh
         run: |
-          # The v5.3.1 source manifest changed after the lockfile was generated.
+          # The v5.3.2 source manifest changed after the lockfile was generated.
           # Resolve only workspace packages to avoid gratuitously upgrading all
           # third-party dependencies, then keep --locked for both builds.
           cargo update --workspace --manifest-path src-tauri/Cargo.toml
@@ -57,6 +57,12 @@ jobs:
           $actual = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
           $expected = '2493dbc168923bb3e59e5e7716f71deced92992eea9acd6e9d74f84ac7751343'
           if ($actual -ne $expected) { throw "cloudflared.exe checksum mismatch: $actual" }
+
+      - name: Run Rust authentication and transport unit tests
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --target x86_64-pc-windows-msvc --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Build Windows executable
         shell: pwsh
@@ -83,9 +89,25 @@ jobs:
           if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
           if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
 
-      - name: Replace v5.3.1 EXE and APK
+      - name: Publish v5.3.2 release after both builds succeed
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload v5.3.1 VmaX.exe VmaX-Android-arm64.apk --clobber --repo VibeXme/VmaX
+          $notes = @'
+          ## VmaX 5.3.2 — Device identity security update
+
+          - Protect Windows Ed25519 device identity seeds using Windows DPAPI.
+          - Migrate existing Windows plaintext identity files without changing device IDs or public keys.
+          - Retain existing authenticated Supabase account sessions and direct QUIC certificate pinning.
+          - Validate Rust unit tests and both release binaries before publishing.
+
+          ### Downloads
+          - VmaX.exe — Windows portable
+          - VmaX-Android-arm64.apk — Android ARM64
+
+          Note: Android identity continues to use app-private storage. The Windows identity migration is one-way; back up app data before moving a device identity between Windows accounts.
+          '@
+          $notes | Set-Content -Encoding utf8 'release-v5.3.2.md'
+          gh release create v5.3.2 VmaX.exe VmaX-Android-arm64.apk --target "${{ github.sha }}" --title 'VmaX 5.3.2' --notes-file release-v5.3.2.md --repo VibeXme/VmaX
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

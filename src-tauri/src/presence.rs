@@ -21,7 +21,7 @@ struct SavedAccount {
 }
 
 #[cfg(windows)]
-fn protect(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
+pub(crate) fn protect(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     use windows::Win32::{
         Foundation::{HLOCAL, LocalFree},
         Security::Cryptography::{
