@@ -121,8 +121,8 @@ export function builtinPresets(baseConfig: VmaXConfig): SettingsPreset[] {
     ),
     make(
       "native_competitive",
-      "Native 120 · competitive",
-      "For a clean, fast path: native display resolution at 120 FPS with hardware encoding, adaptive 60 Mbps quality, zero FEC overhead and a one-frame repair window. Use this on Ethernet, a strong 5 GHz/6 GHz LAN, or a stable private overlay; switch back to Native 120 · gaming if packet loss appears.",
+      "Parsec-style · native gaming",
+      "Parsec-style low-latency play: native display resolution at 120 FPS with hardware encoding, adaptive 60 Mbps quality, zero FEC overhead and an 8 ms repair budget. QUIC keeps the path encrypted and can fall back through the relay; use the safer Native 120 · gaming profile if packet loss appears.",
       {
         resolution: "native",
         framerate: 120,
@@ -135,7 +135,7 @@ export function builtinPresets(baseConfig: VmaXConfig): SettingsPreset[] {
         constantFps: true,
         unlimitedBitrate: false,
       },
-      { protocol: "quic", fecRedundancyPct: 0, hardwareCursor: true, packetWindowMs: 16, congestionSensitivity: "low_latency" },
+      { protocol: "quic", fecRedundancyPct: 0, hardwareCursor: true, packetWindowMs: 8, congestionSensitivity: "low_latency" },
     ),
     make(
       "lan",
