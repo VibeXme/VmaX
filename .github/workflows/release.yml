@@ -59,8 +59,17 @@ jobs:
       - name: Run Rust authentication and transport unit tests
         shell: pwsh
         run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --lib --target x86_64-pc-windows-msvc --locked
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $log = Join-Path $env:RUNNER_TEMP 'vmax-rust-tests.log'
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --target x86_64-pc-windows-msvc --locked 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status) {
+            $tail = Get-Content $log -Tail 75
+            @('### Windows Rust test failure', '', '```text') + $tail + '```' |
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+            $summary = ($tail -join "%0A").Replace("%", "%25").Replace("%250A", "%0A")
+            Write-Output "::error title=Windows Rust tests failed::$summary"
+            exit $status
+          }
 
       - name: Build Windows executable
         shell: pwsh
