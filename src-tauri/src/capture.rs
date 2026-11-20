@@ -264,9 +264,10 @@ pub mod win {
         DXGI_MODE_ROTATION_ROTATE270, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-        DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1,
-        IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+        CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_INVALID_CALL,
+        DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+        DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput1,
+        IDXGIOutputDuplication, IDXGIResource,
     };
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
@@ -494,9 +495,9 @@ pub mod win {
         }
     }
 
-    struct FrameReleaseGuard<'a>(&'a IDXGIOutputDuplication);
+    struct FrameReleaseGuard(IDXGIOutputDuplication);
 
-    impl Drop for FrameReleaseGuard<'_> {
+    impl Drop for FrameReleaseGuard {
         fn drop(&mut self) {
             unsafe {
                 let _ = self.0.ReleaseFrame();
@@ -507,6 +508,8 @@ pub mod win {
     pub struct DxgiCapturer {
         pub device: ID3D11Device,
         pub context: ID3D11DeviceContext,
+        acquired_frame: Option<FrameReleaseGuard>,
+        capture_discontinuity: bool,
         duplication: Option<IDXGIOutputDuplication>,
         output1: Option<IDXGIOutput1>,
         rotation: DXGI_MODE_ROTATION,
@@ -850,6 +853,8 @@ pub mod win {
             Ok(Self {
                 device,
                 context,
+                acquired_frame: None,
+                capture_discontinuity: false,
                 duplication: Some(dupl),
                 output1: Some(output1),
                 rotation,
@@ -999,8 +1004,8 @@ pub mod win {
             self.pointer_shape = shape.is_drawable().then_some(shape);
         }
 
-        pub fn waiting_for_desktop(&self) -> bool {
-            self.duplication.is_none() && !self.needs_recovery()
+        pub fn has_valid_frame(&self) -> bool {
+            self.has_valid_frame
         }
 
         /// Handles static desktop refinement (2 progressive frames after motion stops)
@@ -1026,6 +1031,10 @@ pub mod win {
             false
         }
 
+        pub fn take_capture_discontinuity(&mut self) -> bool {
+            std::mem::take(&mut self.capture_discontinuity)
+        }
+
         pub fn capture_frame(
             &mut self,
             timeout_ms: u32,
@@ -1044,12 +1053,13 @@ pub mod win {
 
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut desktop_res: Option<IDXGIResource> = None;
+            drop(self.acquired_frame.take());
             let res =
                 unsafe { dupl.AcquireNextFrame(timeout_ms, &mut frame_info, &mut desktop_res) };
 
             match res {
                 Ok(()) => {
-                    let _guard = FrameReleaseGuard(&dupl);
+                    self.acquired_frame = Some(FrameReleaseGuard(dupl.clone()));
                     self.update_pointer(&dupl, &frame_info);
                     let desktop_changed = frame_info.AccumulatedFrames > 0
                         || frame_info.TotalMetadataBufferSize > 0
@@ -1085,7 +1095,10 @@ pub mod win {
                     } else {
                         (desc.Width, desc.Height)
                     };
-                    if self.has_valid_frame && (desc.Width, desc.Height) != self.surface_size {
+                    if (self.surface_size != (0, 0) && (desc.Width, desc.Height) != self.surface_size)
+                        || (width, height) != (self.native_width, self.native_height)
+                    {
+                        drop(self.acquired_frame.take());
                         self.duplication = None;
                         self.has_valid_frame = false;
                         return Err(format!("Display mode changed to {width}x{height}"));
@@ -1123,11 +1136,12 @@ pub mod win {
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                     Ok(self.should_emit_static_frame(force_frame))
                 }
-                Err(ref e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                Err(ref e) if matches!(e.code(), DXGI_ERROR_ACCESS_LOST | DXGI_ERROR_INVALID_CALL) => {
+                    self.capture_discontinuity = true;
                     self.duplication = None;
                     self.has_valid_frame = false;
                     drop(dupl);
-                    if self.reacquire_duplication(Duration::from_millis(15)) {
+                    if self.reacquire_duplication(Duration::ZERO) {
                         return Ok(self.has_valid_frame);
                     }
                     if self.needs_recovery() {

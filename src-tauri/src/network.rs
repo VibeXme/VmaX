@@ -45,6 +45,7 @@ const DEFAULT_FEC_GROUP_SIZE: u8 = 10;
 const MAX_QUEUED_DELTA_BYTES: usize = 512 * 1024;
 const RELAY_STARTUP_BITRATE_BPS: u32 = 4_000_000;
 const HIGH_RTT_STARTUP_BITRATE_BPS: u32 = 6_000_000;
+const PLI_INTERVAL: Duration = Duration::from_millis(200);
 /// Maximum age of an encoded delta frame before it is considered stale.
 ///
 /// Scale this with the negotiated frame rate instead of using a fixed 30 ms:
@@ -71,10 +72,7 @@ impl VideoRecovery {
     ) {
         self.awaiting_keyframe = true;
         let now = Instant::now();
-        if self
-            .last_request
-            .is_some_and(|last| now - last < Duration::from_millis(300))
-        {
+        if !allow_keyframe_request(self.last_request, now) {
             return;
         }
         self.last_request = Some(now);
@@ -354,6 +352,8 @@ pub struct NetworkTelemetry {
     pub rtt_ms: f64,
     pub min_rtt_ms: f64,
     pub packet_loss_pct: f64,
+    #[serde(default)]
+    pub peer_packet_loss_pct: Option<f64>,
     pub target_bitrate_bps: u32,
     pub congestion_state: CongestionState,
     pub video_frames_tx: u64,
@@ -388,6 +388,7 @@ impl Default for NetworkTelemetry {
             rtt_ms: 0.0,
             min_rtt_ms: 0.0,
             packet_loss_pct: 0.0,
+            peer_packet_loss_pct: None,
             target_bitrate_bps: DEFAULT_INITIAL_BITRATE_BPS,
             congestion_state: CongestionState::Stable,
             video_frames_tx: 0,
@@ -435,6 +436,20 @@ pub struct OutboundVideoFrame {
     pub payload: Bytes,
 }
 
+#[derive(Clone)]
+pub struct VideoSender(watch::Sender<Option<OutboundVideoFrame>>);
+
+impl VideoSender {
+    pub fn publish(&self, frame: OutboundVideoFrame) -> Result<(), &'static str> {
+        self.0.send(Some(frame)).map_err(|_| "video sender disconnected")
+    }
+}
+
+async fn next_video_frame(rx: &mut watch::Receiver<Option<OutboundVideoFrame>>) -> Option<OutboundVideoFrame> {
+    rx.changed().await.ok()?;
+    rx.borrow_and_update().clone()
+}
+
 /// Events emitted by the P2P network loop toward capture, audio, input, and UI layers.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
@@ -444,6 +459,7 @@ pub enum NetworkEvent {
         invite_uri: String,
     },
     VideoFrameReceived(ReassembledFrame),
+    VideoFramePending(Arc<std::sync::Mutex<Option<ReassembledFrame>>>),
     AudioPacketReceived(AudioPacket),
     InputEventReceived(InputPacket),
     RumbleReceived(crate::haptics::Rumble),
@@ -567,7 +583,7 @@ impl VideoBacklog {
 /// Non-blocking sender handles for pushing video, audio, input, and control into the active QUIC loop.
 #[derive(Clone)]
 pub struct SessionTx {
-    pub video_tx: mpsc::Sender<OutboundVideoFrame>,
+    pub video_tx: VideoSender,
     pub audio_tx: mpsc::Sender<AudioPacket>,
     pub input_tx: mpsc::Sender<InputPacket>,
     pub control_tx: mpsc::Sender<ControlMessage>,
@@ -606,9 +622,34 @@ impl SessionTx {
     }
 }
 
+type LatestVideo = Arc<std::sync::Mutex<Option<ReassembledFrame>>>;
+
+pub struct SessionEvents(mpsc::UnboundedReceiver<NetworkEvent>);
+
+impl SessionEvents {
+    pub async fn recv(&mut self) -> Option<NetworkEvent> {
+        self.0.recv().await.map(Self::take_frame)
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<NetworkEvent, mpsc::error::TryRecvError> {
+        self.0.try_recv().map(Self::take_frame)
+    }
+
+    fn take_frame(event: NetworkEvent) -> NetworkEvent {
+        match event {
+            NetworkEvent::VideoFramePending(slot) => {
+                let frame = slot.lock().unwrap_or_else(|error| error.into_inner()).take();
+                NetworkEvent::VideoFrameReceived(frame.expect("one frame per pending notification"))
+            }
+            event => event,
+        }
+    }
+}
+
 pub struct SessionHandle {
     pub tx: SessionTx,
-    pub event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
+    pub event_rx: SessionEvents,
     pub telemetry: Arc<Mutex<NetworkTelemetry>>,
     pub join_handle: tokio::task::JoinHandle<Result<(), NetworkError>>,
 }
@@ -1106,7 +1147,7 @@ async fn spawn_session(
         || invite
             .as_ref()
             .is_some_and(|invite| invite.room_code.starts_with("saved-"));
-    let (video_tx, video_rx) = mpsc::channel::<OutboundVideoFrame>(2);
+    let (video_tx, video_rx) = watch::channel(None);
     // Keep realtime queues shallow. Audio/input producers already use try_send
     // for high-frequency traffic, so large queues only preserve stale data.
     let (audio_tx, audio_rx) = mpsc::channel::<AudioPacket>(8);
@@ -1135,7 +1176,7 @@ async fn spawn_session(
     let loop_overrides = overrides.clone();
 
     let tx_handle = SessionTx {
-        video_tx,
+        video_tx: VideoSender(video_tx),
         audio_tx,
         input_tx,
         control_tx,
@@ -1173,7 +1214,7 @@ async fn spawn_session(
 
     Ok(SessionHandle {
         tx: tx_handle,
-        event_rx,
+        event_rx: SessionEvents(event_rx),
         telemetry,
         join_handle,
     })
@@ -1198,7 +1239,7 @@ async fn run_p2p_session(
     role: SessionRole,
     mut config: NetworkConfig,
     invite: Option<ParsedInvite>,
-    video_rx: mpsc::Receiver<OutboundVideoFrame>,
+    video_rx: watch::Receiver<Option<OutboundVideoFrame>>,
     mut audio_rx: mpsc::Receiver<AudioPacket>,
     input_rx: mpsc::Receiver<InputPacket>,
     control_rx: mpsc::Receiver<ControlMessage>,
@@ -1973,10 +2014,40 @@ fn now_monotonic_us() -> u64 {
         .as_micros() as u64
 }
 
+#[derive(Default)]
+struct VideoSyncRequest {
+    waiting_for_keyframe: bool,
+    last_sent: Option<Instant>,
+}
+
+impl VideoSyncRequest {
+    fn lost_reference(&mut self, ctrl_tx: &mpsc::Sender<ControlMessage>) {
+        self.waiting_for_keyframe = true;
+        self.retry_at(Instant::now(), ctrl_tx);
+    }
+
+    fn retry_at(&mut self, now: Instant, ctrl_tx: &mpsc::Sender<ControlMessage>) {
+        if self.waiting_for_keyframe
+            && allow_keyframe_request(self.last_sent, now)
+            && ctrl_tx.try_send(ControlMessage::RequestKeyframe {
+                last_good_frame_id: None,
+                reason: "video frame missing, corrupt, or superseded".into(),
+            }).is_ok()
+        {
+            self.last_sent = Some(now);
+        }
+    }
+}
+
+fn allow_keyframe_request(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= PLI_INTERVAL)
+}
+
 fn handle_inbound_media_datagram(
     dgram: &[u8],
     reassembler: &mut VideoReassembler,
-    last_pli: &mut Instant,
+    latest_video: &LatestVideo,
+    sync: &mut VideoSyncRequest,
     counters: &SessionCounters,
     event_tx: &mpsc::UnboundedSender<NetworkEvent>,
     ctrl_tx: &mpsc::Sender<ControlMessage>,
@@ -2034,7 +2105,20 @@ fn handle_inbound_media_datagram(
                         builder.note_rfi();
                     }
                 }
-                let _ = event_tx.send(NetworkEvent::VideoFrameReceived(frame));
+                let keyframe = frame.is_keyframe;
+                if keyframe {
+                    sync.waiting_for_keyframe = false;
+                }
+                let mut slot = latest_video.lock().unwrap_or_else(|error| error.into_inner());
+                let replaced = slot.replace(frame).is_some();
+                if replaced {
+                    counters.video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let _ = event_tx.send(NetworkEvent::VideoFramePending(Arc::clone(latest_video)));
+                }
+                if !keyframe && (replaced || dropped_frames > 0) {
+                    sync.lost_reference(ctrl_tx);
+                }
             }
             Ok(ReassembleOutcome::DroppedNeedKeyframe { dropped_frames }) => {
                 counters
@@ -2043,17 +2127,13 @@ fn handle_inbound_media_datagram(
                 if let Some(builder) = feedback.as_deref_mut() {
                     builder.note_rfi();
                 }
-                let fallback_interval = if feedback.is_some() { 600 } else { 250 };
-                if last_pli.elapsed() >= Duration::from_millis(fallback_interval) {
-                    *last_pli = Instant::now();
-                    let _ = ctrl_tx.try_send(ControlMessage::RequestKeyframe {
-                        last_good_frame_id: None,
-                        reason: format!("dropped {dropped_frames} frame(s) beyond jitter window"),
-                    });
-                }
+                sync.lost_reference(ctrl_tx);
             }
             Ok(ReassembleOutcome::Incomplete) => {}
-            Err(e) => debug!(error = %e, "malformed video datagram ignored"),
+            Err(e) => {
+                debug!(error = %e, "malformed video datagram ignored");
+                sync.lost_reference(ctrl_tx);
+            }
         },
         Ok(ChannelId::Audio) => match AudioPacket::decode(dgram) {
             Ok(pkt) => {
@@ -2231,7 +2311,7 @@ async fn run_quic_multiplex_loop(
     role: SessionRole,
     config: NetworkConfig,
     conn: Connection,
-    mut video_rx: mpsc::Receiver<OutboundVideoFrame>,
+    mut video_rx: watch::Receiver<Option<OutboundVideoFrame>>,
     mut audio_rx: mpsc::Receiver<AudioPacket>,
     mut input_rx: mpsc::Receiver<InputPacket>,
     mut control_rx: mpsc::Receiver<ControlMessage>,
@@ -2295,13 +2375,14 @@ async fn run_quic_multiplex_loop(
         .saturating_sub(Duration::from_millis(18))
         .min(Duration::from_millis(35));
     let dgram_task = tokio::spawn(async move {
+        let latest_video = LatestVideo::default();
         let mut reassembler = VideoReassembler::new(jitter_window);
         let mut rtt = dgram_conn.rtt();
         let mut variation = Duration::ZERO;
         let (delta, keyframe) = video_reassembly_windows(jitter_window, rtt, variation);
         reassembler.set_jitter_windows(delta, keyframe);
         let mut next_rtt_sample = Instant::now() + Duration::from_millis(100);
-        let mut last_pli = Instant::now() - Duration::from_secs(1);
+        let mut video_sync = VideoSyncRequest::default();
         // Only the receiving client samples arrival times.  The host emits no
         // feedback reports of its own.
         let mut feedback_builder = (role == SessionRole::Client)
@@ -2330,7 +2411,8 @@ async fn run_quic_multiplex_loop(
                     handle_inbound_media_datagram(
                         &dgram,
                         &mut reassembler,
-                        &mut last_pli,
+                        &latest_video,
+                        &mut video_sync,
                         &dgram_counters,
                         &dgram_events,
                         &dgram_ctrl_tx,
@@ -2340,6 +2422,12 @@ async fn run_quic_multiplex_loop(
                     );
                 }
                 _ = feedback_tick.tick() => {
+                    let expired = reassembler.evict_expired();
+                    if expired > 0 {
+                        dgram_counters.video_frames_dropped.fetch_add(u64::from(expired), Ordering::Relaxed);
+                        video_sync.lost_reference(&dgram_ctrl_tx);
+                    }
+                    video_sync.retry_at(Instant::now(), &dgram_ctrl_tx);
                     if let Some(builder) = feedback_builder.as_mut() {
                         let now = Instant::now();
                         builder.set_rtt(dgram_conn.rtt());
@@ -2362,6 +2450,7 @@ async fn run_quic_multiplex_loop(
     let uni_telemetry = Arc::clone(&telemetry);
     let peer_two_shard_fec = Arc::new(AtomicBool::new(false));
     let uni_two_shard_fec = Arc::clone(&peer_two_shard_fec);
+    let last_remote_pli = Arc::new(std::sync::Mutex::new(None));
     let uni_task = tokio::spawn(async move {
         while let Ok(mut recv) = uni_conn.accept_uni().await {
             let events = uni_events.clone();
@@ -2371,6 +2460,7 @@ async fn run_quic_multiplex_loop(
             let telemetry = Arc::clone(&uni_telemetry);
             let two_shard_fec = Arc::clone(&uni_two_shard_fec);
 
+            let last_remote_pli = Arc::clone(&last_remote_pli);
             tokio::spawn(async move {
                 let mut kind_byte = [0u8; 1];
                 if recv.read_exact(&mut kind_byte).await.is_err() {
@@ -2439,16 +2529,25 @@ async fn run_quic_multiplex_loop(
                                         last_good_frame_id,
                                         reason,
                                     } => {
+                                        let now = Instant::now();
+                                        let mut last = last_remote_pli.lock().unwrap_or_else(|error| error.into_inner());
+                                        if !allow_keyframe_request(*last, now) {
+                                            continue;
+                                        }
+                                        *last = Some(now);
                                         let _ = events.send(NetworkEvent::KeyframeRequested {
                                             last_good_frame_id: *last_good_frame_id,
                                             reason: reason.clone(),
                                         });
                                     }
                                     ControlMessage::TelemetryFeedback {
-                                        frames_dropped, ..
+                                        frames_dropped, loss_pct, ..
                                     } => {
                                         ctrs.peer_frames_dropped
                                             .store(*frames_dropped, Ordering::Relaxed);
+                                        if role == SessionRole::Client && (0.0..=100.0).contains(loss_pct) {
+                                            telemetry.lock().await.peer_packet_loss_pct = Some(*loss_pct);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -2495,7 +2594,7 @@ async fn run_quic_multiplex_loop(
             config.initial_bitrate_bps,
             adaptive_fec.current().parity_permille(),
         ),
-        3,
+        1,
         overrides.backlog.pacer_stats(),
     );
     // QUIC flow control can suspend a reliable input write. Keep it off the
@@ -2563,7 +2662,7 @@ async fn run_quic_multiplex_loop(
                     peer.or(turn).unwrap_or_else(|| conn.remote_address())
                 ));
             }
-            Some(frame) = video_rx.recv() => {
+            Some(frame) = next_video_frame(&mut video_rx) => {
                 let queued = QUIC_DATAGRAM_BUFFER_BYTES.saturating_sub(conn.datagram_send_buffer_space())
                     .saturating_add(pacer.stats().queue_bytes as usize);
                 let adaptive_bps = if last_feedback.is_some_and(|stamp| stamp.elapsed() < Duration::from_millis(600)) {
@@ -2598,9 +2697,14 @@ async fn run_quic_multiplex_loop(
                 } else {
                     delta_send_deadline
                 };
-                // Drop captures that already sat too long before the pacer.
-                // A fresh keyframe can still take longer to serialize.
-                let stale = frame.captured_at.elapsed() > delta_send_deadline;
+                // A recovery keyframe may take longer to encode and serialize.
+                // Give it the full keyframe budget so recovery can make progress.
+                let max_capture_age = if video_recovery.awaiting_keyframe {
+                    max_frame_age
+                } else {
+                    delta_send_deadline
+                };
+                let stale = frame.captured_at.elapsed() > max_capture_age;
                 if stale || !frame.is_keyframe && (video_recovery.awaiting_keyframe || gap || queued >= dynamic_cap) {
                     video_recovery.request_keyframe(&event_tx, "video queue lost a reference frame");
                     continue;
@@ -2875,7 +2979,7 @@ async fn run_raw_udp_loop(
     role: SessionRole,
     config: NetworkConfig,
     socket: UdpSocket,
-    mut video_rx: mpsc::Receiver<OutboundVideoFrame>,
+    mut video_rx: watch::Receiver<Option<OutboundVideoFrame>>,
     mut audio_rx: mpsc::Receiver<AudioPacket>,
     mut input_rx: mpsc::Receiver<InputPacket>,
     mut control_rx: mpsc::Receiver<ControlMessage>,
@@ -2901,7 +3005,9 @@ async fn run_raw_udp_loop(
     }
 
     let mut reassembler = VideoReassembler::new(Duration::from_millis(config.jitter_window_ms));
-    let mut last_pli = Instant::now() - Duration::from_secs(1);
+    let latest_video = LatestVideo::default();
+    let mut video_sync = VideoSyncRequest::default();
+    let mut last_remote_pli = None;
     let mut bitrate_ctrl =
         BitrateController::new(config.initial_bitrate_bps, config.max_bitrate_bps);
     let mut last_max_bitrate_bps = config.max_bitrate_bps;
@@ -2949,7 +3055,9 @@ async fn run_raw_udp_loop(
                                             }
                                         }
                                     }
-                                    ControlMessage::RequestKeyframe { last_good_frame_id, reason } => {
+                                    ControlMessage::RequestKeyframe { last_good_frame_id, reason }
+                                        if allow_keyframe_request(last_remote_pli, Instant::now()) => {
+                                        last_remote_pli = Some(Instant::now());
                                         let _ = event_tx.send(NetworkEvent::KeyframeRequested {
                                             last_good_frame_id: *last_good_frame_id,
                                             reason: reason.clone(),
@@ -2971,7 +3079,8 @@ async fn run_raw_udp_loop(
                             handle_inbound_media_datagram(
                                 pkt,
                                 &mut reassembler,
-                                &mut last_pli,
+                                &latest_video,
+                                &mut video_sync,
                                 &counters,
                                 &event_tx,
                                 &internal_ctrl_tx,
@@ -2986,7 +3095,7 @@ async fn run_raw_udp_loop(
                     Err(e) => return Err(NetworkError::Io(e)),
                 }
             }
-            Some(frame) = video_rx.recv() => {
+            Some(frame) = next_video_frame(&mut video_rx) => {
                 let fec_group = overrides.fec_group_size.load(Ordering::Relaxed);
                 let packets = match packetize_video(
                     frame.codec,
@@ -3049,6 +3158,12 @@ async fn run_raw_udp_loop(
                 }
             }
             _ = telemetry_tick.tick() => {
+                let expired = reassembler.evict_expired();
+                if expired != 0 {
+                    counters.video_frames_dropped.fetch_add(u64::from(expired), Ordering::Relaxed);
+                    video_sync.lost_reference(&internal_ctrl_tx);
+                }
+                video_sync.retry_at(Instant::now(), &internal_ctrl_tx);
                 if last_peer_seen.elapsed() > Duration::from_secs(10) {
                     return Err(NetworkError::HolePunchTimeout);
                 }
@@ -3113,6 +3228,44 @@ async fn send_framed_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn video_handoff_keeps_only_the_latest_frame() {
+        let (tx, mut rx) = watch::channel(None);
+        let tx = VideoSender(tx);
+        for frame_id in 1..=10 {
+            tx.publish(OutboundVideoFrame {
+                meta: crate::telemetry::FrameTelemetry::full_range_hardware(0, 1920, 1080),
+                codec: VideoCodec::H264,
+                frame_id,
+                timestamp_us: u64::from(frame_id) * 16_667,
+                captured_at: Instant::now(),
+                fps: 60,
+                is_keyframe: frame_id == 1,
+                payload: Bytes::from_static(b"frame"),
+            }).unwrap();
+        }
+        assert_eq!(next_video_frame(&mut rx).await.unwrap().frame_id, 10);
+        drop(tx);
+        assert!(next_video_frame(&mut rx).await.is_none());
+    }
+
+    #[test]
+    fn video_sync_retries_at_two_hundred_ms_until_recovered() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut sync = VideoSyncRequest { waiting_for_keyframe: true, last_sent: None };
+        let now = Instant::now();
+        sync.retry_at(now, &tx);
+        assert!(matches!(rx.try_recv(), Ok(ControlMessage::RequestKeyframe { last_good_frame_id: None, .. })));
+        sync.retry_at(now + Duration::from_millis(199), &tx);
+        assert!(rx.try_recv().is_err());
+        sync.retry_at(now + PLI_INTERVAL, &tx);
+        assert!(rx.try_recv().is_ok());
+        sync.waiting_for_keyframe = false;
+        sync.retry_at(now + PLI_INTERVAL * 2, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
     use crate::protocol::{AudioCodec, AudioPacketHeader, InputEvent, VideoCodec, audio_flags};
     use crate::signaling::LocalSignalingServer;
 
@@ -3257,7 +3410,7 @@ mod tests {
         }
         let mut client = start_client_session(client_cfg, invite_uri).await.unwrap();
 
-        async fn wait_connected(rx: &mut mpsc::UnboundedReceiver<NetworkEvent>, route: TestRoute) {
+        async fn wait_connected(rx: &mut SessionEvents, route: TestRoute) {
             loop {
                 match timeout(Duration::from_secs(6), rx.recv())
                     .await
@@ -3317,7 +3470,7 @@ mod tests {
         if protocol == TransportProtocol::Quic {
             host.tx
                 .video_tx
-                .send(OutboundVideoFrame {
+                .publish(OutboundVideoFrame {
                     meta: crate::telemetry::FrameTelemetry::full_range_hardware(1, 1920, 1080),
                     codec: VideoCodec::Hevc,
                     frame_id: 0,
@@ -3327,12 +3480,11 @@ mod tests {
                     is_keyframe: true,
                     payload: Bytes::from_static(b"obsolete frame"),
                 })
-                .await
                 .unwrap();
         }
         host.tx
             .video_tx
-            .send(OutboundVideoFrame {
+            .publish(OutboundVideoFrame {
                 meta: crate::telemetry::FrameTelemetry::full_range_hardware(1, 1920, 1080),
                 codec: VideoCodec::Hevc,
                 frame_id: 1,
@@ -3342,7 +3494,6 @@ mod tests {
                 is_keyframe: true,
                 payload: synthetic_hevc.clone(),
             })
-            .await
             .unwrap();
 
         host.tx
@@ -3503,7 +3654,7 @@ mod tests {
                 payload: synthetic_hevc.clone(),
             };
             // Skip frame 2, simulating a capture-to-network queue drop.
-            host.tx.video_tx.send(frame(3, false)).await.unwrap();
+            host.tx.video_tx.publish(frame(3, false)).unwrap();
             timeout(Duration::from_secs(2), async {
                 while let Some(event) = host.event_rx.recv().await {
                     if let NetworkEvent::KeyframeRequested {
@@ -3521,7 +3672,7 @@ mod tests {
             .await
             .expect("queue drop should request an IDR");
 
-            host.tx.video_tx.send(frame(4, true)).await.unwrap();
+            host.tx.video_tx.publish(frame(4, true)).unwrap();
             timeout(Duration::from_secs(2), async {
                 while let Some(event) = client.event_rx.recv().await {
                     if let NetworkEvent::VideoFrameReceived(frame) = event {
@@ -3606,6 +3757,9 @@ mod tests {
                 let video_tx = host.tx.video_tx.clone();
                 let audio_tx = host.tx.audio_tx.clone();
                 let input_tx = client.tx.input_tx.clone();
+                let keyframe_requested = Arc::new(AtomicBool::new(false));
+                let requested_by_collector = Arc::clone(&keyframe_requested);
+                let (production_done, mut production_finished) = oneshot::channel();
                 const TRANSITIONS: u32 = 64;
                 let input_event = |id: u32| {
                     let pressed = id % 2 == 0;
@@ -3628,10 +3782,12 @@ mod tests {
                         }
 
                         // Skip one reference frame each second. A new keyframe
-                        // after the gap models the host's recovery response.
+                        // follows each injected gap. Also respond to requests
+                        // for additional losses during the run.
                         if id % 60 != 48 {
+                            let requested = keyframe_requested.swap(false, Ordering::AcqRel);
                             video_tx
-                                .send(OutboundVideoFrame {
+                                .publish(OutboundVideoFrame {
                                     frame_id: id,
                                     codec: VideoCodec::H264,
                                     meta: crate::telemetry::FrameTelemetry::full_range_hardware(
@@ -3640,10 +3796,9 @@ mod tests {
                                     timestamp_us: u64::from(id) * 16_667,
                                     captured_at: Instant::now(),
                                     fps: 60,
-                                    is_keyframe: matches!(id % 60, 0 | 50),
+                                    is_keyframe: requested || matches!(id % 60, 0 | 50),
                                     payload: payload.clone(),
                                 })
-                                .await
                                 .unwrap();
                         }
                         audio_tx
@@ -3660,6 +3815,7 @@ mod tests {
                             .await
                             .unwrap();
                     }
+                    let _ = production_done.send(());
                 };
 
                 let consume = async {
@@ -3704,19 +3860,29 @@ mod tests {
                         "a replacement keyframe was lost, relayed={relay_only}"
                     );
                 };
-                let collect_input = async {
-                    for number in 0..TRANSITIONS {
-                        loop {
-                            if let NetworkEvent::InputEventReceived(packet) = host.event_rx.recv().await.unwrap() {
-                                assert_eq!(packet.seq, u64::from(number) + 1);
-                                assert_eq!(packet.event, input_event(number));
-                                break;
-                            }
+                let collect_host_events = async {
+                    let mut number = 0;
+                    let mut finished = false;
+                    while !finished || number < TRANSITIONS {
+                        tokio::select! {
+                            _ = &mut production_finished, if !finished => finished = true,
+                            event = host.event_rx.recv() => match event.unwrap() {
+                                NetworkEvent::InputEventReceived(packet) => {
+                                    assert_eq!(packet.seq, u64::from(number) + 1);
+                                    assert_eq!(packet.event, input_event(number));
+                                    number += 1;
+                                }
+                                NetworkEvent::KeyframeRequested { last_good_frame_id: None, .. } => {
+                                    requested_by_collector.store(true, Ordering::Release);
+                                }
+                                _ => {}
+                            },
                         }
                     }
+                    assert_eq!(number, TRANSITIONS);
                 };
                 timeout(Duration::from_secs(15), async {
-                    tokio::join!(produce, consume, collect_input);
+                    tokio::join!(produce, consume, collect_host_events);
                 })
                 .await
                 .expect("stream stalled under load");

@@ -541,6 +541,8 @@ pub enum ControlMessage {
     },
     EncoderLatency {
         micros: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture_fps: Option<u32>,
     },
     ClientBitrateLimit {
         mbps: u32,

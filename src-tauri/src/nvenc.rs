@@ -70,7 +70,7 @@ impl NvencSettings {
     pub fn vbv_bits(self, bitrate_bps: u32, fps: u32) -> u32 {
         (bitrate_bps / fps.max(1))
             .max(1)
-            .saturating_mul(u32::from(self.vbv_frames.clamp(1, 4)))
+            .saturating_mul(u32::from(self.vbv_frames.clamp(1, 2)))
     }
 
     /// Peak bits VBR may spend on one frame.
@@ -304,6 +304,13 @@ mod tests {
         // Default buffer spans two frame-times without adding reorder delay.
         assert_eq!(settings.vbv_frames, 2);
         assert_eq!(settings.vbv_bits(24_000_000, 60), 800_000);
+    }
+
+    #[test]
+    fn legacy_vbv_settings_are_capped_at_two_frame_budgets() {
+        let settings = NvencSettings { vbv_frames: 4, ..Default::default() };
+        assert_eq!(settings.vbv_bits(24_000_000, 60), 800_000);
+        assert_eq!(settings.vbv_bits(12_000_000, 60), 400_000);
     }
 
     #[test]

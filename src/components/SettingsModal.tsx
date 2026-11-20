@@ -57,7 +57,7 @@ interface SettingsModalProps {
 }
 
 const NVENC_NUMBER_OPTIONS = [
-  { key: "vbvFrames", label: "VBV size in frames", hint: "Larger buffers allow bigger bursts on detailed frames.", min: 1, max: 4 },
+  { key: "vbvFrames", label: "VBV size in frames", hint: "Limit the encoder buffer to one or two frames.", min: 1, max: 2 },
   { key: "aqStrength", label: "Adaptive quantization strength", hint: "Shift bits toward detail. Set to 0 to disable.", min: 0, max: 15 },
   { key: "minQp", label: "Minimum QP", hint: "Lowest quantization the rate controller may use.", min: 0, max: 51 },
   { key: "refreshPeriod", label: "Intra refresh period in frames", hint: "Frames between refresh waves.", min: 2, max: 600 },
@@ -279,11 +279,9 @@ function NvencControls({ settings, onChange }: { settings: NvencSettings; onChan
             onToggle={() => onChange({ ...settings, quarterPass: !settings.quarterPass })} />
         </SettingRow>
         <SettingRow title="Intra refresh" hint="Refresh the picture gradually to help recover from packet loss.">
-          <ToggleSwitch ariaLabel="Intra refresh" checked={settings.intraRefresh}
-            onToggle={() => onChange({ ...settings, intraRefresh: !settings.intraRefresh })} />
+          <span className="text-xs text-zinc-400">On supported hardware</span>
         </SettingRow>
         {NVENC_NUMBER_OPTIONS.map(({ key, label, hint, min, max }) => {
-          if (!settings.intraRefresh && (key === "refreshPeriod" || key === "refreshFrames")) return null;
           const upper = key === "refreshFrames" ? Math.min(max, settings.refreshPeriod - 1) : max;
           const value = Math.min(upper, settings[key]);
           return (

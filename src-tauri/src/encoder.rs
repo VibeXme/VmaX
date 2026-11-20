@@ -757,7 +757,7 @@ pub mod win {
             let mut encode_config = preset_cfg.presetCfg;
             encode_config.version = rung.config_ver();
             let mut intra_refresh = crate::encoder_recovery::IntraRefreshConfig {
-                enabled: settings.intra_refresh,
+                enabled: true,
                 period_frames: settings.refresh_period.clamp(2, 600),
                 refresh_frames: settings.refresh_frames.clamp(1, 60),
             }

@@ -1,4 +1,4 @@
-name: Rebuild v5.3.6 binaries
+name: Rebuild v5.3.7 binaries
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: vmax-v5.3.6-release-${{ github.ref }}
+  group: vmax-v5.3.7-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -111,19 +111,19 @@ jobs:
           if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
           if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
 
-      - name: Publish v5.3.6 release after all builds succeed
+      - name: Publish v5.3.7 release after all builds succeed
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $notes = @'
-          ## VmaX 5.3.6
+          ## VmaX 5.3.7
 
-          - Declare Android camera access for scanning invite QR codes.
-          - Honor the selected resolution and frame rate when Lock resolution and Constant FPS are enabled.
-          - Keep frame timing steady through small scheduler overruns.
-          - Keep media flowing while reliable input waits for network capacity.
-          - Keep a verified UDP path active if its WebSocket relay disconnects.
+          - Recover Windows desktop capture after a DXGI reset and keep static desktops streaming in Constant FPS mode.
+          - Keep one pending video frame per handoff to limit queue latency.
+          - Pace QUIC datagrams and request a fresh keyframe after frame loss.
+          - Reduce NVENC buffering and enable intra-refresh on supported GPUs.
+          - Show capture, decode, and presentation FPS, encode time, network RTT, packet loss, and frame drops in the stream HUD.
 
           ### Downloads
           - VmaX.exe — Windows portable
@@ -132,6 +132,6 @@ jobs:
 
           Relay hosting and bandwidth are supplied by the operator. Actual latency depends on the network path and devices.
           '@
-          $notes | Set-Content -Encoding utf8 'release-v5.3.6.md'
-          gh release create v5.3.6 VmaX.exe VmaX-Android-arm64.apk VmaX-Relay-Linux-x86_64.tar.gz --target "${{ github.sha }}" --title 'VmaX 5.3.6' --notes-file release-v5.3.6.md --repo VibeXme/VmaX
+          $notes | Set-Content -Encoding utf8 'release-v5.3.7.md'
+          gh release create v5.3.7 VmaX.exe VmaX-Android-arm64.apk VmaX-Relay-Linux-x86_64.tar.gz --target "${{ github.sha }}" --title 'VmaX 5.3.7' --notes-file release-v5.3.7.md --repo VibeXme/VmaX
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

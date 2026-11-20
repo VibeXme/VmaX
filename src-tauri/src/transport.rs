@@ -12,15 +12,13 @@ use quinn::Connection;
 use std::collections::VecDeque;
 use std::io;
 use std::net::UdpSocket as StdUdpSocket;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Hard application-level datagram cap.  QUIC adds its own header and AEAD
-/// tag; 1180 bytes keeps the final UDP payload below the smallest common
+/// tag; 1170 bytes keeps the final UDP payload below the smallest common
 /// mobile-carrier MTU (1280) even with IPv6 extension headers.
 pub const MAX_APP_DATAGRAM_BYTES: usize = 1170;
 /// Keep QUIC's application datagram queue small enough that congestion is
@@ -191,10 +189,14 @@ impl PacerStats {
     }
 }
 
-enum PacerCommand {
-    Frame(Vec<PacerShard>, Instant, Duration),
-    Shutdown,
+struct PacedFrame {
+    shards: Vec<PacerShard>,
+    deadline: Instant,
+    spread: Duration,
+    wire_bytes: u64,
 }
+
+type PacerQueue = Arc<(Mutex<Option<PacedFrame>>, Condvar)>;
 
 /// One encoded shard with the identity the client will echo in its feedback
 /// report.  Passing it through the pacer lets the pacing thread stamp the
@@ -220,10 +222,9 @@ pub struct SentShard {
 }
 
 /// Owns the dedicated pacing thread.  `send_frame` is non-blocking and
-/// returns `false` when the bounded queue or the datagram budget is exceeded;
-/// the caller should then request an intra-refresh instead of spinning.
+/// replaces any pending frame when the worker is still pacing a prior frame.
 pub struct PacedSender {
-    tx: SyncSender<PacerCommand>,
+    pending: PacerQueue,
     rate_bps: Arc<AtomicU64>,
     stopped: Arc<AtomicBool>,
     stats: Arc<PacerStats>,
@@ -247,14 +248,15 @@ impl PacedSender {
     /// The host capture loop reads the queue through it to decide whether a new
     /// frame can still fit, so it must be able to observe the pacer's live
     /// queue rather than a snapshot taken at the last frame boundary.
+    /// The queue limit is fixed at one pending frame for every caller.
     pub fn spawn_with_stats(
         conn: Connection,
         initial_rate_bps: u32,
-        max_queued_frames: usize,
+        _max_queued_frames: usize,
         stats: Arc<PacerStats>,
     ) -> Self {
-        let capacity = max_queued_frames.max(1);
-        let (tx, rx) = mpsc::sync_channel(capacity);
+        let pending = Arc::new((Mutex::new(None), Condvar::new()));
+        let worker_pending = Arc::clone(&pending);
         let rate_bps = Arc::new(AtomicU64::new(u64::from(initial_rate_bps.max(1))));
         let sent_log = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
         let thread_rate = Arc::clone(&rate_bps);
@@ -268,7 +270,7 @@ impl PacedSender {
             .spawn(move || {
                 pacing_loop(
                     conn,
-                    rx,
+                    worker_pending,
                     thread_rate,
                     Arc::clone(&thread_stats),
                     thread_log,
@@ -279,7 +281,7 @@ impl PacedSender {
             .ok();
 
         Self {
-            tx,
+            pending,
             rate_bps,
             stopped,
             stats,
@@ -302,22 +304,20 @@ impl PacedSender {
             self.stats.rejected_packets.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        self.stats
-            .queue_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
-        match self
-            .tx
-            .try_send(PacerCommand::Frame(shards, deadline, spread))
-        {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                self.stats
-                    .queue_bytes
-                    .fetch_sub(bytes as u64, Ordering::Relaxed);
-                self.stats.rejected_packets.fetch_add(1, Ordering::Relaxed);
-                false
-            }
+        let Ok(mut pending) = self.pending.0.lock() else {
+            return false;
+        };
+        if self.stopped.load(Ordering::Relaxed) || self.join.is_none() {
+            return false;
         }
+        let wire_bytes = bytes as u64;
+        self.stats.queue_bytes.fetch_add(wire_bytes, Ordering::Relaxed);
+        if let Some(previous) = pending.replace(PacedFrame { shards, deadline, spread, wire_bytes }) {
+            self.stats.queue_bytes.fetch_sub(previous.wire_bytes, Ordering::Relaxed);
+            self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        self.pending.1.notify_one();
+        true
     }
 
     pub fn set_rate_bps(&self, rate_bps: u32) {
@@ -340,7 +340,12 @@ impl PacedSender {
 
     pub fn shutdown(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
-        let _ = self.tx.try_send(PacerCommand::Shutdown);
+        if let Ok(mut pending) = self.pending.0.lock() {
+            if let Some(frame) = pending.take() {
+                self.stats.queue_bytes.fetch_sub(frame.wire_bytes, Ordering::Relaxed);
+            }
+            self.pending.1.notify_one();
+        }
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -355,7 +360,7 @@ impl Drop for PacedSender {
 
 fn pacing_loop(
     conn: Connection,
-    rx: Receiver<PacerCommand>,
+    queue: PacerQueue,
     rate_bps: Arc<AtomicU64>,
     stats: Arc<PacerStats>,
     sent_log: Arc<Mutex<VecDeque<SentShard>>>,
@@ -363,84 +368,85 @@ fn pacing_loop(
     stopped: Arc<AtomicBool>,
 ) {
     let mut engine = PaceEngine::new(initial_rate);
-    while let Ok(command) = rx.recv() {
-        if stopped.load(Ordering::Relaxed) {
+    loop {
+        let pending = queue.0.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pending = queue.1.wait_while(pending, |frame| {
+            frame.is_none() && !stopped.load(Ordering::Relaxed)
+        }).unwrap_or_else(|error| error.into_inner());
+        let Some(PacedFrame { shards, deadline, spread, wire_bytes }) = pending.take() else {
             break;
-        }
-        match command {
-            PacerCommand::Shutdown => break,
-            PacerCommand::Frame(shards, deadline, spread) => {
-                let mut failed = false;
-                let mut next_shard = Instant::now();
-                let wire_bytes: u64 = shards.iter().map(|s| s.datagram.len() as u64).sum();
-                let spacing = frame_shard_spacing(
-                    wire_bytes,
-                    rate_bps.load(Ordering::Relaxed),
-                    spread,
-                    shards.len(),
+        };
+        drop(pending);
+        let mut failed = false;
+        let mut remaining_bytes = wire_bytes;
+        let mut next_shard = Instant::now();
+        let spacing = frame_shard_spacing(
+            wire_bytes,
+            rate_bps.load(Ordering::Relaxed),
+            spread,
+            shards.len(),
+        );
+        for shard in shards {
+            if stopped.load(Ordering::Relaxed) {
+                stats.queue_bytes.fetch_sub(remaining_bytes, Ordering::Relaxed);
+                return;
+            }
+            let bytes = shard.datagram.len() as u64;
+            remaining_bytes -= bytes;
+            if failed || Instant::now() >= deadline {
+                if !failed {
+                    stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                failed = true;
+                stats.queue_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                continue;
+            }
+            let rate = rate_bps.load(Ordering::Relaxed);
+            engine.set_rate_bps(rate.min(u64::from(u32::MAX)) as u32);
+            let now = Instant::now();
+            // Apply the wire rate and the frame's minimum shard spacing.
+            let slot = engine.slot_for(shard.datagram.len(), now.max(next_shard));
+            next_shard = slot + spacing;
+            let delay = slot.saturating_duration_since(now);
+            if !delay.is_zero() {
+                stats.max_pacing_delay_us.fetch_max(
+                    delay.as_micros().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
                 );
-                for shard in shards {
-                    if stopped.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let bytes = shard.datagram.len() as u64;
-                    if failed || Instant::now() >= deadline {
-                        if !failed {
-                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        failed = true;
-                        stats.queue_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                        continue;
-                    }
-                    let rate = rate_bps.load(Ordering::Relaxed);
-                    engine.set_rate_bps(rate.min(u64::from(u32::MAX)) as u32);
-                    let now = Instant::now();
-                    // A small access unit should still span the frame's pacing
-                    // window. Large frames remain limited by the wire budget.
-                    let slot = engine.slot_for(shard.datagram.len(), now.max(next_shard));
-                    next_shard = slot + spacing;
-                    let delay = slot.saturating_duration_since(now);
-                    if !delay.is_zero() {
-                        stats.max_pacing_delay_us.fetch_max(
-                            delay.as_micros().min(u128::from(u64::MAX)) as u64,
-                            Ordering::Relaxed,
-                        );
-                        spin_sleep_until(slot.min(deadline));
-                    }
-                    let result = if Instant::now() < deadline
-                        && conn.datagram_send_buffer_space() >= bytes as usize
+                spin_sleep_until(slot.min(deadline));
+            }
+            let result = if Instant::now() < deadline
+                && conn.datagram_send_buffer_space() >= bytes as usize
+            {
+                conn.send_datagram(shard.datagram).ok()
+            } else {
+                None
+            };
+            match result {
+                Some(()) => {
+                    stats.sent_packets.fetch_add(1, Ordering::Relaxed);
+                    stats.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    if !shard.weighted_parity
+                        && let Ok(mut log) = sent_log.lock()
                     {
-                        conn.send_datagram(shard.datagram).ok()
-                    } else {
-                        None
-                    };
-                    match result {
-                        Some(()) => {
-                            stats.sent_packets.fetch_add(1, Ordering::Relaxed);
-                            stats.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
-                            if !shard.weighted_parity
-                                && let Ok(mut log) = sent_log.lock()
-                            {
-                                log.push_back(SentShard {
-                                    frame_id: shard.frame_id as u32,
-                                    chunk_idx: shard.chunk_idx,
-                                    bytes: bytes as usize,
-                                    parity: shard.parity,
-                                    sent: Instant::now(),
-                                });
-                                while log.len() > 8192 {
-                                    log.pop_front();
-                                }
-                            }
-                        }
-                        None => {
-                            failed = true;
-                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                        log.push_back(SentShard {
+                            frame_id: shard.frame_id as u32,
+                            chunk_idx: shard.chunk_idx,
+                            bytes: bytes as usize,
+                            parity: shard.parity,
+                            sent: Instant::now(),
+                        });
+                        while log.len() > 8192 {
+                            log.pop_front();
                         }
                     }
-                    stats.queue_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                }
+                None => {
+                    failed = true;
+                    stats.send_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            stats.queue_bytes.fetch_sub(bytes, Ordering::Relaxed);
         }
     }
 }

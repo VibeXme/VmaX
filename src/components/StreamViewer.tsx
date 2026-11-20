@@ -62,6 +62,7 @@ interface StreamViewerProps {
   resolution: ResolutionOption;
   pingMs: number;
   packetLossPct?: number;
+  droppedFrames: number;
   hardwareCursor?: boolean;
   nativeFps: number;
   viewerSharpness: number;
@@ -90,7 +91,7 @@ const RESOLUTION_DIMENSIONS: Record<
   "4K": { width: 3840, height: 2160 },
 };
 
-const KEYFRAME_REQUEST_COOLDOWN_MS = 300;
+const KEYFRAME_REQUEST_COOLDOWN_MS = 200;
 /**
  * `latencyMode` is part of WebCodecs, but not every bundled TypeScript DOM
  * library knows it yet. Widening the config type locally keeps the hint while
@@ -99,13 +100,6 @@ const KEYFRAME_REQUEST_COOLDOWN_MS = 300;
 type DecoderConfigWithLatency = VideoDecoderConfig & {
   latencyMode?: "quality" | "realtime";
 };
-/**
- * Consecutive lost frames tolerated before the decoder is reset to wait for a
- * keyframe. Four frames is ~67 ms at 60 FPS and ~33 ms at 120 FPS. Isolated
- * loss still gets cheap intra-refresh recovery, but a genuinely broken
- * reference chain can no longer stay visible for ~200 ms.
- */
-const MAX_TOLERATED_GAPS = 4;
 const HEADER_SIZE_BYTES = 16;
 const CODEC_HEVC = 1;
 const CODEC_H264 = 2;
@@ -305,6 +299,7 @@ export function StreamViewer({
   resolution,
   pingMs,
   packetLossPct,
+  droppedFrames,
   hardwareCursor = true,
   nativeFps,
   viewerSharpness,
@@ -328,6 +323,39 @@ export function StreamViewer({
   const keyboardRef = useRef<HTMLTextAreaElement>(null);
   const touchAvailable = navigator.maxTouchPoints > 0;
   const [overlayVisible, setOverlayVisible] = useState(false);
+  const [captureFps, setCaptureFps] = useState<number | null>(null);
+  const [dropsPerSecond, setDropsPerSecond] = useState(0);
+  const [decoderDropsPerSecond, setDecoderDropsPerSecond] = useState<number | null>(null);
+  const droppedFramesRef = useRef(droppedFrames);
+  droppedFramesRef.current = droppedFrames;
+  useEffect(() => {
+    if (!hasTauriRuntime() || !connected) return;
+    const capture = listen<number>("vmax://host-capture-fps", ({ payload }) => setCaptureFps(payload));
+    let decoderDrops: number | null = null;
+    let previousDecoderDrops: number | null = null;
+    const drops = listen<number>("vmax://decoder-queue-drops", ({ payload }) => {
+      decoderDrops = payload;
+    });
+    let previous = droppedFramesRef.current;
+    let sampledAt = performance.now();
+    const timer = window.setInterval(() => {
+      const now = performance.now();
+      const current = droppedFramesRef.current;
+      const samplesPerSecond = 1000 / Math.max(1, now - sampledAt);
+      setDropsPerSecond(Math.round(Math.max(0, current - previous) * samplesPerSecond));
+      if (decoderDrops !== null && previousDecoderDrops !== null) {
+        setDecoderDropsPerSecond(Math.round(Math.max(0, decoderDrops - previousDecoderDrops) * samplesPerSecond));
+      }
+      previousDecoderDrops = decoderDrops;
+      previous = current;
+      sampledAt = now;
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+      void capture.then((unlisten) => unlisten()).catch(() => {});
+      void drops.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, [connected]);
   const [hostEncodeMs, setHostEncodeMs] = useState<number | null>(null);
   const [parsecTelemetry, setParsecTelemetry] = useState<ParsecTelemetryPayload | null>(null);
   const [recoverStalls, setRecoverStalls] = useState(true);
@@ -410,6 +438,8 @@ export function StreamViewer({
   const [streamSize, setStreamSize] = useState<{ w: number; h: number } | null>(null);
   const [playback, setPlayback] = useState<{
     fps: number;
+    decodeFps: number;
+    discardedFps: number;
     decodeMs: number | null;
     videoMbps: number;
     intervalMs: number;
@@ -710,7 +740,6 @@ export function StreamViewer({
     let activeCodecByte = 0;
     let awaitingKeyframe = true;
     let lastSubmittedFrame: number | null = null;
-    let consecutiveGaps = 0;
     // Decode-everything, drop-at-present: backlog alone never tears down the
     // reference chain (see lib/decodeHealth.ts).
     const decoderHealth = new DecoderHealth();
@@ -757,6 +786,8 @@ export function StreamViewer({
     let emaDecodeMs: number | null = null;
     let videoBytes = 0;
     let drawnFrames = 0;
+    let decodedFrames = 0;
+    let discardedFrames = 0;
     let lastDrawnAt = 0;
     let lastVideoPacketAt = 0;
     let lastStallResetAt = -Infinity;
@@ -764,6 +795,8 @@ export function StreamViewer({
     let decodeTotalMs = 0;
     let lastPlaybackSample = performance.now();
     let subscribed = false;
+    let frameChannelId: number | undefined;
+    let acknowledgeTimer: number | undefined;
     let lastCodecLabel = "";
 
     // Vsync-paced presentation: at most one draw per display refresh and the
@@ -791,7 +824,7 @@ export function StreamViewer({
       const now = performance.now();
       const elapsedMs = Math.max(1, now - lastPlaybackSample);
       const presentWindow = presenter.takeWindow();
-      if (receivedFirstFrame) {
+      if (subscribed && connectedRef.current && !nativeVideoRef.current) {
         const windowDecodeMs = decodeSamples ? decodeTotalMs / decodeSamples : emaDecodeMs;
         if (windowDecodeMs !== null && windowDecodeMs > 0) {
           void invoke("report_client_decode_latency", {
@@ -801,6 +834,8 @@ export function StreamViewer({
         const measuredMbps = (videoBytes * 8) / elapsedMs / 1000;
         setPlayback({
           fps: Math.round((drawnFrames * 1000) / elapsedMs),
+          decodeFps: Math.round((decodedFrames * 1000) / elapsedMs),
+          discardedFps: Math.round(((discardedFrames + presentWindow.superseded) * 1000) / elapsedMs),
           decodeMs: windowDecodeMs,
           videoMbps: measuredMbps,
           intervalMs: presentWindow.intervalMs,
@@ -810,7 +845,7 @@ export function StreamViewer({
       }
       const waitingForFirstFrame = nativeVideoRef.current
         ? !nativeFrameSeen.current
-        : !receivedFirstFrame;
+        : !receivedFirstFrame || awaitingKeyframe;
       if (subscribed && connectedRef.current && !document.hidden && waitingForFirstFrame) {
         requestSyncKeyframe("awaiting_first_frame");
       }
@@ -829,7 +864,7 @@ export function StreamViewer({
         requestSyncKeyframe("video_stalled");
       }
       lastPlaybackSample = now;
-      videoBytes = drawnFrames = decodeSamples = decodeTotalMs = 0;
+      videoBytes = drawnFrames = decodedFrames = discardedFrames = decodeSamples = decodeTotalMs = 0;
     }, 500);
 
     /**
@@ -853,7 +888,6 @@ export function StreamViewer({
     const clearPendingFrames = () => {
       awaitingKeyframe = true;
       lastSubmittedFrame = null;
-      consecutiveGaps = 0;
       decoderHealth.reset();
       decodeSubmittedAt.clear();
       // A frame decoded for the previous reference chain must never be shown
@@ -975,6 +1009,7 @@ export function StreamViewer({
             frame.close();
             return;
           }
+          decodedFrames++;
           const submittedAt = decodeSubmittedAt.get(frame.timestamp);
           if (submittedAt !== undefined) {
             const deltaMs = Math.max(0.05, performance.now() - submittedAt);
@@ -1044,7 +1079,8 @@ export function StreamViewer({
       }
 
       const onFrame = new Channel<ArrayBuffer>();
-      onFrame.onmessage = (payload) => {
+      frameChannelId = onFrame.id;
+      const processFrame = (payload: ArrayBuffer) => {
         if (cancelled) {
           return;
         }
@@ -1098,24 +1134,10 @@ export function StreamViewer({
         // A three-frame queue is what a burst of datagrams looks like.
         const verdict = decoderHealth.evaluate(decoder?.decodeQueueSize ?? 0, now);
         if (verdict.action === "reset") {
-          consecutiveGaps = 0;
           resetDecoder();
         } else if (gap && !isKeyframe) {
-          // A single lost delta breaks the reference chain, but the decoder
-          // conceals it and the host heals it with intra-refresh. Freezing the
-          // picture until the next IDR on every isolated loss is exactly what
-          // makes a healthy 60 FPS stream feel like it stutters, so ask for a
-          // clean reference in the background and keep presenting. Naming the
-          // last good frame keeps that request cheap: the host refreshes the
-          // picture progressively instead of emitting an IDR burst.
-          consecutiveGaps++;
-          requestSyncKeyframe("frame_loss", lastSubmittedFrame);
-          if (consecutiveGaps >= MAX_TOLERATED_GAPS) {
-            consecutiveGaps = 0;
-            resetDecoder();
-          }
-        } else {
-          consecutiveGaps = 0;
+          resetDecoder();
+          requestSyncKeyframe("frame_loss");
         }
 
         const activeDecoder = ensureDecoderForCodec(codecByte);
@@ -1125,6 +1147,7 @@ export function StreamViewer({
 
         if (awaitingKeyframe) {
           if (!isKeyframe) {
+            discardedFrames++;
             // Nothing in this decoder can be decoded until a keyframe lands, so
             // this request must be for an IDR, not a refresh wave.
             requestSyncKeyframe(
@@ -1155,9 +1178,33 @@ export function StreamViewer({
         }
       };
 
+      const acknowledge = (deadline: number) => {
+        if (cancelled) return;
+        if (decoder && decoder.decodeQueueSize > 0) {
+          if (performance.now() < deadline) {
+            acknowledgeTimer = window.setTimeout(() => acknowledge(deadline), 4);
+            return;
+          }
+          resetDecoder();
+          requestSyncKeyframe("decode_queue_stalled");
+        }
+        void invoke("acknowledge_stream_frame", { channelId: onFrame.id }).catch(() => {});
+      };
+      onFrame.onmessage = (payload) => {
+        try {
+          processFrame(payload);
+        } finally {
+          acknowledge(performance.now() + 1_000);
+        }
+      };
+
       try {
         await invoke("subscribe_stream_frames", { onFrame });
-        subscribed = true;
+        if (cancelled) {
+          void invoke("unsubscribe_stream_frames", { channelId: onFrame.id }).catch(() => {});
+        } else {
+          subscribed = true;
+        }
       } catch (error) {
         if (!cancelled) setStreamNotice(`Viewer could not open the video channel. ${String(error)}`);
       }
@@ -1167,6 +1214,10 @@ export function StreamViewer({
 
     return () => {
       cancelled = true;
+      window.clearTimeout(acknowledgeTimer);
+      if (frameChannelId !== undefined) {
+        void invoke("unsubscribe_stream_frames", { channelId: frameChannelId }).catch(() => {});
+      }
       webviewDecoderReset.current = null;
       document.removeEventListener("visibilitychange", recoverOnVisible);
       window.clearInterval(playbackTimer);
@@ -1826,12 +1877,9 @@ export function StreamViewer({
                 <dd className="tabular-nums font-semibold text-white">
                   {displayEncodeMs !== null ? `${displayEncodeMs.toFixed(2)} ms` : "—"}
                 </dd>
-                <dt className="text-zinc-500">Network</dt>
-                <dd
-                  title="One-way network latency (RTT / 2)"
-                  className={`tabular-nums font-semibold ${displayNetworkMs !== null && displayNetworkMs <= 15 ? "text-emerald-300" : "text-white"}`}
-                >
-                  {displayNetworkMs !== null ? `${displayNetworkMs.toFixed(2)} ms` : "—"}
+                <dt className="text-zinc-500">Network RTT</dt>
+                <dd className="tabular-nums font-semibold text-white">
+                  {pingMs > 0 ? `${pingMs.toFixed(1)} ms` : "—"}
                 </dd>
                 <dt className="text-zinc-500">Pipeline</dt>
                 <dd
@@ -1843,6 +1891,18 @@ export function StreamViewer({
                 <dt className="text-zinc-500">Bitrate</dt>
                 <dd className="tabular-nums font-semibold text-white">
                   {`${displayBitrateMbps.toFixed(2)} Mbps`}
+                </dd>
+                <dt className="text-zinc-500">Capture FPS</dt>
+                <dd className="tabular-nums text-zinc-200">{connected ? captureFps ?? "—" : "—"}</dd>
+                <dt className="text-zinc-500">{nativeVideo ? "Native output FPS" : "Decode FPS"}</dt>
+                <dd className="tabular-nums text-zinc-200">{nativeVideo ? nativeFps : playback?.decodeFps ?? "—"}</dd>
+                <dt className="text-zinc-500">Receive drops / s</dt>
+                <dd className="tabular-nums text-zinc-200">{connected ? dropsPerSecond : "—"}</dd>
+                <dt className="text-zinc-500">Viewer drops / s</dt>
+                <dd className="tabular-nums text-zinc-200">
+                  {connected && decoderDropsPerSecond !== null
+                    ? decoderDropsPerSecond + (nativeVideo ? 0 : playback?.discardedFps ?? 0)
+                    : "—"}
                 </dd>
                 <dt className="text-zinc-500">FPS drawn</dt>
                 <dd className="tabular-nums text-zinc-200">{displayFps ?? "—"}</dd>
@@ -1861,7 +1921,7 @@ export function StreamViewer({
                 </dd>
                 <dt className="text-zinc-500">Transport</dt>
                 <dd className="text-zinc-200">{pathLabel}</dd>
-                <dt className="text-zinc-500">TX loss</dt>
+                <dt className="text-zinc-500">Host packet loss</dt>
                 <dd className="tabular-nums text-zinc-200">
                   {packetLossPct !== undefined ? `${packetLossPct.toFixed(1)}%` : "—"}
                 </dd>

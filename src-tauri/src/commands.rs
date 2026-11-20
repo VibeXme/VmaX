@@ -433,6 +433,28 @@ struct LastHostConfig {
     room_code: Option<String>,
 }
 
+struct VideoDelivery {
+    channel: Channel<InvokeResponseBody>,
+    in_flight: bool,
+    pending: Option<Vec<u8>>,
+    superseded: u64,
+}
+
+impl VideoDelivery {
+    fn offer(&mut self, frame: Vec<u8>) {
+        if self.pending.replace(frame).is_some() {
+            self.superseded = self.superseded.saturating_add(1);
+        }
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        if !self.in_flight && let Some(frame) = self.pending.take() {
+            self.in_flight = self.channel.send(InvokeResponseBody::Raw(frame)).is_ok();
+        }
+    }
+}
+
 pub struct AppState {
     haptics: Arc<crate::haptics::HapticsConfig>,
     #[cfg(target_os = "windows")]
@@ -445,7 +467,7 @@ pub struct AppState {
     touch_gamepad: Arc<TouchGamepad>,
     session_lifecycle: Mutex<()>,
     active_forwarder: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
-    video_channel: Arc<StdMutex<Option<Channel<InvokeResponseBody>>>>,
+    video_channel: Arc<StdMutex<Option<VideoDelivery>>>,
     client_codecs: Arc<StdMutex<Vec<VideoCodec>>>,
     client_display: Arc<StdMutex<Option<crate::handshake::ClientDisplay>>>,
     audio_denoise_flag: Arc<AtomicBool>,
@@ -588,23 +610,20 @@ pub fn set_constant_fps_mode(enabled: bool) {
 }
 
 #[cfg(target_os = "windows")]
-struct HighResTimerGuard;
+struct HighResTimerGuard(bool);
 
 #[cfg(target_os = "windows")]
 impl HighResTimerGuard {
     fn new() -> Self {
-        unsafe {
-            windows::Win32::Media::timeBeginPeriod(1);
-        }
-        Self
+        Self(unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0)
     }
 }
 
 #[cfg(target_os = "windows")]
 impl Drop for HighResTimerGuard {
     fn drop(&mut self) {
-        unsafe {
-            windows::Win32::Media::timeEndPeriod(1);
+        if self.0 {
+            unsafe { windows::Win32::Media::timeEndPeriod(1) };
         }
     }
 }
@@ -653,7 +672,7 @@ impl Drop for HostPriorityGuard {
 async fn spawn_host_capture_thread(
     app: AppHandle,
     params: StartSessionParams,
-    video_tx: tokio::sync::mpsc::Sender<OutboundVideoFrame>,
+    video_tx: crate::network::VideoSender,
     controls: HostRuntimeControls,
     stop_flag: Arc<AtomicBool>,
     wake_display: bool,
@@ -805,6 +824,8 @@ async fn spawn_host_capture_thread(
             let mut frame_id: u32 = 1;
             let mut cpu_sample = None;
             let mut encoded_frames: u32 = 0;
+            let mut captured_frames: u32 = 0;
+            let mut capture_sample_at = Instant::now();
             let mut ema_encode_ms: f32 = 0.0;
             let mut last_telemetry = Instant::now();
             // EMA-smoothed values behind `vmax://telemetry-tick`.
@@ -835,6 +856,25 @@ async fn spawn_host_capture_thread(
             let mut next_retry = Instant::now();
 
             while !stop_flag.load(Ordering::Relaxed) {
+                let elapsed = capture_sample_at.elapsed();
+                if elapsed >= Duration::from_secs(1) {
+                    let capture_fps = (captured_frames as f64 / elapsed.as_secs_f64()).round() as u32;
+                    capture_sample_at = Instant::now();
+                    captured_frames = 0;
+                    if controls.connected.load(Ordering::Relaxed) {
+                        let app = app_thread.clone();
+                        let micros = if retry_capture { 0 } else { (ema_encode_ms * 1000.0) as u32 };
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<AppState>();
+                            if let Some(tx) = state.active_tx.lock().await.as_ref() {
+                                let _ = tx.control_tx.try_send(ControlMessage::EncoderLatency {
+                                    micros,
+                                    capture_fps: Some(capture_fps),
+                                });
+                            }
+                        });
+                    }
+                }
                 if retry_capture && Instant::now() < next_retry {
                     std::thread::sleep(
                         next_retry
@@ -1124,19 +1164,6 @@ async fn spawn_host_capture_thread(
                     }
                 }
 
-                let force_keyframe = controls.force_idr.swap(false, Ordering::AcqRel);
-                if force_keyframe {
-                    controls.force_intra_refresh.store(0, Ordering::Release);
-                    forced_refresh_frames = 0;
-                    enc.force_keyframe();
-                } else {
-                    let refresh_frames = controls.force_intra_refresh.swap(0, Ordering::AcqRel);
-                    if refresh_frames > 0 {
-                        forced_refresh_frames = refresh_frames;
-                        enc.request_intra_refresh(refresh_frames);
-                    }
-                }
-
                 if !controls.connected.load(Ordering::Relaxed) {
                     capture_waiting_since = None;
                     encoder_waiting_since = None;
@@ -1164,20 +1191,9 @@ async fn spawn_host_capture_thread(
 
                 // Backpressure: when the network worker cannot accept another
                 // frame right now, skip this capture slot instead of encoding a
-                // frame that can only be dropped. Skipping a slot keeps the
-                // reference chain intact; dropping an encoded frame forces an
-                // intra-refresh and is what turns a busy link into visible
-                // pulsing. The viewer sees a brief lower frame rate instead of
-                // an artifact plus a keyframe spike.
-                //
-                // `video_tx.capacity()` only catches a worker that is busy,
-                // which is rare: the worker hands frames to the pacer and
-                // returns. The queue that actually grows is the one between the
-                // pacer and the wire, so that is the one to watch. It is also
-                // the queue whose overflow the sender answers by dropping an
-                // encoded delta, which is precisely the event that turns a
-                // saturated uplink into a stutter.
-                if video_tx.capacity() == 0 || controls.send_backlog.saturated() {
+                // frame that can only be dropped. Skipping a slot preserves
+                // the encoder's reference chain and avoids another IDR.
+                if controls.send_backlog.saturated() {
                     pacing.set_fps(pace_fps);
                     pacing.wait_next_frame();
                     continue;
@@ -1194,16 +1210,16 @@ async fn spawn_host_capture_thread(
                 // Pointer policy is a live setting: the host draws the cursor
                 // into the frame unless the viewer paints its own.
                 cap.set_pointer_overlay(controls.hardware_cursor.load(Ordering::Relaxed));
-                let valid_frame = match cap.capture_frame(capture_wait_ms, force_keyframe || forced_refresh_frames > 0) {
+                let force_frame = controls.force_idr.load(Ordering::Acquire)
+                    || controls.force_intra_refresh.load(Ordering::Acquire) > 0
+                    || forced_refresh_frames > 0;
+                let valid_frame = match cap.capture_frame(capture_wait_ms, force_frame) {
                     Ok(true) => {
                         capture_errors = 0;
                         capture_waiting_since = None;
                         true
                     }
-                    Ok(false) if cap.waiting_for_desktop() => {
-                        std::thread::sleep(Duration::from_millis(15));
-                        continue;
-                    }
+                    Ok(false) if cap.has_valid_frame() => false,
                     Ok(false) => {
                         let waiting = capture_waiting_since.get_or_insert_with(Instant::now);
                         if waiting.elapsed() >= Duration::from_secs(2) {
@@ -1237,10 +1253,23 @@ async fn spawn_host_capture_thread(
                         false
                     }
                 };
-                if force_keyframe && !valid_frame {
+                let discontinuity = cap.take_capture_discontinuity();
+                if discontinuity && !valid_frame {
                     controls.force_idr.store(true, Ordering::Release);
                 }
                 if valid_frame {
+                    if controls.force_idr.swap(false, Ordering::AcqRel) || discontinuity {
+                        controls.force_intra_refresh.store(0, Ordering::Release);
+                        forced_refresh_frames = 0;
+                        enc.force_keyframe();
+                    } else {
+                        let refresh_frames = controls.force_intra_refresh.swap(0, Ordering::AcqRel);
+                        if refresh_frames > 0 {
+                            forced_refresh_frames = refresh_frames;
+                            enc.request_intra_refresh(refresh_frames);
+                        }
+                    }
+                    captured_frames += 1;
                     if cap.take_refinement_request() {
                         // Motion stopped: two near-lossless frames before the
                         // idle heartbeat thins the stream out.
@@ -1287,7 +1316,7 @@ async fn spawn_host_capture_thread(
                                 payload: Bytes::from(au.payload),
                             };
                             frame_id = frame_id.wrapping_add(1);
-                            if video_tx.try_send(out).is_err() {
+                            if video_tx.publish(out).is_err() {
                                 controls.force_intra_refresh.store(5, Ordering::Release);
                             }
                         }
@@ -1341,18 +1370,6 @@ async fn spawn_host_capture_thread(
                     } else {
                         0.0
                     };
-                    if controls.connected.load(Ordering::Relaxed) {
-                        let app = app_thread.clone();
-                        let micros = (ema_encode_ms * 1000.0) as u32;
-                        tauri::async_runtime::spawn(async move {
-                            let state = app.state::<AppState>();
-                            if let Some(tx) = state.active_tx.lock().await.as_ref() {
-                                let _ = tx
-                                    .control_tx
-                                    .try_send(ControlMessage::EncoderLatency { micros });
-                            }
-                        });
-                    }
                     let label = enc.pipeline_label().to_string();
                     let _ = app_thread.emit(
                         "vmax://hardware-telemetry",
@@ -1413,7 +1430,7 @@ async fn spawn_host_capture_thread(
 async fn spawn_host_capture_thread(
     _app: AppHandle,
     _params: StartSessionParams,
-    _video_tx: tokio::sync::mpsc::Sender<OutboundVideoFrame>,
+    _video_tx: crate::network::VideoSender,
     _controls: HostRuntimeControls,
     _stop_flag: Arc<AtomicBool>,
     _wake_display: bool,
@@ -1425,7 +1442,7 @@ struct EventForwarderContext {
     app: AppHandle,
     role: SessionRole,
     protocol: TransportProtocol,
-    video_channel: Arc<StdMutex<Option<Channel<InvokeResponseBody>>>>,
+    video_channel: Arc<StdMutex<Option<VideoDelivery>>>,
     client_codecs: Arc<StdMutex<Vec<VideoCodec>>>,
     client_display: Arc<StdMutex<Option<crate::handshake::ClientDisplay>>>,
     host_controls: Option<HostRuntimeControls>,
@@ -1641,6 +1658,14 @@ fn register_session<'a>(
                                     pipeline_label: label.clone(),
                                 },
                             );
+                            let bridge_drops = ctx.video_channel.lock().ok()
+                                .and_then(|delivery| delivery.as_ref().map(|delivery| delivery.superseded))
+                                .unwrap_or(0);
+                            #[cfg(target_os = "android")]
+                            let decoder_drops = bridge_drops.saturating_add(crate::android_jni::backlog_drops());
+                            #[cfg(not(target_os = "android"))]
+                            let decoder_drops = bridge_drops;
+                            let _ = ctx.app.emit("vmax://decoder-queue-drops", decoder_drops);
                             let elapsed = last_client_telemetry.elapsed().as_secs_f32().max(0.001);
                             #[allow(unused_mut)]
                             let mut displayed_frames = client_fps_frames;
@@ -1840,8 +1865,8 @@ fn register_session<'a>(
                         }
 
                         if !native_video
-                            && let Ok(guard) = ctx.video_channel.lock()
-                            && let Some(ref ch) = *guard
+                            && let Ok(mut guard) = ctx.video_channel.lock()
+                            && let Some(delivery) = guard.as_mut()
                         {
                             let raw = build_video_ipc_frame(
                                 frame.frame_id,
@@ -1851,7 +1876,7 @@ fn register_session<'a>(
                                 &frame.payload,
                                 frame.meta.host_encode_us,
                             );
-                            let _ = ch.send(InvokeResponseBody::Raw(raw));
+                            delivery.offer(raw);
                         }
 
                         if frame.is_keyframe || video_rx_count % 60 == 1 {
@@ -1999,7 +2024,7 @@ fn register_session<'a>(
                             format!("Intra-refresh wave ({frames} frames): {reason}"),
                         );
                     }
-                    NetworkEvent::CongestionFeedback(_) => {}
+                    NetworkEvent::CongestionFeedback(_) | NetworkEvent::VideoFramePending(_) => {}
                     NetworkEvent::ControlReceived(msg) => {
                         #[cfg(target_os = "windows")]
                         if matches!(&msg, ControlMessage::ReconnectGamepad)
@@ -2026,10 +2051,13 @@ fn register_session<'a>(
                                 port.filter(|port| (1..=4).contains(port)),
                             );
                         }
-                        if let ControlMessage::EncoderLatency { micros } = &msg
+                        if let ControlMessage::EncoderLatency { micros, capture_fps } = &msg
                             && ctx.role == SessionRole::Client
                             && *micros <= 1_000_000
                         {
+                            if let Some(fps) = capture_fps {
+                                let _ = ctx.app.emit("vmax://host-capture-fps", *fps);
+                            }
                             let smooth_ms = record_encode_latency_us(*micros);
                             let _ = ctx
                                 .app
@@ -3202,13 +3230,38 @@ pub async fn subscribe_stream_frames(
             .video_channel
             .lock()
             .map_err(|_| "failed to register video frame channel".to_string())?;
-        *guard = Some(on_frame);
+        *guard = Some(VideoDelivery {
+            channel: on_frame,
+            in_flight: false,
+            pending: None,
+            superseded: 0,
+        });
     }
     // The connection can deliver its first IDR before the WebView opens this
     // IPC channel. An idle desktop may never send another frame by itself.
     // A viewer that has just opened the channel has decoded nothing yet, so it
     // has no reference to name: this is the one honest case for a full IDR.
     request_keyframe(state, Some("viewer ready".into()), None).await
+}
+
+#[tauri::command]
+pub fn acknowledge_stream_frame(state: State<'_, AppState>, channel_id: u32) {
+    if let Ok(mut guard) = state.video_channel.lock()
+        && let Some(delivery) = guard.as_mut()
+        && delivery.channel.id() == channel_id
+    {
+        delivery.in_flight = false;
+        delivery.flush();
+    }
+}
+
+#[tauri::command]
+pub fn unsubscribe_stream_frames(state: State<'_, AppState>, channel_id: u32) {
+    if let Ok(mut guard) = state.video_channel.lock()
+        && guard.as_ref().is_some_and(|delivery| delivery.channel.id() == channel_id)
+    {
+        *guard = None;
+    }
 }
 
 #[tauri::command]
@@ -3685,7 +3738,7 @@ pub async fn send_probe_packet(
     match channel.as_str() {
         "video" => {
             tx.video_tx
-                .send(OutboundVideoFrame {
+                .publish(OutboundVideoFrame {
                     meta: crate::telemetry::FrameTelemetry::full_range_hardware(1, 1920, 1080),
                     frame_id: seq as u32,
                     timestamp_us: ts_us,
@@ -3695,7 +3748,6 @@ pub async fn send_probe_packet(
                     is_keyframe: seq % 30 == 1,
                     payload: Bytes::from(vec![0x5A; 16_384]),
                 })
-                .await
                 .map_err(|e| e.to_string())?;
             emit_packet_log(
                 &app,

@@ -165,8 +165,7 @@ function asBoolean(val: unknown, fallback: boolean): boolean {
  * two-frame budget; a deliberate user choice is left alone.
  */
 function migrateVbvFrames(value: unknown): number {
-  const frames = Math.round(asClampedNumber(value, 1, 4, DEFAULT_NVENC.vbvFrames));
-  return frames === 1 ? DEFAULT_NVENC.vbvFrames : frames;
+  return Math.round(asClampedNumber(value, 1, 2, DEFAULT_NVENC.vbvFrames));
 }
 
 /** A QP floor of 5 was the old default; 3 is the text-friendly one. */

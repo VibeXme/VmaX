@@ -835,7 +835,8 @@ export function App() {
             connectionPath={telemetry.connection_path}
             resolution={config.video.resolution}
             pingMs={livePingMs}
-            packetLossPct={telemetry.packet_loss_pct}
+            packetLossPct={telemetry.peer_packet_loss_pct ?? undefined}
+            droppedFrames={telemetry.video_frames_dropped}
             hardwareCursor={config.network.hardwareCursor}
             nativeFps={hardware.fps}
             viewerSharpness={config.video.viewerSharpness}

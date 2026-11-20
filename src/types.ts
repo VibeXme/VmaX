@@ -42,6 +42,7 @@ export interface NetworkTelemetry {
   rtt_ms: number;
   min_rtt_ms: number;
   packet_loss_pct: number;
+  peer_packet_loss_pct?: number | null;
   target_bitrate_bps: number;
   congestion_state: CongestionState;
   video_frames_tx: number;

@@ -14,8 +14,9 @@
 
 use bytes::Bytes;
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -233,8 +234,11 @@ struct QueuedFrame {
     frame: BufferedFrame,
 }
 
+type FrameQueue = Arc<Mutex<VecDeque<QueuedFrame>>>;
+
 pub struct JitterProducer {
-    ring: Arc<SpscRing<QueuedFrame>>,
+    queue: FrameQueue,
+    capacity: usize,
     epoch: Arc<AtomicU64>,
     estimator: JitterEstimator,
     hold_us: Arc<AtomicU32>,
@@ -245,11 +249,10 @@ pub struct JitterProducer {
 }
 
 pub struct JitterConsumer {
-    ring: Arc<SpscRing<QueuedFrame>>,
+    queue: FrameQueue,
     epoch: Arc<AtomicU64>,
     hold_us: Arc<AtomicU32>,
     stats: Arc<JitterStats>,
-    pending: Option<QueuedFrame>,
     observed_epoch: u64,
     needs_keyframe: bool,
     awaiting_keyframe: bool,
@@ -258,12 +261,14 @@ pub struct JitterConsumer {
 
 impl JitterProducer {
     pub fn new(origin: Instant, capacity: usize) -> (Self, JitterConsumer) {
-        let ring = Arc::new(SpscRing::with_capacity(capacity));
+        let capacity = capacity.max(1);
+        let queue = Arc::new(Mutex::new(VecDeque::with_capacity(capacity)));
         let hold_us = Arc::new(AtomicU32::new(MIN_HOLD.as_micros() as u32));
         let stats = Arc::new(JitterStats::default());
         let epoch = Arc::new(AtomicU64::new(0));
         let producer = Self {
-            ring: Arc::clone(&ring),
+            queue: Arc::clone(&queue),
+            capacity,
             epoch: Arc::clone(&epoch),
             estimator: JitterEstimator::new(),
             hold_us: Arc::clone(&hold_us),
@@ -273,11 +278,10 @@ impl JitterProducer {
             last_pushed: None,
         };
         let consumer = JitterConsumer {
-            ring,
+            queue,
             epoch,
             hold_us,
             stats,
-            pending: None,
             observed_epoch: 0,
             needs_keyframe: false,
             awaiting_keyframe: true,
@@ -287,7 +291,7 @@ impl JitterProducer {
     }
 
     /// Called on the network thread immediately after reassembly.  Returns
-    /// `false` only when the ring is full (the caller should request RFI).
+    /// `false` when an out-of-order frame is rejected.
     pub fn push(&mut self, frame: BufferedFrame) -> bool {
         if self.last_pushed.is_some_and(|last| frame.frame_id <= last) {
             self.stats.dropped_stale.fetch_add(1, Ordering::Relaxed);
@@ -309,16 +313,18 @@ impl JitterProducer {
         self.hold_us.store(self.current_hold_us, Ordering::Relaxed);
 
         let epoch = self.epoch.load(Ordering::Relaxed);
-        match self.ring.push(QueuedFrame { epoch, frame }) {
-            Ok(()) => {
-                self.stats.pushed.fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            Err(_) => {
-                self.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
-                false
-            }
+        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        if queue.len() == self.capacity {
+            queue.pop_front();
+            self.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
         }
+        queue.push_back(QueuedFrame { epoch, frame });
+        self.stats.pushed.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub fn superseded_frames(&self) -> u64 {
+        self.stats.dropped_full.load(Ordering::Relaxed)
     }
 
     /// Clears the monotonic frame-id guard and the jitter estimate after a
@@ -350,7 +356,7 @@ impl JitterProducer {
             forced_late: self.stats.forced_late.load(Ordering::Relaxed),
             p95_jitter_us: self.estimator.p95_us(),
             hold_us: self.current_hold_us,
-            queue_depth: self.ring.len() as u32,
+            queue_depth: self.queue.lock().unwrap_or_else(|error| error.into_inner()).len() as u32,
         }
     }
 }
@@ -360,7 +366,8 @@ impl JitterConsumer {
     /// after receiving a new keyframe.
     pub fn next(&mut self, now: Instant) -> Option<BufferedFrame> {
         loop {
-            let queued = self.pending.take().or_else(|| self.ring.pop())?;
+            let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+            let queued = queue.front()?;
             let epoch = self.epoch.load(Ordering::Acquire);
             if epoch != self.observed_epoch {
                 self.observed_epoch = epoch;
@@ -369,6 +376,7 @@ impl JitterConsumer {
                 self.needs_keyframe = false;
             }
             if queued.epoch != epoch {
+                queue.pop_front();
                 continue;
             }
             let frame = &queued.frame;
@@ -381,11 +389,11 @@ impl JitterConsumer {
                 }
                 self.awaiting_keyframe = true;
                 self.stats.dropped_stale.fetch_add(1, Ordering::Relaxed);
+                queue.pop_front();
                 continue;
             }
             let hold = Duration::from_micros(u64::from(self.hold_us.load(Ordering::Relaxed)));
             if now < frame.arrival + hold {
-                self.pending = Some(queued);
                 return None;
             }
             if now.saturating_duration_since(frame.arrival) >= hold + MAX_LATE_GRACE {
@@ -395,7 +403,7 @@ impl JitterConsumer {
             self.awaiting_keyframe = false;
             self.needs_keyframe = false;
             self.stats.emitted.fetch_add(1, Ordering::Relaxed);
-            return Some(queued.frame);
+            return queue.pop_front().map(|queued| queued.frame);
         }
     }
 
@@ -416,23 +424,23 @@ impl JitterConsumer {
     /// Instant at which the pending frame becomes due.  The decoder thread
     /// sleeps exactly this long instead of polling every millisecond.
     pub fn pending_due(&self) -> Option<Instant> {
-        let frame = self.pending.as_ref()?;
+        let queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        let frame = queue.front()?;
         let hold_us = u64::from(self.hold_us.load(Ordering::Relaxed));
         Some(frame.frame.arrival + Duration::from_micros(hold_us))
     }
 
     pub fn has_pending(&self) -> bool {
-        self.pending.is_some() || !self.ring.is_empty()
+        !self.queue.lock().unwrap_or_else(|error| error.into_inner()).is_empty()
     }
 
     /// Stream discontinuity (codec switch, reconnect).  Drop everything so a
     /// stale IDR does not hold the new stream hostage.
     pub fn reset(&mut self) {
-        self.pending = None;
         self.awaiting_keyframe = true;
         self.needs_keyframe = false;
         self.last_emitted = None;
-        while self.ring.pop().is_some() {}
+        self.queue.lock().unwrap_or_else(|error| error.into_inner()).clear();
     }
 
     pub fn stats(&self) -> JitterStatsSnapshot {
@@ -444,7 +452,7 @@ impl JitterConsumer {
             forced_late: self.stats.forced_late.load(Ordering::Relaxed),
             p95_jitter_us: 0,
             hold_us: self.hold_us.load(Ordering::Relaxed),
-            queue_depth: self.ring.len() as u32,
+            queue_depth: self.queue.lock().unwrap_or_else(|error| error.into_inner()).len() as u32,
         }
     }
 }
@@ -475,6 +483,21 @@ mod tests {
             assert_eq!(ring.pop(), Some(i));
         }
         assert_eq!(ring.pop(), None);
+    }
+
+    #[test]
+    fn single_slot_replaces_stale_video_and_resumes_on_keyframe() {
+        let now = Instant::now();
+        let (mut producer, mut consumer) = JitterProducer::new(now, 1);
+        assert!(producer.push(frame(1, now, true)));
+        assert_eq!(consumer.next(now + MAX_HOLD).unwrap().frame_id, 1);
+        assert!(producer.push(frame(2, now, false)));
+        assert!(producer.push(frame(3, now, false)));
+        assert_eq!(producer.superseded_frames(), 1);
+        assert!(consumer.next(now + MAX_HOLD).is_none());
+        assert!(consumer.take_keyframe_request());
+        assert!(producer.push(frame(4, now, true)));
+        assert_eq!(consumer.next(now + MAX_HOLD).unwrap().frame_id, 4);
     }
 
     #[test]

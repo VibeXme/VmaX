@@ -534,6 +534,8 @@ pub fn run() {
             commands::test_media_relay,
             commands::send_probe_packet,
             commands::subscribe_stream_frames,
+            commands::acknowledge_stream_frame,
+            commands::unsubscribe_stream_frames,
             commands::send_input_event,
             commands::set_fullscreen_keyboard_capture,
             commands::send_remote_text,
