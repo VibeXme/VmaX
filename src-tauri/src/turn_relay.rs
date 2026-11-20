@@ -96,7 +96,8 @@ pub(crate) fn is_public_peer(addr: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay_upgrade::RelayUpgrade;
+    use crate::relay_upgrade::{RelayUpgrade, UdpRoutes};
+    use crate::signaling::DatagramRoute;
     use tokio::sync::watch;
     use turn::{
         auth::StaticAuthHandler,
@@ -188,11 +189,15 @@ mod tests {
                 *peer_rx.wait_for(Option::is_some).await.unwrap(),
                 Some(turn_addr)
             );
-            relay
-                .conn()
-                .send_to(b"host media", peer_addr)
-                .await
-                .unwrap();
+            let routes = UdpRoutes {
+                direct: (None, watch::channel(None).1),
+                turn: (Some(relay.conn()), host_rx),
+            };
+            assert!(
+                tokio::spawn(async move { routes.try_send(b"host media").await })
+                    .await
+                    .unwrap()
+            );
             peer.send_to(b"peer input", turn_addr).await.unwrap();
             let mut packet = [0; 32];
             let size = peer_app.recv(&mut packet).await.unwrap();

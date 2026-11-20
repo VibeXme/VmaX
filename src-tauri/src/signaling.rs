@@ -365,6 +365,18 @@ pub struct PeerMatch {
     pub raw_udp: Option<bool>,
 }
 
+pub(crate) trait DatagramRoute: Send + Sync {
+    fn try_send(&self, packet: &[u8]) -> impl Future<Output = bool> + Send;
+}
+
+struct NoDatagramRoute;
+
+impl DatagramRoute for NoDatagramRoute {
+    async fn try_send(&self, _: &[u8]) -> bool {
+        false
+    }
+}
+
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_RELAY_PACKET: usize = 4096;
 const LAN_DISCOVERY_PORT: u16 = 8788;
@@ -559,13 +571,13 @@ impl RelayConnection {
     /// Relays opaque QUIC packets between a connected loopback socket and the paired WebSocket.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn forward(self, udp: tokio::net::UdpSocket) -> Result<(), SignalingError> {
-        self.forward_routes(&udp, async |_| false).await
+        self.forward_routes(&udp, NoDatagramRoute).await
     }
 
     pub(crate) async fn forward_routes(
         self,
         udp: &UdpSocket,
-        try_udp: impl AsyncFn(&[u8]) -> bool,
+        route: impl DatagramRoute,
     ) -> Result<(), SignalingError> {
         let (mut send, mut recv) = self.0.split();
         let mut buf = [0; MAX_RELAY_PACKET];
@@ -575,7 +587,7 @@ impl RelayConnection {
                     .recv(&mut buf)
                     .await
                     .map_err(tokio_tungstenite::tungstenite::Error::Io)?;
-                if try_udp(&buf[..len]).await {
+                if route.try_send(&buf[..len]).await {
                     continue;
                 }
                 send.send(Message::Binary(bytes::Bytes::copy_from_slice(&buf[..len])))

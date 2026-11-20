@@ -23,8 +23,32 @@ fn probe(key: &hmac::Key, side: u8, response: bool, nonce: [u8; 8]) -> [u8; PROB
     out
 }
 
+type RouteSocket = std::sync::Arc<dyn webrtc_util::Conn + Send + Sync>;
+
+pub(crate) struct UdpRoutes {
+    pub direct: (Option<RouteSocket>, watch::Receiver<Option<SocketAddr>>),
+    pub turn: (Option<RouteSocket>, watch::Receiver<Option<SocketAddr>>),
+}
+
+impl crate::signaling::DatagramRoute for UdpRoutes {
+    async fn try_send(&self, packet: &[u8]) -> bool {
+        for (socket, path) in [&self.direct, &self.turn] {
+            let address = *path.borrow();
+            if let (Some(socket), Some(address)) = (socket, address)
+                && matches!(
+                    tokio::time::timeout(Duration::from_millis(20), socket.send_to(packet, address)).await,
+                    Ok(Ok(_))
+                )
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 pub(crate) struct RelayUpgrade {
-    pub udp: std::sync::Arc<dyn webrtc_util::Conn + Send + Sync>,
+    pub udp: RouteSocket,
     pub candidates: Vec<SocketAddr>,
     pub fallback_candidate: Option<SocketAddr>,
     pub host: bool,

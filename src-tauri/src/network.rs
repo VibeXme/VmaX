@@ -1606,7 +1606,7 @@ async fn run_p2p_session(
         let probe_candidates = candidates.clone();
         let direct_candidates = candidates.clone();
         let task = RelayTask(tokio::spawn(async move {
-            use crate::relay_upgrade::RelayUpgrade;
+            use crate::relay_upgrade::{RelayUpgrade, UdpRoutes};
             use webrtc_util::Conn;
 
             let bridge = Arc::new(bridge);
@@ -1639,16 +1639,9 @@ async fn run_p2p_session(
                 }
                 std::future::pending::<()>().await;
             };
-            let forward = signaling.forward_routes(&bridge, async |packet| {
-                for (socket, path) in [(&udp, &relay_path_rx), (&turn_conn, &relay_turn_rx)] {
-                    let address = *path.borrow();
-                    if let (Some(socket), Some(address)) = (socket, address)
-                        && matches!(timeout(Duration::from_millis(20), socket.send_to(packet, address)).await, Ok(Ok(sent)) if sent == packet.len())
-                    {
-                        return true;
-                    }
-                }
-                false
+            let forward = signaling.forward_routes(&bridge, UdpRoutes {
+                direct: (udp.clone(), relay_path_rx),
+                turn: (turn_conn.clone(), relay_turn_rx),
             });
             tokio::select! {
                 _ = direct_receive => {}
