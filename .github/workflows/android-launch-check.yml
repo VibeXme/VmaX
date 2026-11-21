@@ -1,0 +1,52 @@
+name: Diagnose Android launch
+on:
+  push:
+    branches: [android-launch-check]
+permissions:
+  contents: read
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download released APK
+        run: curl -fLsS --retry 2 https://github.com/VibeXme/VmaX/releases/download/v5.3.10/VmaX-Android-arm64.apk -o VmaX.apk
+      - name: Run Android 11 emulator
+        run: |
+          set -e
+          test -e /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platform-tools' 'emulator' 'system-images;android-30;google_apis;x86_64'
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n vmax -k 'system-images;android-30;google_apis;x86_64'
+          "$ANDROID_HOME/emulator/emulator" -avd vmax -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -no-metrics >emulator.log 2>&1 &
+          adb="$ANDROID_HOME/platform-tools/adb"
+          timeout 150 "$adb" wait-for-device
+          timeout 180 bash -c 'while ! "$1" shell getprop sys.boot_completed | grep -q "^1"; do sleep 2; done' _ "$adb"
+          "$adb" shell input keyevent 82
+          "$adb" shell getprop ro.product.cpu.abilist
+          "$adb" install VmaX.apk
+          "$adb" logcat -c
+          timeout 35 "$adb" shell am start -W -n com.vmax.app/.MainActivity || true
+          sleep 10
+          "$adb" shell pidof com.vmax.app || true
+          "$adb" logcat -b crash -d >crash.log
+          "$adb" logcat -d >logcat.log
+          {
+            echo '### Android 11 startup'
+            echo '\`\`\`text'
+            grep -E 'FATAL EXCEPTION|NoSuchMethod|UnsatisfiedLink|Cannot start|signal [0-9]|com.vmax.app' crash.log | tail -45 || true
+            grep -Ei 'vmax|chromium.*error' logcat.log | tail -30 || true
+            echo '\`\`\`'
+          } >>"$GITHUB_STEP_SUMMARY"
+          result=$(grep -E 'FATAL EXCEPTION|NoSuchMethod|UnsatisfiedLink|Cannot start|signal [0-9]|com.vmax.app' crash.log | tail -20 | head -c 2500)
+          if [[ -n "$result" ]]; then
+            result=${result//'%'/'%25'}
+            result=${result//$'\n'/'%0A'}
+            echo "::error title=VmaX Android crash::$result"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-startup-logs
+          path: '*.log'
