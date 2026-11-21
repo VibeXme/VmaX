@@ -100,7 +100,17 @@ jobs:
           VMAX_ANDROID_KEY_ALIAS: ${{ secrets.VMAX_ANDROID_KEY_ALIAS }}
           VMAX_ANDROID_KEY_PASSWORD: ${{ secrets.VMAX_ANDROID_KEY_PASSWORD }}
         run: |
-          .\build_vmax_release.ps1 -SkipWindows -SkipInstaller
+          $log = Join-Path $env:RUNNER_TEMP 'vmax-android-build.log'
+          .\build_vmax_release.ps1 -SkipWindows -SkipInstaller 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status) {
+            $errors = Select-String -LiteralPath $log -Pattern 'Error:|failed|exception|unresolved reference' | Select-Object -Last 12
+            $summary = if ($errors) { ($errors.Line -join "`n") } else { (Get-Content $log -Tail 18) -join "`n" }
+            $summary = $summary.Substring(0, [Math]::Min($summary.Length, 3000))
+            $summary = $summary.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Android build failed::$summary"
+            exit $status
+          }
           if (-not (Test-Path 'VmaX-Android-arm64.apk')) {
             throw 'Android APK was not produced.'
           }
@@ -131,6 +141,7 @@ jobs:
           $notes = @'
           - Fix an Android startup crash caused by the release optimizer stripping native decoder callbacks.
           - Verify the required JNI entry points in the packaged Android APK before publishing.
+          - Keep startup keyframes alive long enough to finish at the negotiated bitrate and retry recovery when video stalls while the connection remains active.
           - Use native video presentation on supported Windows and Android devices, with capture and transport diagnostics in the HUD.
           - Auto transport probes LAN and IPv6 routes, uses paced Raw UDP with forward error correction where reachable, and falls back to WebRTC with TURN.
           - Host up to four players with an upload-aware shared bitrate budget, optional minimum-quality admission limits, and join and leave notifications.

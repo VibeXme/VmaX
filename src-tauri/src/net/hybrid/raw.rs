@@ -26,7 +26,8 @@ const BODY: usize = 1160 - HEADER - 24; // ciphertext and sequence number fit in
 const FRAME_INFO: usize = 1 + 8 + 4 + TELEMETRY_LEN;
 const GROUP: usize = 16;
 const MAX_SHARDS: usize = 4096;
-const KEYFRAME_AGE: Duration = Duration::from_millis(500);
+const KEYFRAME_AGE: Duration = Duration::from_secs(2);
+const KEYFRAME_PACING_MARGIN: Duration = Duration::from_millis(150);
 const DELTA_AGE: Duration = Duration::from_millis(35);
 const TICK: Duration = Duration::from_millis(3);
 
@@ -275,32 +276,37 @@ impl StreamTransport for RawLink {
         }
     }
 
-    async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<()> {
-        let deadline = frame.captured_at
-            + if frame.is_keyframe {
-                KEYFRAME_AGE
-            } else {
-                DELTA_AGE
-            };
-        if self.video.is_some() {
-            // Preserve a frame already being serialized. SP drops are signalled
-            // to this viewer, so it cannot decode across a missing reference.
-            self.input.push_back(Incoming::Keyframe);
-            return Ok(());
-        }
-        if deadline <= Instant::now() || frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
-            self.input.push_back(Incoming::Keyframe);
-            return Ok(());
+    async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<bool> {
+        if self.video.is_some() || frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
+            return Ok(false);
         }
         let wire_rate = crate::transport::paced_wire_rate(rate, 125).max(1);
         let spacing = Duration::from_secs_f64(1160.0 * 8.0 / f64::from(wire_rate));
+        let keyframe = frame.is_keyframe;
+        let captured_at = frame.captured_at;
+        if captured_at.elapsed() >= DELTA_AGE {
+            return Ok(false);
+        }
+        let shards = shards(frame)?;
+        let age = if keyframe {
+            // Include every FEC shard in the time budget while retaining the
+            // configured wire rate. Reject frames that cannot finish in time.
+            let needed = spacing * shards.len() as u32 + KEYFRAME_PACING_MARGIN;
+            if needed > KEYFRAME_AGE {
+                return Ok(false);
+            }
+            needed
+        } else {
+            DELTA_AGE
+        };
+        let deadline = captured_at + age;
         self.video = Some(Pending {
-            shards: shards(frame)?.into_iter(),
+            shards: shards.into_iter(),
             next: Instant::now(),
             deadline,
             spacing,
         });
-        Ok(())
+        Ok(true)
     }
 
     async fn send(&mut self, packet: Bytes) -> Result<()> {
@@ -494,6 +500,47 @@ struct Assembly {
 mod tests {
     use super::*;
     use crate::protocol::VideoCodec;
+
+    #[tokio::test]
+    async fn paced_join_keyframe_can_take_more_than_half_a_second() -> Result<()> {
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+        let sender_addr = sender.local_addr()?;
+        let receiver_addr = receiver.local_addr()?;
+        let (host, viewer) = tokio::try_join!(
+            RawLink::new(sender, receiver_addr, [1; 32], [2; 32], true),
+            RawLink::new(receiver, sender_addr, [2; 32], [1; 32], false),
+        )?;
+        let (mut host, mut viewer) = (host, viewer);
+        let payload = Bytes::from(vec![0x65; 450_000]);
+        let frame = OutboundVideoFrame {
+            meta: FrameTelemetry::full_range_hardware(2, 1920, 1080),
+            codec: VideoCodec::H264,
+            frame_id: 1,
+            timestamp_us: 0,
+            captured_at: Instant::now(),
+            fps: 60,
+            is_keyframe: true,
+            payload: payload.clone(),
+        };
+        assert!(host.video(frame, 4_000_000).await?);
+        let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    outgoing = host.next() => {
+                        assert!(!matches!(outgoing?, Incoming::Keyframe), "sender expired a paced keyframe");
+                    }
+                    incoming = viewer.next() => match incoming? {
+                        Incoming::Video(frame) => return Ok::<_, anyhow::Error>(frame),
+                        Incoming::Keyframe => bail!("viewer expired a paced keyframe"),
+                        Incoming::Packet(_) => {}
+                    }
+                }
+            }
+        }).await??;
+        assert_eq!(delivered.payload, payload);
+        Ok(())
+    }
 
     #[test]
     fn raw_shards_recover_two_lost_data_packets_per_full_group() -> Result<()> {

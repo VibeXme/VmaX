@@ -1,4 +1,4 @@
-import { copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
 
 const manifest = new URL(
   "../src-tauri/gen/android/app/src/main/AndroidManifest.xml",
@@ -48,3 +48,16 @@ if (!activitySource.includes(marker)) {
   writeFileSync(activity, updated);
 }
 copyFileSync(new URL("./VmaxLowLatencyDecoder.kt", import.meta.url), decoder);
+
+const proguard = new URL("../../proguard-rules.pro", manifest);
+const decoderRule = "-keep class com.vmax.app.VmaxLowLatencyDecoder {";
+if (!readFileSync(proguard, "utf8").includes(decoderRule)) {
+  appendFileSync(proguard, `
+# Rust resolves these static callbacks by their JVM names and descriptors.
+${decoderRule}
+    public static void onNativeVideoFrame(byte[], long, int, int, int, boolean);
+    public static void layoutSurface(int, int, int, int, boolean);
+    public static void resetSession();
+}
+`);
+}

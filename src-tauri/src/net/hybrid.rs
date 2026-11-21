@@ -38,6 +38,7 @@ const ALPN: &[u8] = b"vmax/hybrid/1";
 const BANDWIDTH_CODE: u32 = 429;
 const INVITE_PATH: &str = "/auto";
 const PLI_INTERVAL: Duration = Duration::from_millis(200);
+const VIDEO_SILENCE: Duration = Duration::from_secs(1);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const BUFFER: usize = 32;
 
@@ -67,7 +68,7 @@ trait StreamTransport: Send {
         &mut self,
         frame: OutboundVideoFrame,
         rate: u32,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<bool>> + Send;
     fn send(&mut self, packet: Bytes) -> impl Future<Output = Result<()>> + Send;
     fn next(&mut self) -> impl Future<Output = Result<Incoming>> + Send;
     fn take_video_packets(&mut self) -> u64;
@@ -374,7 +375,10 @@ impl Room {
             tokio::select! {
                 incoming = link.next() => {
                     match incoming? {
-                        Incoming::Keyframe => self.request_idr(&mut last_pli),
+                        Incoming::Keyframe => {
+                            waiting_for_keyframe = true;
+                            self.request_idr(&mut last_pli);
+                        }
                         Incoming::Packet(bytes) => {
                             last_seen = Instant::now();
                             self.receive(index, &mut link, bytes, &mut last_pli).await?;
@@ -397,9 +401,11 @@ impl Room {
                             waiting_for_keyframe = true;
                             self.request_idr(&mut last_pli);
                         } else {
-                            waiting_for_keyframe = false;
-                            last_frame = Some(frame.frame_id);
-                            link.video(frame, self.rate()).await?;
+                            let id = frame.frame_id;
+                            waiting_for_keyframe = !link.video(frame, self.rate()).await?;
+                            if !waiting_for_keyframe {
+                                last_frame = Some(id);
+                            }
                         }
                     }
                 }
@@ -827,6 +833,7 @@ async fn client_stream<T: StreamTransport>(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_seen = Instant::now();
+    let mut last_video = last_seen;
     let mut last_pli = None;
     let mut latest_frame = None;
     let mut waiting = true;
@@ -842,6 +849,7 @@ async fn client_stream<T: StreamTransport>(
             incoming = link.next() => match incoming? {
                 Incoming::Video(frame) => {
                     last_seen = Instant::now();
+                    window_bytes += frame.payload.len();
                     let newer = latest_frame.is_none_or(|last: u32| (frame.frame_id.wrapping_sub(last) as i32) > 0);
                     if !newer { continue; }
                     waiting |= latest_frame.is_some_and(|last: u32| frame.frame_id != last.wrapping_add(1));
@@ -851,8 +859,8 @@ async fn client_stream<T: StreamTransport>(
                         continue;
                     }
                     waiting = false;
+                    last_video = last_seen;
                     frames += 1;
-                    window_bytes += frame.payload.len();
                     recovered += u64::from(frame.fec_recovered_shards);
                     // The existing app receiver takes this slot on delivery.
                     let mut slot = pending.lock().unwrap();
@@ -896,6 +904,9 @@ async fn client_stream<T: StreamTransport>(
             }
             _ = tick.tick() => {
                 ensure!(last_seen.elapsed() < IDLE_TIMEOUT, "Host stopped responding");
+                if last_video.elapsed() >= VIDEO_SILENCE {
+                    waiting = true;
+                }
                 if waiting && last_pli.is_none_or(|time: Instant| time.elapsed() >= PLI_INTERVAL) {
                     last_pli = Some(Instant::now());
                     link.send(ControlMessage::RequestKeyframe { last_good_frame_id: None, reason: "viewer lost a reference".into() }.encode_datagram()?).await?;

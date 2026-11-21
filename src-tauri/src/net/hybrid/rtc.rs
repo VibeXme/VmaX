@@ -478,15 +478,17 @@ impl StreamTransport for RtcLink {
         self.path
     }
 
-    async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<()> {
-        let Some(mid) = self.video else { return Ok(()) };
+    async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<bool> {
+        let Some(mid) = self.video else {
+            return Ok(false);
+        };
         let codec = match frame.codec {
             VideoCodec::H264 => Codec::H264,
             VideoCodec::Hevc => Codec::H265,
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
         if !frame.is_keyframe && self.video_needs_sync {
-            return Ok(());
+            return Ok(false);
         }
         let queued = self
             .rtc
@@ -506,7 +508,7 @@ impl StreamTransport for RtcLink {
             {
                 self.queue.push_back(Incoming::Keyframe);
             }
-            return Ok(());
+            return Ok(false);
         }
         if self.configured_rate.abs_diff(rate) >= 100_000 {
             self.rtc
@@ -530,7 +532,7 @@ impl StreamTransport for RtcLink {
         )
         .await?;
         self.video_needs_sync = false;
-        Ok(())
+        Ok(true)
     }
 
     async fn send(&mut self, packet: Bytes) -> Result<()> {
@@ -544,7 +546,9 @@ impl StreamTransport for RtcLink {
                 .request_keyframe(None, KeyframeRequestKind::Pli)
                 .is_ok();
             self.drain().await?;
-            if requested {
+            // Before the first RTP arrives the reliable control channel can
+            // reach the host even if the receiver has no media SSRC yet.
+            if requested && self.received != 0 {
                 return Ok(());
             }
         }
