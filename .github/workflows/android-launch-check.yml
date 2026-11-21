@@ -7,10 +7,64 @@ permissions:
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
-      - name: Download released APK
-        run: curl -fLsS --retry 2 https://github.com/VibeXme/VmaX/releases/download/v5.3.10/VmaX-Android-arm64.apk -o VmaX.apk
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up the Android toolchain
+        shell: bash
+        run: |
+          rustup target add aarch64-linux-android
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$RUNNER_TEMP/android-sdk}}"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager" ]]; then
+            archive="$RUNNER_TEMP/android-cmdline-tools.zip"
+            curl --fail --location --retry 2 https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o "$archive"
+            unzip -q "$archive" -d "$RUNNER_TEMP/android-cli"
+            mv "$RUNNER_TEMP/android-cli/cmdline-tools" "$ANDROID_HOME/cmdline-tools/vmax"
+            sdkmanager="$ANDROID_HOME/cmdline-tools/vmax/bin/sdkmanager"
+          fi
+          yes | "$sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || test "${PIPESTATUS[1]}" = 0
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;29.0.14206865'
+          printf 'ANDROID_HOME=%s\n' "$ANDROID_HOME" >>"$GITHUB_ENV"
+          printf 'NDK_HOME=%s/ndk/29.0.14206865\n' "$ANDROID_HOME" >>"$GITHUB_ENV"
+          npm ci
+      - name: Build the Android ARM64 APK
+        run: |
+          npm run tauri -- android init --ci --skip-targets-install
+          npm run tauri -- android build --ci --apk --target aarch64 -- --locked
+      - name: Sign and verify the Android APK
+        shell: bash
+        env:
+          VMAX_ANDROID_KEYSTORE_BASE64: ${{ secrets.VMAX_ANDROID_KEYSTORE_BASE64 }}
+          VMAX_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.VMAX_ANDROID_KEYSTORE_PASSWORD }}
+          VMAX_ANDROID_KEY_ALIAS: ${{ secrets.VMAX_ANDROID_KEY_ALIAS }}
+          VMAX_ANDROID_KEY_PASSWORD: ${{ secrets.VMAX_ANDROID_KEY_PASSWORD }}
+        run: |
+          tools="$ANDROID_HOME/build-tools/37.0.0"
+          unsigned=src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          keystore=$(mktemp)
+          trap 'rm -f "$keystore"' EXIT
+          if [[ -n "$VMAX_ANDROID_KEYSTORE_BASE64" ]]; then
+            printf '%s' "$VMAX_ANDROID_KEYSTORE_BASE64" | base64 --decode >"$keystore"
+          else
+            rm -f "$keystore"
+            export VMAX_ANDROID_KEYSTORE_PASSWORD=android VMAX_ANDROID_KEY_PASSWORD=android VMAX_ANDROID_KEY_ALIAS=androiddebugkey
+            keytool -genkeypair -keystore "$keystore" -storepass:env VMAX_ANDROID_KEYSTORE_PASSWORD -keypass:env VMAX_ANDROID_KEY_PASSWORD -alias "$VMAX_ANDROID_KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=VmaX Android Development'
+          fi
+          "$tools/apksigner" sign --ks "$keystore" --ks-key-alias "$VMAX_ANDROID_KEY_ALIAS" --ks-pass env:VMAX_ANDROID_KEYSTORE_PASSWORD --key-pass env:VMAX_ANDROID_KEY_PASSWORD --out VmaX-Android-arm64.apk "$unsigned"
+          "$tools/apksigner" verify VmaX-Android-arm64.apk
+          "$tools/aapt" dump permissions VmaX-Android-arm64.apk > apk-permissions.txt
+          grep -F android.permission.CAMERA apk-permissions.txt
+          node tools/verify-android-decoder.mjs VmaX-Android-arm64.apk "$tools/dexdump"
       - name: Run Android 15 emulator
         run: |
           set -e
@@ -38,14 +92,14 @@ jobs:
           timeout 240 "$adb" wait-for-device
           echo "::notice title=Android emulator connected::Waiting for boot completion"
           timeout 420 bash -c 'while ! "$1" shell getprop sys.boot_completed | grep -q "^1"; do sleep 2; done' _ "$adb"
-          echo "::notice title=Android boot complete::Testing released APK"
+          echo "::notice title=Android boot complete::Testing v5.3.11 APK"
           "$adb" shell input keyevent 82
           "$adb" shell getprop ro.product.cpu.abilist
-          "$adb" install VmaX.apk
+          "$adb" install VmaX-Android-arm64.apk
           "$adb" logcat -c
           timeout 35 "$adb" shell am start -W -n com.vmax.app/.MainActivity || true
           sleep 10
-          "$adb" shell pidof com.vmax.app || true
+          app_pid=$("$adb" shell pidof com.vmax.app | tr -d "\r") || true
           "$adb" logcat -b crash -d >crash.log
           "$adb" logcat -d >logcat.log
           {
@@ -60,7 +114,12 @@ jobs:
             result=${result//'%'/'%25'}
             result=${result//$'\n'/'%0A'}
             echo "::error title=VmaX Android crash::$result"
+            exit 1
           fi
+          test -n "$app_pid"
+          "$adb" shell dumpsys activity activities >activity.log
+          grep -E "mResumedActivity.*com.vmax.app|topResumedActivity.*com.vmax.app" activity.log
+          echo "::notice title=Android launch passed::VmaX is running in the foreground on Android 15."
       - uses: actions/upload-artifact@v4
         if: always()
         with:
