@@ -2,7 +2,7 @@
 
 use crate::jitter_buffer::{BufferedFrame, JitterConsumer, JitterProducer};
 use crate::protocol::ReassembledFrame;
-use jni::objects::{GlobalRef, JObject, JValue};
+use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::sys::{JNI_FALSE, jboolean, jint};
 use jni::{JNIEnv, JavaVM};
 use std::collections::VecDeque;
@@ -162,27 +162,36 @@ pub fn set_native_route(active: bool) {
     NATIVE_ROUTE.store(active, Ordering::Relaxed);
 }
 
-pub fn layout_surface(layout: crate::native_d3d11::SurfaceLayout) -> Result<(), String> {
-    let Some(target) = lock(&TARGET).clone() else {
-        return Ok(());
-    };
-    let mut env = target
-        .vm
-        .attach_current_thread()
-        .map_err(|e| e.to_string())?;
-    let picture = layout.picture;
-    let result = env.call_static_method(
-        &target.class,
-        "layoutSurface",
-        "(IIIIZ)V",
-        &[
-            JValue::Int(picture.x),
-            JValue::Int(picture.y),
-            JValue::Int(picture.width),
-            JValue::Int(picture.height),
-            JValue::Bool(u8::from(layout.visible)),
-        ],
-    );
+pub fn layout_surface(
+    env: &mut JNIEnv<'_>,
+    activity: &JObject<'_>,
+    webview: &JObject<'_>,
+    layout: crate::native_d3d11::SurfaceLayout,
+) -> Result<(), String> {
+    let result = (|| {
+        let class_name = env.new_string(DECODER_CLASS.replace('/', "."))?;
+        let class = JClass::from(env.call_method(
+            activity,
+            "getAppClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[JValue::Object(&class_name)],
+        )?.l()?);
+        let picture = layout.picture;
+        env.call_static_method(
+            class,
+            "layoutSurface",
+            "(Landroid/app/Activity;Landroid/webkit/WebView;IIIIZ)V",
+            &[
+                JValue::Object(activity),
+                JValue::Object(webview),
+                JValue::Int(picture.x),
+                JValue::Int(picture.y),
+                JValue::Int(picture.width),
+                JValue::Int(picture.height),
+                JValue::Bool(u8::from(layout.visible)),
+            ],
+        )
+    })();
     if result.is_err() {
         let _ = env.exception_clear();
     }

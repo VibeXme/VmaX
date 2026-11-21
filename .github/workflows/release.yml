@@ -193,7 +193,8 @@ jobs:
             exit 0
           }
           $notes = @'
-          - Fix an Android startup crash caused by the release optimizer stripping native decoder callbacks.
+          - Open the Android lobby before creating the native video surface. MediaCodec starts when a viewer connects.
+          - Record Android startup and Rust panic diagnostics in logcat.
           - Verify the required JNI entry points in the packaged Android APK before publishing.
           - Keep startup keyframes alive long enough to finish at the negotiated bitrate and retry recovery when video stalls while the connection remains active.
           - Use native video presentation on supported Windows and Android devices, with capture and transport diagnostics in the HUD.

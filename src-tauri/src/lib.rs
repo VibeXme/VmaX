@@ -277,7 +277,29 @@ fn install_crash_handler() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "android")]
+fn android_startup_error(message: &str) {
+    use std::ffi::{CString, c_char, c_int};
+
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    if let Ok(text) = CString::new(message) {
+        // Android's logger copies the tag and text before this call returns.
+        unsafe { __android_log_write(6, c"VmaX".as_ptr(), text.as_ptr()) };
+    }
+}
+
+#[cfg(target_os = "android")]
+fn install_crash_handler() {
+    std::panic::set_hook(Box::new(|info| {
+        android_startup_error(&format!("Rust panic: {info}"));
+    }));
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 fn install_crash_handler() {
     std::panic::set_hook(Box::new(|info| {
         use std::fs::File;
@@ -457,6 +479,9 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "android")]
+    install_crash_handler();
+
     // Prime the Windows OS RNG before rustls/aws-lc-rs initializes its entropy
     // source, preventing a JitterEntropy panic on systems where the CNG RNG
     // has not yet been primed.
@@ -468,6 +493,7 @@ pub fn run() {
     signaling::ensure_rustls_provider();
 
     // Install crash logging for both Rust panics AND native Windows exceptions (access violations, etc.)
+    #[cfg(not(target_os = "android"))]
     install_crash_handler();
 
     // Latency must not depend on window focus: keep capture/encode and the
@@ -596,7 +622,11 @@ pub fn run() {
                 handle.state::<AppState>().stop_internet_on_exit();
             }
         }),
-        Err(err) => tracing::error!(error = %err, "error while running VmaX application"),
+        Err(err) => {
+            #[cfg(target_os = "android")]
+            android_startup_error(&format!("Could not start VmaX: {err}"));
+            tracing::error!(error = %err, "error while running VmaX application");
+        }
     }
 }
 
