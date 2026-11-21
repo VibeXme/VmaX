@@ -1,6 +1,9 @@
 //! Iroh endpoint and invitation setup for the VmaX session transport.
 
 pub(crate) mod client;
+pub(crate) mod hybrid;
+pub(crate) mod regional;
+pub(crate) mod regional_wire;
 pub(crate) mod control;
 pub(crate) mod host;
 mod input;

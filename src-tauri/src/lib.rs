@@ -27,7 +27,7 @@ pub mod nat_mobility;
 #[cfg(target_os = "windows")]
 pub mod native_client;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "android"))]
 pub mod native_d3d11;
 
 pub(crate) mod net;
@@ -578,10 +578,8 @@ pub fn run() {
 
             #[cfg(target_os = "windows")]
             commands::native_d3d11_backend_state,
-            #[cfg(target_os = "windows")]
-            commands::init_native_client_renderer,
-            #[cfg(target_os = "windows")]
-            commands::present_native_frame,
+            #[cfg(any(target_os = "windows", target_os = "android"))]
+            commands::layout_native_video,
 
             commands::start_host_opus_audio,
             commands::start_client_opus_audio,

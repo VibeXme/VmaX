@@ -107,6 +107,8 @@ Output: `VmaX-Android-arm64.apk`
 
 ## Internet relay
 
+For a regional **Auto** endpoint with room codes and authenticated TURN over UDP and TLS, use the [regional VPS deployment guide](deploy/server/README.md).
+
 VmaX prefers a direct QUIC path when the peers can establish one. For internet
 hosting, the Windows app can automatically select from configured VmaX
 WebSocket relays. It verifies bidirectional packet forwarding and ranks the

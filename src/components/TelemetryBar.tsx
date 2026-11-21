@@ -53,7 +53,7 @@ export function TelemetryBar({ visible }: { visible: boolean }) {
   const resolution = tick.width > 0 ? `${tick.width}x${tick.height}` : "—";
 
   return (
-    <div className="telemetry-bar" role="status" aria-live="off" data-idle={tick.idle}>
+    <div className="telemetry-bar" role="status" aria-live="off" data-idle={tick.idle} data-native-video-overlay>
       <span className="telemetry-bar-latency">
         Decode {formatMs(tick.decodeMs)}
       </span>

@@ -333,6 +333,8 @@ mod tests {
 
     fn frame(id: u32, arrival: Instant) -> BufferedFrame {
         BufferedFrame {
+            width: 1920,
+            height: 1080,
             frame_id: id,
             timestamp_us: u64::from(id) * 16_667,
             codec: 1,

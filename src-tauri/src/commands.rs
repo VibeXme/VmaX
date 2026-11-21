@@ -20,7 +20,7 @@ use crate::input::touch_gamepad::{TouchGamepad, TouchGamepadInput};
 use crate::input::{FrontendInputPayload, build_input_packet};
 
 #[cfg(target_os = "windows")]
-use crate::native_client::{NativeD3D11Renderer, SwapChainConfig, VideoCodec as NativeVideoCodec};
+use crate::native_client;
 
 use crate::network::{
     ConnectionPhase, CongestionSensitivity, NetworkConfig, NetworkEvent, NetworkTelemetry,
@@ -51,7 +51,7 @@ use url::Url;
 use windows::Win32::Foundation::HWND;
 
 fn default_protocol() -> String {
-    "quic".to_string()
+    "auto".to_string()
 }
 
 /// Smallest fraction of the configured pixel count the smoothness guard may
@@ -305,7 +305,7 @@ impl Default for VmaXSettingsPayload {
                 bitrate_kbps: default_audio_bitrate(),
             },
             network: NetworkSettingsPayload {
-                protocol: "quic".to_string(),
+                protocol: "auto".to_string(),
                 // Same path the UI ships: parity for the relayed case, one
                 // frame interval of reassembly slack, and congestion control
                 // that trades bitrate before it trades latency.
@@ -392,6 +392,7 @@ fn encoder_mode_from_u8(val: u8) -> EncoderModePreference {
 
 fn protocol_label(protocol: TransportProtocol) -> &'static str {
     match protocol {
+        TransportProtocol::Auto => "AUTO",
         TransportProtocol::Quic => "QUIC",
         TransportProtocol::RawUdp => "Raw UDP",
     }
@@ -469,6 +470,8 @@ pub struct AppState {
     session_lifecycle: Mutex<()>,
     active_forwarder: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     video_channel: Arc<StdMutex<Option<VideoDelivery>>>,
+    #[cfg(target_os = "windows")]
+    windows_viewer: StdMutex<Option<native_client::Viewer>>,
     client_codecs: Arc<StdMutex<Vec<VideoCodec>>>,
     client_display: Arc<StdMutex<Option<crate::handshake::ClientDisplay>>>,
     audio_denoise_flag: Arc<AtomicBool>,
@@ -503,6 +506,8 @@ impl Default for AppState {
             session_lifecycle: Mutex::new(()),
             active_forwarder: Mutex::new(None),
             video_channel: Arc::new(StdMutex::new(None)),
+            #[cfg(target_os = "windows")]
+            windows_viewer: StdMutex::new(None),
             client_codecs: Arc::new(StdMutex::new(vec![VideoCodec::H264])),
             client_display: Arc::default(),
             audio_denoise_flag: Arc::new(AtomicBool::new(true)),
@@ -535,6 +540,7 @@ fn emit_packet_log(app: &AppHandle, channel: &str, direction: &str, summary: Str
 
 fn parse_transport_protocol(raw: &str) -> TransportProtocol {
     match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => TransportProtocol::Auto,
         "raw_udp" | "raw-udp" | "udp" => TransportProtocol::RawUdp,
         _ => TransportProtocol::Quic,
     }
@@ -576,6 +582,8 @@ fn build_network_config(effective_signaling: String, params: &StartSessionParams
         fixed_bitrate: params.unlimited_bitrate,
         strict_upload_bps: (role == SessionRole::Host && params.strict_quality)
             .then(|| crate::bitrate::upload_share(params.host_upload_mbps, 1)),
+        upload_budget_bps: (role == SessionRole::Host)
+            .then(|| crate::bitrate::upload_share(params.host_upload_mbps.max(1), 1)),
         fec_group_size: map_fec_group_size(params.fec_redundancy_pct),
         congestion_sensitivity: params.congestion_sensitivity,
         ..Default::default()
@@ -1419,7 +1427,7 @@ struct EventForwarderContext {
     playback_sink: Option<Arc<StdMutex<Option<AudioPlaybackHandle>>>>,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct NativeVideoState {
     pub active: bool,
     pub width: Option<u32>,
@@ -1427,7 +1435,11 @@ pub struct NativeVideoState {
 }
 
 #[tauri::command]
-pub fn native_video_state() -> NativeVideoState {
+pub fn native_video_state(_state: State<'_, AppState>) -> NativeVideoState {
+    #[cfg(target_os = "windows")]
+    {
+        windows_native_state(windows_playback(&_state))
+    }
     #[cfg(target_os = "android")]
     {
         let (width, height) = match crate::android_jni::video_size() {
@@ -1440,7 +1452,7 @@ pub fn native_video_state() -> NativeVideoState {
             height,
         }
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "windows")))]
     {
         NativeVideoState {
             active: false,
@@ -1450,12 +1462,26 @@ pub fn native_video_state() -> NativeVideoState {
     }
 }
 
-/// Reports the Windows renderer policy without claiming that the WebView
-/// channel has already been replaced by a native decoder.
+#[cfg(target_os = "windows")]
+fn windows_playback(state: &AppState) -> native_client::Playback {
+    state.windows_viewer.lock().unwrap().as_ref()
+        .map(native_client::Viewer::playback).unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_state(playback: native_client::Playback) -> NativeVideoState {
+    let size = playback.size.filter(|_| !playback.failed);
+    NativeVideoState {
+        active: size.is_some(),
+        width: size.map(|(width, _)| width),
+        height: size.map(|(_, height)| height),
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[tauri::command]
-pub fn native_d3d11_backend_state() -> crate::native_d3d11::NativeD3D11BackendState {
-    crate::native_d3d11::state()
+pub fn native_d3d11_backend_state(state: State<'_, AppState>) -> crate::native_d3d11::NativeD3D11BackendState {
+    crate::native_d3d11::state(windows_native_state(windows_playback(&state)).active)
 }
 
 fn register_session<'a>(
@@ -1479,6 +1505,12 @@ fn register_session<'a>(
             #[cfg(target_os = "windows")]
             let mut gamepad: Option<HostGamepad> = None;
             #[cfg(target_os = "windows")]
+            let mut player_pads: [Option<HostGamepad>; crate::net::host::MAX_PLAYERS] = Default::default();
+            #[cfg(target_os = "windows")]
+            let mut player_ports = [None; crate::net::host::MAX_PLAYERS];
+            #[cfg(target_os = "windows")]
+            let mut player_rumble = [crate::haptics::Rumble::default(); crate::net::host::MAX_PLAYERS];
+            #[cfg(target_os = "windows")]
             let mut reported_port = None;
             #[cfg(target_os = "windows")]
             let mut last_pad_reconnect: Option<Instant> = None;
@@ -1499,6 +1531,10 @@ fn register_session<'a>(
                 crate::capture::reset_client_decode_latency();
             }
             let mut client_has_video = false;
+            #[cfg(target_os = "windows")]
+            let mut last_windows_playback = native_client::Playback::default();
+            #[cfg(target_os = "windows")]
+            let mut windows_sample = (Instant::now(), 0u64, last_windows_playback);
             #[cfg(target_os = "android")]
             let mut native_video_route: Option<bool> = None;
             #[cfg(target_os = "android")]
@@ -1525,6 +1561,17 @@ fn register_session<'a>(
                         let settings = haptics.get();
                         #[cfg(target_os = "windows")]
                         if let Some(host) = ctx.host_controls.as_ref() {
+                            if let Some(group) = session_tx.hybrid.as_ref() {
+                                for (slot, pad) in player_pads.iter().enumerate() {
+                                    let motors = if settings.enabled && host.effective_guest_input() & GUEST_CONTROLLER != 0 {
+                                        pad.as_ref().map_or(Rumble::default(), HostGamepad::rumble).scaled(settings.intensity)
+                                    } else { Rumble::default() };
+                                    if motors != Rumble::default() || player_rumble[slot] != motors {
+                                        group.rumble(slot, motors);
+                                        player_rumble[slot] = motors;
+                                    }
+                                }
+                            }
                             let motors = if settings.enabled && host.effective_guest_input() & GUEST_CONTROLLER != 0 {
                                 gamepad.as_ref().map_or(Rumble::default(), HostGamepad::rumble).scaled(settings.intensity)
                             } else { Rumble::default() };
@@ -1567,6 +1614,21 @@ fn register_session<'a>(
                         #[cfg(target_os = "windows")]
                         if let Some(host) = ctx.host_controls.as_ref() {
                             let allowed = host.effective_guest_input();
+                            if let Some(group) = session_tx.hybrid.as_ref() {
+                                for (slot, pad) in player_pads.iter_mut().enumerate() {
+                                    let port = if allowed & GUEST_CONTROLLER != 0 {
+                                        pad.as_mut().and_then(HostGamepad::windows_port)
+                                    } else {
+                                        if let Some(pad) = pad.as_mut() { let _ = pad.neutralize(); }
+                                        None
+                                    };
+                                    if port != player_ports[slot] {
+                                        group.control(slot, ControlMessage::GamepadPort { port });
+                                        player_ports[slot] = port;
+                                    }
+                                    if let Some(pad) = pad.as_mut() { let _ = pad.expire(); }
+                                }
+                            }
                             let port = if allowed & GUEST_CONTROLLER != 0 {
                                 gamepad.as_mut().and_then(HostGamepad::windows_port)
                             } else {
@@ -1635,12 +1697,43 @@ fn register_session<'a>(
                                 .unwrap_or(0);
                             #[cfg(target_os = "android")]
                             let decoder_drops = bridge_drops.saturating_add(crate::android_jni::backlog_drops());
-                            #[cfg(not(target_os = "android"))]
+                            #[cfg(target_os = "windows")]
+                            let decoder_drops = bridge_drops.saturating_add(windows_playback(&ctx.app.state::<AppState>()).dropped);
+                            #[cfg(not(any(target_os = "android", target_os = "windows")))]
                             let decoder_drops = bridge_drops;
                             let _ = ctx.app.emit("vmax://decoder-queue-drops", decoder_drops);
                             let elapsed = last_client_telemetry.elapsed().as_secs_f32().max(0.001);
                             #[allow(unused_mut)]
                             let mut displayed_frames = client_fps_frames;
+                            #[cfg(target_os = "windows")]
+                            {
+                                let playback = windows_playback(&ctx.app.state::<AppState>());
+                                let native = windows_native_state(playback);
+                                if native != windows_native_state(last_windows_playback) {
+                                    let _ = ctx.app.emit("vmax://native-video", native);
+                                }
+                                if playback.failed && !last_windows_playback.failed {
+                                    let _ = session_tx.control_tx.try_send(ControlMessage::RequestKeyframe {
+                                        last_good_frame_id: None,
+                                        reason: "Windows decoder switched to WebCodecs".into(),
+                                    });
+                                }
+                                if native.active {
+                                    displayed_frames = playback.presented.saturating_sub(last_windows_playback.presented) as u32;
+                                    let seconds = windows_sample.0.elapsed().as_secs_f64();
+                                    if seconds >= 1.0 {
+                                        tracing::info!(
+                                            recv_pkts = snapshot.video_packets_rx.saturating_sub(windows_sample.1),
+                                            dec_fps = (playback.decoded.saturating_sub(windows_sample.2.decoded) as f64 / seconds).round() as u32,
+                                            render_fps = (playback.presented.saturating_sub(windows_sample.2.presented) as f64 / seconds).round() as u32,
+                                            rtt = snapshot.rtt_ms, path = ?snapshot.connection_path, "CLIENT");
+                                        windows_sample = (Instant::now(), snapshot.video_packets_rx, playback);
+                                    }
+                                } else {
+                                    windows_sample = (Instant::now(), snapshot.video_packets_rx, playback);
+                                }
+                                last_windows_playback = playback;
+                            }
                             #[cfg(target_os = "android")]
                             {
                                 let count = crate::android_jni::rendered_frames();
@@ -1693,6 +1786,29 @@ fn register_session<'a>(
                     NetworkEvent::InviteReady { .. } => {
                         emit_packet_log(&ctx.app, "SIGNAL", "LOCAL", "Invite ready".into());
                     }
+                    NetworkEvent::PlayerPresence(presence) => {
+                        let _ = ctx.app.emit(crate::net::host::PLAYER_PRESENCE_EVENT, presence);
+                        #[cfg(target_os = "windows")]
+                        if !presence.joined {
+                            player_pads[presence.slot] = None;
+                            player_ports[presence.slot] = None;
+                            player_rumble[presence.slot] = Rumble::default();
+                            if presence.slot == 0 {
+                                held_inputs = HeldRemoteInputs::default();
+                            }
+                        }
+                    }
+                    NetworkEvent::PlayerControl { slot, message } => {
+                        #[cfg(target_os = "windows")]
+                        if matches!(message, ControlMessage::ReconnectGamepad)
+                            && let Some(pad) = player_pads.get_mut(slot).and_then(Option::as_mut)
+                        {
+                            pad.reconnect();
+                            player_ports[slot] = None;
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = (slot, message);
+                    }
                     NetworkEvent::PhaseChanged(phase) => {
                         emit_packet_log(
                             &ctx.app,
@@ -1701,7 +1817,7 @@ fn register_session<'a>(
                             format!("Phase -> {phase:?}"),
                         );
                         let is_live = phase == ConnectionPhase::Connected;
-                        if ctx.role == SessionRole::Host && guest_connected != is_live {
+                        if ctx.role == SessionRole::Host && session_tx.hybrid.is_none() && guest_connected != is_live {
                             guest_connected = is_live;
                             let _ = ctx.app.emit(
                                 "vmax://player-presence",
@@ -1709,7 +1825,7 @@ fn register_session<'a>(
                             );
                         }
                         #[cfg(target_os = "windows")]
-                        if ctx.role == SessionRole::Host {
+                        if ctx.role == SessionRole::Host && session_tx.hybrid.is_none() {
                             gamepad = is_live.then(HostGamepad::default);
                             reported_port = None;
                             last_pad_reconnect = None;
@@ -1802,6 +1918,21 @@ fn register_session<'a>(
                         }
 
                         let native_video = {
+                            #[cfg(target_os = "windows")]
+                            {
+                                let state = ctx.app.state::<AppState>();
+                                let viewer = state.windows_viewer.lock().unwrap();
+                                ctx.role == SessionRole::Client && viewer.as_ref().is_some_and(|viewer| {
+                                    let accepted = viewer.offer(&frame);
+                                    if accepted && viewer.take_keyframe_request() {
+                                        let _ = session_tx.control_tx.try_send(ControlMessage::RequestKeyframe {
+                                            last_good_frame_id: None,
+                                            reason: "Windows decoder lost a reference frame".into(),
+                                        });
+                                    }
+                                    accepted
+                                })
+                            }
                             #[cfg(target_os = "android")]
                             {
                                 if ctx.role == SessionRole::Client {
@@ -1828,7 +1959,7 @@ fn register_session<'a>(
                                     false
                                 }
                             }
-                            #[cfg(not(target_os = "android"))]
+                            #[cfg(not(any(target_os = "android", target_os = "windows")))]
                             {
                                 false
                             }
@@ -1913,7 +2044,17 @@ fn register_session<'a>(
                             );
                         }
                     }
-                    NetworkEvent::InputEventReceived(pkt) => {
+                    input @ (NetworkEvent::InputEventReceived(_) | NetworkEvent::PlayerInput { .. }) => {
+                        let (slot, pkt) = match input {
+                            NetworkEvent::PlayerInput { slot, packet } => (Some(slot), packet),
+                            NetworkEvent::InputEventReceived(packet) => (None, packet),
+                            _ => unreachable!(),
+                        };
+                        // A Windows desktop only has one keyboard and pointer.
+                        // The first seat owns those devices. Controllers are per seat.
+                        if slot.is_some_and(|slot| slot != 0) && !matches!(pkt.event, InputEvent::GamepadState { .. }) {
+                            continue;
+                        }
                         if ctx.host_controls.as_ref().is_some_and(|host| {
                             host.effective_guest_input() & guest_input_category(&pkt.event) == 0
                         }) {
@@ -1956,7 +2097,11 @@ fn register_session<'a>(
                             }
                             #[cfg(target_os = "windows")]
                             if matches!(pkt.event, InputEvent::GamepadState { .. }) {
-                                let pad = gamepad.get_or_insert_with(HostGamepad::default);
+                                let pad = if let Some(slot) = slot {
+                                    player_pads[slot].get_or_insert_with(HostGamepad::default)
+                                } else {
+                                    gamepad.get_or_insert_with(HostGamepad::default)
+                                };
                                 if let Err(err) = pad.receive(&pkt).await {
                                     emit_packet_log(&ctx.app, "INPUT", "ERROR", err);
                                 }
@@ -2112,7 +2257,7 @@ fn register_session<'a>(
             if ctx.role == SessionRole::Client {
                 haptics::deliver_android(Rumble::default(), false);
             }
-            if ctx.role == SessionRole::Host {
+            if ctx.role == SessionRole::Host && session_tx.hybrid.is_none() {
                 if guest_connected {
                     let _ = ctx.app.emit(
                         "vmax://player-presence",
@@ -2429,7 +2574,9 @@ async fn start_host_session_internal(
         return Err(crate::network::BANDWIDTH_FULL.into());
     }
     let profile_endpoint = normalize_endpoint(&params.signaling_url)?;
-    if params.relay_only && !profile_endpoint.starts_with("wss://") {
+    let auto = parse_transport_protocol(&params.protocol) == TransportProtocol::Auto
+        && !saved_only.unwrap_or(false) && invited_client.is_none();
+    if params.relay_only && !auto && !profile_endpoint.starts_with("wss://") {
         return Err("Relay-only hosting requires a wss:// VmaX relay endpoint.".into());
     }
     let saved_clients = if saved_only.unwrap_or(false) {
@@ -2461,11 +2608,13 @@ async fn start_host_session_internal(
     let tunnel_origin: Option<String> = None;
     let managed_tunnel = tunnel_origin.is_some();
     let effective_signaling = match tunnel_origin {
+        _ if auto => params.signaling_url.clone(),
         Some(origin) => origin,
         None => ensure_local_relay_if_local(&app, state, &params.signaling_url).await?,
     };
 
     let mut cfg = build_network_config(effective_signaling, &params, SessionRole::Host);
+    cfg.host_codec = Some(codec);
     cfg.relay_only = params.relay_only;
     cfg.identity_file = Some(identity_file);
     cfg.profile_endpoint = Some(profile_endpoint);
@@ -2481,10 +2630,10 @@ async fn start_host_session_internal(
         None
     };
     cfg.host_room_code = room_code.clone();
-    if managed_tunnel
+    if !auto && (managed_tunnel
         || cfg.saved_clients.is_some()
         || cfg.invited_client.is_some()
-        || cfg.relay_only
+        || cfg.relay_only)
     {
         cfg.protocol = TransportProtocol::Quic;
     }
@@ -2597,7 +2746,7 @@ async fn start_host_session_internal(
     }
     state
         .host_auto_rehost
-        .store(invited_client.is_none(), Ordering::Release);
+        .store(invited_client.is_none() && !auto, Ordering::Release);
 
     register_session(
         handle,
@@ -2707,6 +2856,7 @@ pub async fn join_session(
         .as_ref()
         .map_or_else(|| params.signaling_url.clone(), |device| device.0.clone());
     let mut cfg = build_network_config(endpoint, &params, SessionRole::Client);
+    cfg.viewer_codecs = state.client_codecs.lock().ok().map(|codecs| codecs.clone()).unwrap_or_default();
     cfg.identity_file = Some(identity_file);
     if device.is_some() {
         cfg.protocol = TransportProtocol::Quic;
@@ -2764,14 +2914,16 @@ pub async fn join_session(
 
 async fn stop_active_internal(state: &AppState) {
     state.touch_gamepad.set(None);
+    if let Some(forwarder) = state.active_forwarder.lock().await.take() {
+        forwarder.abort();
+        let _ = forwarder.await;
+    }
+    #[cfg(target_os = "windows")]
+    state.windows_viewer.lock().unwrap().take();
     #[cfg(target_os = "android")]
     {
         crate::android_jni::reset_route();
         crate::haptics::deliver_android(crate::haptics::Rumble::default(), false);
-    }
-    if let Some(forwarder) = state.active_forwarder.lock().await.take() {
-        forwarder.abort();
-        let _ = forwarder.await;
     }
     if let Some(tx) = state.active_tx.lock().await.take() {
         tx.close();
@@ -3196,13 +3348,31 @@ pub async fn scan_lan_hosts() -> Result<Vec<DiscoveredHost>, String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+pub struct RelayTest {
+    elapsed_ms: u32,
+    media_forwarded: bool,
+}
+
 #[tauri::command]
-pub async fn test_media_relay(endpoint: String) -> Result<u32, String> {
+pub async fn test_media_relay(endpoint: String) -> Result<RelayTest, String> {
+    if let Some(url) = crate::net::regional::endpoint(&endpoint) {
+        let started = Instant::now();
+        crate::net::regional::probe(&url)
+            .await.map_err(|error| error.to_string())?;
+        return Ok(RelayTest {
+            elapsed_ms: started.elapsed().as_millis() as u32,
+            media_forwarded: false,
+        });
+    }
     let endpoint = crate::signaling::validate_signaling_url(endpoint.trim())
         .map_err(|error| error.to_string())?;
     crate::relay_probe::check(endpoint.as_str())
         .await
-        .map(|elapsed| elapsed.as_millis() as u32)
+        .map(|elapsed| RelayTest {
+            elapsed_ms: elapsed.as_millis() as u32,
+            media_forwarded: true,
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -3484,12 +3654,15 @@ pub async fn report_client_capabilities(
     let mut normalized = codecs;
     #[cfg(target_os = "android")]
     let display = display.map(|mut display| {
-        display.max_refresh_hz = crate::haptics::android_refresh_hz();
+        let refresh_hz = crate::haptics::android_refresh_hz();
+        if refresh_hz != 0 {
+            display.max_refresh_hz = refresh_hz;
+        }
         if native_decoder.unwrap_or(true) {
-            if crate::haptics::android_hevc() && !normalized.contains(&VideoCodec::Hevc) {
+            if crate::android_jni::supports(VideoCodec::Hevc) && !normalized.contains(&VideoCodec::Hevc) {
                 normalized.insert(0, VideoCodec::Hevc);
             }
-            display.hevc_main10 |= crate::haptics::android_main10();
+            display.hevc_main10 |= crate::android_jni::supports(VideoCodec::HevcMain10);
         }
         display
     });
@@ -3642,6 +3815,14 @@ pub async fn update_settings(
         tx.set_fec_group_size(fec_group);
         let budget = session_video_budget(settings.video.bitrate_mbps, settings.video.host_upload_mbps, tx.role);
         tx.set_bitrate_policy(budget, settings.video.unlimited_bitrate);
+        if let Some(host) = tx.hybrid.as_ref() {
+            host.update_budget(
+                budget,
+                crate::bitrate::upload_share(settings.video.host_upload_mbps.max(1), 1),
+                settings.video.unlimited_bitrate,
+                settings.video.strict_quality,
+            );
+        }
     }
 
     let mut applied_live = false;
@@ -3794,79 +3975,53 @@ pub async fn send_probe_packet(
     Ok(())
 }
 
-/// Native D3D11 client renderer state
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeD3D11VideoState {
-    pub available: bool,
-    pub active: bool,
-    pub width: u32,
-    pub height: u32,
-    pub codec: String,
-    pub sharpness: f32,
-    pub full_range: bool,
-}
-
-/// Initialize the native D3D11 client renderer
-#[tauri::command]
-pub async fn init_native_client_renderer(
-    hwnd: u64,
-    width: u32,
-    height: u32,
-    codec: String,
-) -> Result<NativeD3D11VideoState, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let hwnd = HWND(hwnd as *mut c_void);
-        let config = SwapChainConfig { width, height, hwnd };
-        let mut renderer = NativeD3D11Renderer::new(config)?;
-        
-        let native_codec = match codec.as_str() {
-            "h264" => NativeVideoCodec::H264,
-            "hevc" => NativeVideoCodec::Hevc,
-            "hevc_main10" => NativeVideoCodec::HevcMain10,
-            "av1" => NativeVideoCodec::Av1,
-            _ => NativeVideoCodec::H264,
-        };
-        renderer.set_codec(native_codec)?;
-        
-        Ok(NativeD3D11VideoState {
-            available: true,
-            active: true,
-            width,
-            height,
-            codec,
-            sharpness: 0.45,
-            full_range: true,
-        })
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (hwnd, width, height, codec);
-        Ok(NativeD3D11VideoState {
-            available: false,
-            active: false,
-            width: 0,
-            height: 0,
-            codec: String::new(),
-            sharpness: 0.0,
-            full_range: false,
-        })
-    }
-}
-
-/// Present a decoded frame via native D3D11 renderer
 #[cfg(target_os = "windows")]
 #[tauri::command]
-pub async fn present_native_frame(
+pub async fn layout_native_video(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
-    frame_id: u64,
-    timestamp_us: u64,
-    is_keyframe: bool,
-    nal_data: Vec<u8>,
+    layout: crate::native_d3d11::SurfaceLayout,
 ) -> Result<(), String> {
-    let _ = (state, frame_id, timestamp_us, is_keyframe, nal_data);
+    let _session = state.session_lifecycle.lock().await;
+    let Some(tx) = state.active_tx.lock().await.clone().filter(|tx| tx.role == SessionRole::Client) else {
+        return Ok(());
+    };
+    let app = window.app_handle().clone();
+    let main = window.clone();
+    let (reply, result) = tokio::sync::oneshot::channel();
+    window.run_on_main_thread(move || {
+        let result: Result<bool, String> = (|| {
+            let state = app.state::<AppState>();
+            let mut slot = state.windows_viewer.lock().unwrap();
+            let mut created = false;
+            if layout.visible && slot.is_none() {
+                let hwnd = main.hwnd().map_err(|e| e.to_string())?;
+                *slot = Some(native_client::Viewer::new(HWND(hwnd.0))?);
+                created = true;
+            }
+            if let Some(viewer) = slot.as_ref() {
+                if let Err(error) = viewer.layout(layout) {
+                    slot.take();
+                    return Err(error);
+                }
+            }
+            Ok(created)
+        })();
+        let _ = reply.send(result);
+    }).map_err(|e| e.to_string())?;
+    if result.await.map_err(|e| e.to_string())?? {
+        let _ = tx.control_tx.try_send(ControlMessage::RequestKeyframe {
+            last_good_frame_id: None,
+            reason: "Windows native viewer attached".into(),
+        });
+    }
     Ok(())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn layout_native_video(layout: crate::native_d3d11::SurfaceLayout) -> Result<(), String> {
+    crate::android_jni::layout_surface(layout)
 }
 
 /// Start Opus audio capture on host

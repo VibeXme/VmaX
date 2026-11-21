@@ -72,7 +72,7 @@ export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
     bitrateKbps: 192,
   },
   network: {
-    protocol: "quic",
+    protocol: "auto",
     // Parity shards are cheap insurance on the relayed path, where one lost
     // packet is a TCP retransmit stall rather than an isolated datagram.
     fecRedundancyPct: 5,
@@ -114,7 +114,7 @@ function asAudioBitrate(val: unknown, fallback: AudioBitrateKbps): AudioBitrateK
 }
 
 function asProtocol(val: unknown, fallback: TransportProtocol): TransportProtocol {
-  return val === "quic" || val === "raw_udp" ? val : fallback;
+  return val === "auto" || val === "quic" || val === "raw_udp" ? val : fallback;
 }
 
 function asGraphicsBackend(val: unknown, fallback: GraphicsBackend): GraphicsBackend {

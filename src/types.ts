@@ -1,11 +1,13 @@
 export type SessionRole = "host" | "client";
-export type ConnectionPath = "direct_lan" | "direct_internet" | "turn" | "relay";
+export type ConnectionPath = "direct_lan" | "lan_raw_udp" | "direct_raw_udp" | "direct_internet" | "turn" | "relay";
 
 export function connectionPathLabel(path: ConnectionPath | null | undefined, relayed: boolean) {
   if (path === "turn") return "UDP Relay";
   if (relayed || path === "relay") return "Relay";
   if (path === "direct_lan") return "Direct LAN";
-  if (path === "direct_internet") return "Direct Internet";
+  if (path === "lan_raw_udp") return "LAN Raw UDP";
+  if (path === "direct_raw_udp") return "Direct P2P";
+  if (path === "direct_internet") return "Direct P2P";
   return "Direct";
 }
 
@@ -36,6 +38,8 @@ export interface NetworkTelemetry {
   active_peer_addr: string | null;
   relayed: boolean;
   connection_path?: ConnectionPath | null;
+  active_players?: number;
+  player_slot?: number | null;
   saved_session: boolean;
   peer_savable: boolean;
   cert_fingerprint: string | null;
@@ -150,7 +154,7 @@ export type FramerateOption = 30 | 60 | 90 | 120 | 144;
 export type EncoderMode = "hardware" | "software";
 export type FramePacing = "balanced" | "motion" | "detail";
 export type AudioBitrateKbps = 96 | 128 | 192 | 320;
-export type TransportProtocol = "quic" | "raw_udp";
+export type TransportProtocol = "auto" | "quic" | "raw_udp";
 
 export type UpscalingMode =
   | "off"

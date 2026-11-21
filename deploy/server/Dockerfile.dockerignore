@@ -1,0 +1,13 @@
+**
+!relay-server/
+!relay-server/Cargo.toml
+!relay-server/Cargo.lock
+!relay-server/src/
+!relay-server/src/**
+!src-tauri/
+!src-tauri/src/
+!src-tauri/src/signaling.rs
+!src-tauri/src/stun.rs
+!src-tauri/src/vmax_relay_ice.rs
+!src-tauri/src/net/
+!src-tauri/src/net/regional_wire.rs

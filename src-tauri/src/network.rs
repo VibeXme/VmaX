@@ -148,6 +148,8 @@ fn bind_media_socket(address: SocketAddr, public_signaling: bool) -> io::Result<
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionPath {
     DirectLan,
+    LanRawUdp,
+    DirectRawUdp,
     DirectInternet,
     Turn,
     Relay,
@@ -206,6 +208,8 @@ pub enum NetworkError {
     Permission(String),
     #[error("session cancelled")]
     Cancelled,
+    #[error("{0}")]
+    Hybrid(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +235,7 @@ pub enum ConnectionPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportProtocol {
+    Auto,
     Quic,
     RawUdp,
 }
@@ -267,6 +272,12 @@ pub struct NetworkConfig {
     pub fixed_bitrate: bool,
     #[serde(default)]
     pub strict_upload_bps: Option<u32>,
+    #[serde(default)]
+    pub upload_budget_bps: Option<u32>,
+    #[serde(skip)]
+    pub host_codec: Option<VideoCodec>,
+    #[serde(skip)]
+    pub viewer_codecs: Vec<VideoCodec>,
     pub fec_group_size: u8,
     pub protocol: TransportProtocol,
     pub target_fps: u16,
@@ -302,6 +313,9 @@ impl Default for NetworkConfig {
             initial_bitrate_bps: DEFAULT_INITIAL_BITRATE_BPS,
             fixed_bitrate: false,
             strict_upload_bps: None,
+            upload_budget_bps: None,
+            host_codec: None,
+            viewer_codecs: Vec::new(),
             fec_group_size: DEFAULT_FEC_GROUP_SIZE,
             protocol: TransportProtocol::Quic,
             target_fps: 60,
@@ -333,6 +347,10 @@ pub struct NetworkTelemetry {
     pub relayed: bool,
     #[serde(default)]
     pub connection_path: Option<ConnectionPath>,
+    #[serde(default)]
+    pub active_players: u8,
+    #[serde(default)]
+    pub player_slot: Option<u8>,
     #[serde(default)]
     pub saved_session: bool,
     #[serde(default)]
@@ -374,6 +392,8 @@ impl Default for NetworkTelemetry {
             active_peer_addr: None,
             relayed: false,
             connection_path: None,
+            active_players: 0,
+            player_slot: None,
             saved_session: false,
             peer_savable: false,
             trusted_peer: None,
@@ -456,6 +476,9 @@ pub enum NetworkEvent {
     VideoFramePending(Arc<std::sync::Mutex<Option<ReassembledFrame>>>),
     AudioPacketReceived(AudioPacket),
     InputEventReceived(InputPacket),
+    PlayerInput { slot: usize, packet: InputPacket },
+    PlayerPresence(crate::net::host::PlayerPresence),
+    PlayerControl { slot: usize, message: ControlMessage },
     RumbleReceived(crate::haptics::Rumble),
     KeyframeRequested {
         last_good_frame_id: Option<u32>,
@@ -554,6 +577,10 @@ impl VideoBacklog {
         self.pacer.sent_packets() + self.raw_video_packets.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn note_raw_packets(&self, sent: u64) {
+        self.raw_video_packets.fetch_add(sent, Ordering::Relaxed);
+    }
+
     /// Bytes queued between the pacer and the wire.
     pub fn queued_bytes(&self) -> u64 {
         self.pacer.queued_bytes() + self.quic_bytes.load(Ordering::Relaxed)
@@ -590,6 +617,7 @@ pub struct SessionTx {
     pub haptics_tx: watch::Sender<crate::haptics::Rumble>,
     shutdown_tx: watch::Sender<bool>,
     overrides: RuntimeOverrides,
+    pub(crate) hybrid: Option<crate::net::hybrid::HostControl>,
 }
 
 impl SessionTx {
@@ -618,7 +646,7 @@ impl SessionTx {
     /// Live view of the video send queue. The host capture thread holds one to
     /// stop encoding frames the wire cannot carry yet.
     pub fn video_backlog(&self) -> VideoBacklog {
-        self.overrides.backlog.clone()
+        self.hybrid.as_ref().map_or_else(|| self.overrides.backlog.clone(), |host| host.backlog())
     }
 }
 
@@ -1092,8 +1120,21 @@ pub async fn start_host_session(config: NetworkConfig) -> Result<SessionHandle, 
 
 pub async fn start_client_session(
     mut config: NetworkConfig,
-    invite_input: String,
+    mut invite_input: String,
 ) -> Result<SessionHandle, NetworkError> {
+    if crate::net::regional::is_code(&invite_input)
+        && let Some(url) = crate::net::regional::endpoint(&config.signaling_url)
+    {
+        invite_input = crate::net::regional::lookup(&url, &invite_input)
+            .await.map_err(|error| NetworkError::Hybrid(error.to_string()))?;
+    }
+    if crate::net::hybrid::is_invite(&invite_input) {
+        config.protocol = TransportProtocol::Auto;
+        return spawn_session_with_hybrid(SessionRole::Client, config, invite_input).await;
+    }
+    if config.protocol == TransportProtocol::Auto {
+        config.protocol = TransportProtocol::Quic;
+    }
     let parsed = parse_invite_input(&invite_input, &config.signaling_url)?;
     if let Some(raw_udp) = parsed.raw_udp {
         config.protocol = if raw_udp {
@@ -1133,8 +1174,25 @@ pub async fn start_saved_client_session(
 
 async fn spawn_session(
     role: SessionRole,
+    config: NetworkConfig,
+    invite: Option<ParsedInvite>,
+) -> Result<SessionHandle, NetworkError> {
+    spawn_session_inner(role, config, invite, None).await
+}
+
+async fn spawn_session_with_hybrid(
+    role: SessionRole,
+    config: NetworkConfig,
+    invite: String,
+) -> Result<SessionHandle, NetworkError> {
+    spawn_session_inner(role, config, None, Some(invite)).await
+}
+
+async fn spawn_session_inner(
+    role: SessionRole,
     mut config: NetworkConfig,
     invite: Option<ParsedInvite>,
+    hybrid_invite: Option<String>,
 ) -> Result<SessionHandle, NetworkError> {
     crate::signaling::ensure_rustls_provider();
 
@@ -1175,6 +1233,9 @@ async fn spawn_session(
     };
     let loop_overrides = overrides.clone();
 
+    let hybrid = (role == SessionRole::Host && config.protocol == TransportProtocol::Auto)
+        .then(|| crate::net::hybrid::HostControl::new(&config));
+    let hybrid_host = hybrid.clone();
     let tx_handle = SessionTx {
         role,
         video_tx: VideoSender(video_tx),
@@ -1184,10 +1245,15 @@ async fn spawn_session(
         haptics_tx,
         shutdown_tx,
         overrides,
+        hybrid,
     };
 
     let join_handle = tokio::spawn(async move {
-        let res = run_p2p_session(
+        let res = if let Some(host) = hybrid_host {
+            crate::net::hybrid::run_host(host, config, video_rx, audio_rx, control_rx, event_tx.clone(), telemetry_ref.clone(), shutdown_rx).await
+        } else if let Some(invite) = hybrid_invite {
+            crate::net::hybrid::run_client(config, invite, input_rx, control_rx, event_tx.clone(), telemetry_ref.clone(), shutdown_rx).await
+        } else { run_p2p_session(
             role,
             config,
             invite,
@@ -1201,7 +1267,7 @@ async fn spawn_session(
             shutdown_rx,
             loop_overrides,
         )
-        .await;
+        .await };
 
         if let Err(ref err) = res {
             let mut guard = telemetry_ref.lock().await;
@@ -1221,7 +1287,7 @@ async fn spawn_session(
     })
 }
 
-async fn set_phase(
+pub(crate) async fn set_phase(
     phase: ConnectionPhase,
     telemetry: &Arc<Mutex<NetworkTelemetry>>,
     event_tx: &mpsc::UnboundedSender<NetworkEvent>,
@@ -3106,7 +3172,8 @@ async fn run_raw_udp_loop(
                         }
                     }
                     Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                    // A queued ICMP error can arrive before a final disconnect datagram.
+                    Err(e) if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused) => continue,
                     Err(e) => return Err(NetworkError::Io(e)),
                 }
             }

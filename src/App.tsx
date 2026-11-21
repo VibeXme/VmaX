@@ -162,8 +162,10 @@ export function App() {
     setRelayTesting(true);
     setRelayTestResult(null);
     try {
-      const elapsed = await invoke<number>("test_media_relay", { endpoint: signalingUrl });
-      setRelayTestResult(`Packets forwarded in both directions · ${elapsed} ms round trip from this device`);
+      const result = await invoke<{ elapsed_ms: number; media_forwarded: boolean }>("test_media_relay", { endpoint: signalingUrl });
+      setRelayTestResult(result.media_forwarded
+        ? `Packets forwarded in both directions · ${result.elapsed_ms} ms round trip from this device`
+        : `Regional signaling reached in ${result.elapsed_ms} ms`);
     } catch (error) {
       setRelayTestResult(`Relay test failed. ${String(error)}`);
     } finally {
@@ -513,7 +515,8 @@ export function App() {
     const revision = telemetryRevision.current;
     try {
       let endpoint = savedEndpoint;
-      if (!endpoint) {
+      const auto = !endpoint && config.network.protocol === "auto";
+      if (!endpoint && !auto) {
         endpoint = await invoke<string>("prepare_internet", {
           preferredRelay: /^wss:\/\//i.test(signalingUrl.trim()) ? signalingUrl.trim() : null,
           additionalRelays: saved.networks.map((network) => network.endpoint),
@@ -524,8 +527,7 @@ export function App() {
       const snap = await invoke<NetworkTelemetry>("start_host_session", {
         params: {
           ...params,
-          protocol: savedEndpoint ? params.protocol : "quic",
-          relay_only: relayOnly && /^wss:\/\//i.test(params.signaling_url),
+          relay_only: relayOnly && (auto || /^wss:\/\//i.test(params.signaling_url)),
         },
         savedOnly: !!savedEndpoint,
       });
@@ -1051,7 +1053,7 @@ export function App() {
                   <label htmlFor="vmax-endpoint">Relay address</label>
                   <input id="vmax-endpoint" value={signalingUrl} onChange={(event) => { chooseSignalingUrl(event.target.value); setRelayTestResult(null); }} disabled={busy || isSessionActive || relayTesting} placeholder="ws://127.0.0.1:8787" />
                   <button type="button" className="vmax-secondary" disabled={busy || isSessionActive || relayTesting || !signalingUrl.trim()}
-                    onClick={() => void testRelay()}>{relayTesting ? "Testing relay…" : "Test media relay"}</button>
+                    onClick={() => void testRelay()}>{relayTesting ? "Testing relay…" : "Test relay"}</button>
                   {relayTestResult && <p className="vmax-status" role="status">{relayTestResult}</p>}
                   <button type="button" className="vmax-secondary" disabled={busy || isSessionActive} onClick={() => { chooseSignalingUrl(DEFAULT_SIGNALING_URL); setRelayOnly(false); }}>Use local Wi-Fi or hotspot</button>
                   {page === "sessions" && mode === "host" && (

@@ -471,6 +471,24 @@ pub mod win {
         }
 
         pub(crate) fn scale(&self, src_tex: &ID3D11Texture2D) -> Result<(), String> {
+            self.scale_slice(src_tex, 0)
+        }
+
+        pub(crate) fn set_yuv_input(&self, full_range: bool) -> Result<(), String> {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+            let context = self.video_context.cast::<ID3D11VideoContext1>()
+                .map_err(|error| error.to_string())?;
+            unsafe {
+                context.VideoProcessorSetStreamColorSpace1(
+                    &self.processor, 0,
+                    if full_range { DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 }
+                    else { DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709 },
+                );
+            }
+            Ok(())
+        }
+
+        pub(crate) fn scale_slice(&self, src_tex: &ID3D11Texture2D, slice: u32) -> Result<(), String> {
             let src_res: ID3D11Resource = src_tex
                 .cast()
                 .map_err(|e| format!("src_tex cast failed: {e}"))?;
@@ -478,7 +496,10 @@ pub mod win {
                 FourCC: 0,
                 ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
                 Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                    Texture2D: Default::default(),
+                    Texture2D: windows::Win32::Graphics::Direct3D11::D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: slice,
+                    },
                 },
             };
             let mut in_view: Option<ID3D11VideoProcessorInputView> = None;

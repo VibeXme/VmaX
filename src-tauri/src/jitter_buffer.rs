@@ -32,6 +32,8 @@ pub struct BufferedFrame {
     pub frame_id: u32,
     pub timestamp_us: u64,
     pub codec: u8,
+    pub width: u16,
+    pub height: u16,
     pub is_keyframe: bool,
     pub arrival: Instant,
     pub payload: Bytes,
@@ -463,6 +465,8 @@ mod tests {
 
     fn frame(id: u32, arrival: Instant, key: bool) -> BufferedFrame {
         BufferedFrame {
+            width: 1920,
+            height: 1080,
             frame_id: id,
             timestamp_us: u64::from(id) * 16_667,
             codec: 1,

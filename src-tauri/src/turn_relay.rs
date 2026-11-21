@@ -6,6 +6,8 @@ use tokio::{net::UdpSocket, time::timeout};
 use turn::client::{Client, ClientConfig};
 use url::Url;
 use webrtc_util::Conn;
+#[path = "turn_tls.rs"]
+mod turn_tls;
 
 const ALLOCATION_TIMEOUT: Duration = Duration::from_millis(1500);
 const CLOUDFLARE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -141,6 +143,38 @@ pub(crate) struct TurnRelay {
 }
 
 impl TurnRelay {
+    pub(crate) async fn regional(
+        domain: &str,
+        udp_port: u16,
+        tls_port: u16,
+        username: String,
+        password: String,
+    ) -> Option<Self> {
+        if let Some(relay) = timeout(
+            ALLOCATION_TIMEOUT,
+            Self::allocate(
+                format!("{domain}:{udp_port}"),
+                username.clone(),
+                password.clone(),
+            ),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        {
+            return Some(relay);
+        }
+
+        timeout(Duration::from_secs(3), async {
+            let conn = turn_tls::TlsConn::connect(domain, tls_port).await?;
+            let addr = conn.remote_addr().expect("TLS TURN connection has a peer");
+            Self::allocate_on(addr.to_string(), username, password, Arc::new(conn)).await
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+    }
+
     pub(crate) async fn configured() -> Option<Self> {
         if let (Ok(key_id), Ok(token)) = (
             std::env::var("VMAX_CLOUDFLARE_TURN_KEY_ID"),
@@ -187,6 +221,15 @@ impl TurnRelay {
 
     async fn allocate(server: String, username: String, password: String) -> io::Result<Self> {
         let conn = UdpSocket::bind("0.0.0.0:0").await?;
+        Self::allocate_on(server, username, password, Arc::new(conn)).await
+    }
+
+    async fn allocate_on(
+        server: String,
+        username: String,
+        password: String,
+        conn: Arc<dyn Conn + Send + Sync>,
+    ) -> io::Result<Self> {
         let client = Client::new(ClientConfig {
             stun_serv_addr: server.clone(),
             turn_serv_addr: server,
@@ -195,7 +238,7 @@ impl TurnRelay {
             realm: String::new(),
             software: String::new(),
             rto_in_ms: 0,
-            conn: Arc::new(conn),
+            conn,
             vnet: None,
         })
         .await

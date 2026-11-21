@@ -1,0 +1,66 @@
+name: vmax-regional
+
+services:
+  signaling:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      VMAX_REGIONAL_BIND: 127.0.0.1:8788
+      VMAX_REGIONAL_TOKEN_FILE: /run/secrets/regional_host_token
+      VMAX_TURN_SECRET_FILE: /run/secrets/turn_secret
+      VMAX_TURN_DOMAIN: ${VMAX_TURN_DOMAIN:?set the TURN domain}
+      VMAX_TURN_TTL_SECONDS: ${VMAX_TURN_TTL_SECONDS:-14400}
+      RUST_LOG: info
+    secrets: [regional_host_token, turn_secret]
+
+  coturn:
+    image: coturn/coturn:4.8.0
+    network_mode: host
+    restart: unless-stopped
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    entrypoint: ["/bin/sh", "/etc/vmax/run-coturn.sh"]
+    environment:
+      VMAX_TURN_DOMAIN: ${VMAX_TURN_DOMAIN:?set the TURN domain}
+      VMAX_PUBLIC_IPV4: ${VMAX_PUBLIC_IPV4:?set the public IPv4 address}
+      VMAX_PRIVATE_IPV4: ${VMAX_PRIVATE_IPV4:?set the interface IPv4 address}
+    tmpfs:
+      - /run/vmax:mode=0700
+      - /tmp
+    volumes:
+      - ./turnserver.conf:/etc/vmax/turnserver.conf:ro
+      - ./run-coturn.sh:/etc/vmax/run-coturn.sh:ro
+      - ./certs:/run/vmax-certs:ro
+    secrets: [turn_secret]
+
+  ingress:
+    image: haproxy:3.2-alpine
+    network_mode: host
+    restart: unless-stopped
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    environment:
+      VMAX_SIGNAL_DOMAIN: ${VMAX_SIGNAL_DOMAIN:?set the signaling domain}
+      VMAX_TURN_DOMAIN: ${VMAX_TURN_DOMAIN:?set the TURN domain}
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./certs:/run/vmax-certs:ro
+    depends_on: [signaling, coturn]
+
+secrets:
+  regional_host_token:
+    file: ./secrets/regional-host-token
+  turn_secret:
+    file: ./secrets/turn-secret

@@ -44,8 +44,10 @@ export function HostingDashboard({ telemetry, hardware, pingSamples, config, log
   const connected = telemetry.phase === "connected";
   const [inputError, setInputError] = useState("");
   const [updatingInput, setUpdatingInput] = useState(false);
-  const invite = telemetry.phase === "waiting_for_peer" && !telemetry.saved_session ? telemetry.invite_uri : null;
-  const internet = new URLSearchParams(invite?.split("?")[1]).get("sig")?.startsWith("wss://");
+  const auto = telemetry.invite_uri?.startsWith("vmax://join/auto?") ?? false;
+  const invite = (telemetry.phase === "waiting_for_peer" || (auto && connected)) && !telemetry.saved_session
+    ? telemetry.invite_uri : null;
+  const internet = auto || new URLSearchParams(invite?.split("?")[1]).get("sig")?.startsWith("wss://");
 
   async function copy(value: string, kind: "link" | "code") {
     try {
@@ -62,7 +64,7 @@ export function HostingDashboard({ telemetry, hardware, pingSamples, config, log
         <div className="vmax-session-head">
           <div className="vmax-intro">
             <div className="vmax-symbol"><Radio size={21} /></div>
-            <div><h1>Hosting</h1><p role="status">{PHASE_LABEL[telemetry.phase]}</p></div>
+            <div><h1>Hosting</h1><p role="status">{auto && connected ? `${telemetry.active_players ?? 0}/4 players connected` : PHASE_LABEL[telemetry.phase]}</p></div>
           </div>
           <div className="vmax-chip-row">
             {onOpenFriends && <button type="button" className="vmax-secondary" onClick={onOpenFriends}><Users size={16} /> Friends</button>}
@@ -75,6 +77,7 @@ export function HostingDashboard({ telemetry, hardware, pingSamples, config, log
         {connected && (
           <fieldset className="vmax-form" disabled={updatingInput}>
             <legend>Guest input</legend>
+            {auto && <p className="vmax-status">Player 1 uses the keyboard and mouse. Each player has a separate controller slot.</p>}
             <div className="vmax-chip-row">
               {(["keyboard", "mouse", "controller"] as const).map((device) => (
                 <label key={device} className="vmax-secondary capitalize">
@@ -107,7 +110,7 @@ export function HostingDashboard({ telemetry, hardware, pingSamples, config, log
                 {copyState === "link" ? <Check size={16} /> : <Copy size={16} />}
                 {copyState === "link" ? "Copied" : "Copy full invite link"}
               </button>
-              {!internet && telemetry.room_code && <button type="button" className="vmax-secondary" aria-label="Copy room code" onClick={() => void copy(telemetry.room_code!, "code")}>
+              {(!internet || auto) && telemetry.room_code && <button type="button" className="vmax-secondary" aria-label="Copy room code" onClick={() => void copy(telemetry.room_code!, "code")}>
                 {copyState === "code" ? "Code copied" : telemetry.room_code}
               </button>}
               {copyState === "failed" && <p className="vmax-status" role="status">Select the link and copy it manually.</p>}

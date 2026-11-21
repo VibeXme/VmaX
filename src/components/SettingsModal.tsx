@@ -748,19 +748,21 @@ export function SettingsModal({
                 <div className="space-y-3.5">
                   <SettingRow
                     title="Protocol"
-                    hint="Encrypted multi-stream QUIC vs low-overhead Raw UDP"
+                    hint="Auto uses Raw UDP when a direct probe succeeds and WebRTC otherwise."
                   >
-                    <BinaryToggle
-                      checked={config.network.protocol === "quic"}
-                      offLabel="Raw UDP"
-                      onLabel="QUIC"
-                      ariaLabel="Toggle protocol between QUIC and Raw UDP"
-                      onToggle={() =>
-                        onUpdateNetwork({
-                          protocol:
-                            config.network.protocol === "quic" ? "raw_udp" : "quic",
-                        })
-                      }
+                    <SelectControl
+                      id="vmax-transport"
+                      ariaLabel="Transport protocol"
+                      value={config.network.protocol}
+                      options={[
+                        { value: "auto", label: "Auto (Best Connection)" },
+                        { value: "quic", label: "Legacy QUIC" },
+                        { value: "raw_udp", label: "Legacy Raw UDP" },
+                      ]}
+                      onChangeValue={(protocol) => {
+                        if (protocol === "auto" || protocol === "quic" || protocol === "raw_udp")
+                          onUpdateNetwork({ protocol });
+                      }}
                     />
                   </SettingRow>
 

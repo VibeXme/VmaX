@@ -7,6 +7,9 @@ mod signaling;
 mod stun;
 #[path = "../../src-tauri/src/vmax_relay_ice.rs"]
 mod vmax_relay_ice;
+mod regional;
+#[path = "../../src-tauri/src/net/regional_wire.rs"]
+mod regional_wire;
 
 #[cfg(test)]
 #[path = "../../src-tauri/src/relay_probe.rs"]
@@ -17,6 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if let Ok(bind) = std::env::var("VMAX_REGIONAL_BIND") {
+        return regional::run(&bind).await;
+    }
     let port = std::env::var("VMAX_RELAY_PORT")
         .map(|value| value.parse::<u16>())
         .unwrap_or(Ok(8787))?;

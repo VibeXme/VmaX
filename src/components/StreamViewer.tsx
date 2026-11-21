@@ -399,6 +399,7 @@ export function StreamViewer({
   const [pointerLocked, setPointerLocked] = useState(false);
   const [pointerLockError, setPointerLockError] = useState("");
   const windowsClient = /Windows/.test(navigator.userAgent) && hasTauriRuntime();
+  const androidClient = /Android/i.test(navigator.userAgent) && hasTauriRuntime();
   const [releaseKey, setReleaseKey] = useState(savedReleaseKey);
   const [keyboardCapture, setKeyboardCapture] = useState(false);
   const [captureError, setCaptureError] = useState("");
@@ -500,6 +501,11 @@ export function StreamViewer({
       setHasFirstFrame(true);
       if (state.width && state.height) {
         setStreamSize({ w: state.width, h: state.height });
+        const canvas = canvasRef.current;
+        if (canvas) {
+          if (canvas.width !== state.width) canvas.width = state.width;
+          if (canvas.height !== state.height) canvas.height = state.height;
+        }
       }
     };
     let routeEventSeen = false;
@@ -525,6 +531,56 @@ export function StreamViewer({
       void stop.then((unlisten) => unlisten()).catch(() => {});
     };
   }, []);
+
+  useEffect(() => {
+    if (!windowsClient && !androidClient) return;
+    let lastLayout = "";
+    let disposed = false;
+    let inFlight = false;
+    const update = () => {
+      const canvas = canvasRef.current;
+      if (!canvas || disposed || inFlight) return;
+      const bounds = getVideoBounds(canvas);
+      if (!bounds) return;
+      const scale = window.devicePixelRatio || 1;
+      const pixels = (x: number, y: number, width: number, height: number) => ({
+        x: Math.round(x * scale),
+        y: Math.round(y * scale),
+        width: Math.round((x + width) * scale) - Math.round(x * scale),
+        height: Math.round((y + height) * scale) - Math.round(y * scale),
+      });
+      const controls = windowsClient
+        ? Array.from(document.querySelectorAll("[data-stream-controls], [data-native-video-overlay]"))
+            .map((element) => element.getBoundingClientRect())
+            .filter((rect) => rect.width > 0 && rect.height > 0)
+            .map((rect) => pixels(rect.x, rect.y, rect.width, rect.height))
+        : [];
+      const layout = {
+        picture: pixels(bounds.rect.x + bounds.x, bounds.rect.y + bounds.y, bounds.width, bounds.height),
+        controls,
+        visible: connected && !document.hidden &&
+          (windowsClient ? !inputBlocked : nativeVideoRef.current),
+      };
+      const key = JSON.stringify([layout, nativeVideoRef.current]);
+      if (key === lastLayout) return;
+      inFlight = true;
+      lastLayout = key;
+      void invoke("layout_native_video", { layout }).catch((error) => {
+        console.warn("Native video layout failed", error);
+      }).finally(() => { inFlight = false; });
+    };
+    const observer = new ResizeObserver(update);
+    if (canvasRef.current) observer.observe(canvasRef.current);
+    const timer = window.setInterval(update, 100);
+    document.addEventListener("visibilitychange", update);
+    update();
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [windowsClient, androidClient, connected, inputBlocked]);
 
   useEffect(() => {
     if (!fullscreen || !connected || inputBlocked) releaseKeyboardCapture();
