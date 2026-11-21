@@ -14,14 +14,26 @@ jobs:
       - name: Run Android 15 emulator
         run: |
           set -e
-          trap 'if [ -f emulator.log ]; then report=$(tail -n 18 emulator.log | head -c 1800); report=${report//$'\n'/'%0A'}; echo "::notice title=Emulator log tail::$report"; fi' EXIT
+          report_failure() {
+            if [[ -f emulator.log ]]; then
+              report=$(tail -n 25 emulator.log | tr "\n" " " | head -c 2400)
+              echo "::error title=Android emulator output::$report"
+            fi
+          }
+          trap report_failure ERR
           test -e /dev/kvm
           sudo chmod a+rw /dev/kvm
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n vmax -k 'system-images;android-35;google_apis;x86_64'
-          "$ANDROID_HOME/emulator/emulator" -avd vmax -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -feature -Vulkan -skip-adb-auth -no-metrics >emulator.log 2>&1 &
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
           adb="$ANDROID_HOME/platform-tools/adb"
+          "$adb" start-server
+          "$ANDROID_HOME/emulator/emulator" -accel-check
+          "$ANDROID_HOME/emulator/emulator" -avd vmax -port 5554 -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -feature -Vulkan -skip-adb-auth -no-metrics >emulator.log 2>&1 &
+          emulator_pid=$!
+          sleep 8
+          kill -0 "$emulator_pid"
           echo "::notice title=Android emulator started::Waiting for ADB"
           timeout 240 "$adb" wait-for-device
           echo "::notice title=Android emulator connected::Waiting for boot completion"
