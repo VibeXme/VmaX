@@ -52,7 +52,6 @@ jobs:
         shell: pwsh
         run: |
           rustup target add x86_64-pc-windows-msvc
-          rustup target add aarch64-linux-android
 
       - name: Fetch and verify required Windows tunnel helper
         shell: pwsh
@@ -92,32 +91,74 @@ jobs:
           if (-not (Test-Path $exe)) { throw "Windows executable was not produced at $exe" }
           Copy-Item -LiteralPath $exe -Destination 'VmaX.exe' -Force
 
-      - name: Build Android ARM64 APK
-        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmax-windows
+          path: VmaX.exe
+          if-no-files-found: error
+
+  android-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up the Android toolchain
+        run: |
+          rustup target add aarch64-linux-android
+          sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;29.0.14206865'
+          printf 'NDK_HOME=%s/ndk/29.0.14206865\n' "$ANDROID_HOME" >>"$GITHUB_ENV"
+          npm ci
+      - name: Build the Android ARM64 APK
+        run: |
+          npm run tauri -- android init --ci --skip-targets-install
+          npm run tauri -- android build --ci --apk --target aarch64 -- --locked
+      - name: Sign and verify the Android APK
+        shell: bash
         env:
           VMAX_ANDROID_KEYSTORE_BASE64: ${{ secrets.VMAX_ANDROID_KEYSTORE_BASE64 }}
           VMAX_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.VMAX_ANDROID_KEYSTORE_PASSWORD }}
           VMAX_ANDROID_KEY_ALIAS: ${{ secrets.VMAX_ANDROID_KEY_ALIAS }}
           VMAX_ANDROID_KEY_PASSWORD: ${{ secrets.VMAX_ANDROID_KEY_PASSWORD }}
         run: |
-          $log = Join-Path $env:RUNNER_TEMP 'vmax-android-build.log'
-          .\build_vmax_release.ps1 -SkipWindows -SkipInstaller 2>&1 | Tee-Object -FilePath $log
-          $status = $LASTEXITCODE
-          if ($status) {
-            $errors = Select-String -LiteralPath $log -Pattern 'Error:|failed|exception|unresolved reference' | Select-Object -Last 12
-            $summary = if ($errors) { ($errors.Line -join "`n") } else { (Get-Content $log -Tail 18) -join "`n" }
-            $summary = $summary.Substring(0, [Math]::Min($summary.Length, 3000))
-            $summary = $summary.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
-            Write-Output "::error title=Android build failed::$summary"
-            exit $status
-          }
-          if (-not (Test-Path 'VmaX-Android-arm64.apk')) {
-            throw 'Android APK was not produced.'
-          }
+          tools="$ANDROID_HOME/build-tools/37.0.0"
+          unsigned=src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk
+          keystore=$(mktemp)
+          trap 'rm -f "$keystore"' EXIT
+          if [[ -n "$VMAX_ANDROID_KEYSTORE_BASE64" ]]; then
+            printf '%s' "$VMAX_ANDROID_KEYSTORE_BASE64" | base64 --decode >"$keystore"
+          else
+            rm -f "$keystore"
+            export VMAX_ANDROID_KEYSTORE_PASSWORD=android VMAX_ANDROID_KEY_PASSWORD=android VMAX_ANDROID_KEY_ALIAS=androiddebugkey
+            keytool -genkeypair -keystore "$keystore" -storepass:env VMAX_ANDROID_KEYSTORE_PASSWORD -keypass:env VMAX_ANDROID_KEY_PASSWORD -alias "$VMAX_ANDROID_KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=VmaX Android Development'
+          fi
+          "$tools/apksigner" sign --ks "$keystore" --ks-key-alias "$VMAX_ANDROID_KEY_ALIAS" --ks-pass env:VMAX_ANDROID_KEYSTORE_PASSWORD --key-pass env:VMAX_ANDROID_KEY_PASSWORD --out VmaX-Android-arm64.apk "$unsigned"
+          "$tools/apksigner" verify VmaX-Android-arm64.apk
+          "$tools/aapt" dump permissions VmaX-Android-arm64.apk > apk-permissions.txt
+          grep -F android.permission.CAMERA apk-permissions.txt
+          node tools/verify-android-decoder.mjs VmaX-Android-arm64.apk "$tools/dexdump"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmax-android
+          path: VmaX-Android-arm64.apk
+          if-no-files-found: error
 
+  publish-prerelease:
+    needs: [relay-tests, rebuild-release-binaries, android-apk]
+    if: github.repository == 'VibeXme/VmaX' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: vmax-relay-linux
+          merge-multiple: true
 
       - name: Verify release files
         shell: pwsh
