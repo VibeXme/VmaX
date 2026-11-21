@@ -26,7 +26,7 @@ jobs:
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'
           echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n vmax -k 'system-images;android-35;google_apis;x86_64'
-          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          avd_ini=$(find "$HOME" "${ANDROID_USER_HOME:-$HOME/.android}" "$RUNNER_TEMP" -name vmax.ini -print -quit 2>/dev/null); test -f "$avd_ini"; export ANDROID_AVD_HOME="$(dirname "$avd_ini")"
           adb="$ANDROID_HOME/platform-tools/adb"
           "$adb" start-server
           "$ANDROID_HOME/emulator/emulator" -accel-check
