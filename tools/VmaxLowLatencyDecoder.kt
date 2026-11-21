@@ -17,7 +17,10 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.webkit.WebView
 import android.widget.FrameLayout
+import androidx.annotation.Keep
 
+// Rust resolves the class and its static callbacks by their exact JVM names.
+@Keep
 object VmaxLowLatencyDecoder {
     private data class Format(val mime: String, val width: Int, val height: Int, val profile: Int)
 

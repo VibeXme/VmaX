@@ -246,7 +246,20 @@ function Build-Android {
     if (-not $buildTools) { throw 'Android SDK Build-Tools with apksigner are required.' }
 
     $apksigner = Join-Path $buildTools.FullName 'apksigner.bat'
-    if ($apk.Name -like '*-unsigned.apk') {
+    if ($env:VMAX_ANDROID_KEYSTORE_BASE64) {
+        if (-not ($env:VMAX_ANDROID_KEYSTORE_PASSWORD -and $env:VMAX_ANDROID_KEY_ALIAS -and $env:VMAX_ANDROID_KEY_PASSWORD)) {
+            throw 'Set the Android release keystore password, key alias, and key password.'
+        }
+        $keyFile = New-TemporaryFile
+        try {
+            [IO.File]::WriteAllBytes($keyFile.FullName, [Convert]::FromBase64String($env:VMAX_ANDROID_KEYSTORE_BASE64))
+            $signed = Join-Path $apkDir 'vmax-local-signed.apk'
+            & $apksigner sign --ks $keyFile.FullName --ks-key-alias $env:VMAX_ANDROID_KEY_ALIAS --ks-pass env:VMAX_ANDROID_KEYSTORE_PASSWORD --key-pass env:VMAX_ANDROID_KEY_PASSWORD --out $signed $apk.FullName
+            if ($LASTEXITCODE) { throw 'APK release signing failed.' }
+        } finally {
+            Remove-Item -LiteralPath $keyFile.FullName -Force
+        }
+    } elseif ($apk.Name -like '*-unsigned.apk') {
         $keyDir = Join-Path $env:LOCALAPPDATA 'VmaX\android-build'
         New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
         $keystore = Join-Path $keyDir 'debug.keystore'
@@ -267,6 +280,9 @@ function Build-Android {
     if ($LASTEXITCODE -or -not ($permissions -match "android\.permission\.CAMERA")) {
         throw 'Android APK is missing the camera permission required by the invite QR scanner.'
     }
+    $dexdump = Join-Path $buildTools.FullName 'dexdump.exe'
+    & node (Join-Path $PSScriptRoot 'tools\verify-android-decoder.mjs') $signed $dexdump
+    if ($LASTEXITCODE) { throw 'Android APK decoder JNI verification failed.' }
     Copy-Item -LiteralPath $signed -Destination (Join-Path $PSScriptRoot 'VmaX-Android-arm64.apk') -Force
     Write-Host "Android APK at $PSScriptRoot\VmaX-Android-arm64.apk"
 }

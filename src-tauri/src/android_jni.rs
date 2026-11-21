@@ -171,7 +171,7 @@ pub fn layout_surface(layout: crate::native_d3d11::SurfaceLayout) -> Result<(), 
         .attach_current_thread()
         .map_err(|e| e.to_string())?;
     let picture = layout.picture;
-    env.call_static_method(
+    let result = env.call_static_method(
         &target.class,
         "layoutSurface",
         "(IIIIZ)V",
@@ -182,9 +182,11 @@ pub fn layout_surface(layout: crate::native_d3d11::SurfaceLayout) -> Result<(), 
             JValue::Int(picture.height),
             JValue::Bool(u8::from(layout.visible)),
         ],
-    )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    );
+    if result.is_err() {
+        let _ = env.exception_clear();
+    }
+    result.map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Clear session-scoped decoder state.
@@ -324,6 +326,8 @@ pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeSetDecoderA
             NEEDS_KEYFRAME.store(true, Ordering::Release);
         }
         Err(err) => {
+            // A failed JNI lookup can leave an exception pending in surfaceCreated.
+            let _ = env.exception_clear();
             DECODER_ACTIVE.store(false, Ordering::Release);
             tracing::warn!(error = %err, "Android decoder bridge unavailable");
         }

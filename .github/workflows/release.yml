@@ -94,6 +94,11 @@ jobs:
 
       - name: Build Android ARM64 APK
         shell: pwsh
+        env:
+          VMAX_ANDROID_KEYSTORE_BASE64: ${{ secrets.VMAX_ANDROID_KEYSTORE_BASE64 }}
+          VMAX_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.VMAX_ANDROID_KEYSTORE_PASSWORD }}
+          VMAX_ANDROID_KEY_ALIAS: ${{ secrets.VMAX_ANDROID_KEY_ALIAS }}
+          VMAX_ANDROID_KEY_PASSWORD: ${{ secrets.VMAX_ANDROID_KEY_PASSWORD }}
         run: |
           .\build_vmax_release.ps1 -SkipWindows -SkipInstaller
           if (-not (Test-Path 'VmaX-Android-arm64.apk')) {
@@ -124,6 +129,8 @@ jobs:
             exit 0
           }
           $notes = @'
+          - Fix an Android startup crash caused by the release optimizer stripping native decoder callbacks.
+          - Verify the required JNI entry points in the packaged Android APK before publishing.
           - Use native video presentation on supported Windows and Android devices, with capture and transport diagnostics in the HUD.
           - Auto transport probes LAN and IPv6 routes, uses paced Raw UDP with forward error correction where reachable, and falls back to WebRTC with TURN.
           - Host up to four players with an upload-aware shared bitrate budget, optional minimum-quality admission limits, and join and leave notifications.
@@ -133,6 +140,8 @@ jobs:
           - VmaX.exe — Windows portable
           - VmaX-Android-arm64.apk — Android ARM64
           - VmaX-Relay-Linux-x86_64.tar.gz — standalone Linux signaling relay
+
+          Earlier Android prereleases used build-specific certificates. Android may require a clean install if it reports a signing conflict. Uninstalling removes VmaX's local app data.
 
           Follow the [regional VPS guide](https://github.com/VibeXme/VmaX/blob/RELEASE_TAG/deploy/server/README.md) to deploy the relay. Public relay performance and sub-30 ms WAN latency still need field validation.
           '@
