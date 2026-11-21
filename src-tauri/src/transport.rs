@@ -83,8 +83,7 @@ pub fn tune_udp_socket(socket: &StdUdpSocket) -> io::Result<()> {
     crate::wan_transport::tune_wan_socket(&socket2::SockRef::from(socket))
 }
 
-/// Sub-millisecond sleep: coarse OS sleep until the last 250 µs, then a
-/// spin-yield loop.  Must only be called on the dedicated pacer thread.
+/// Sleep on the dedicated pacer thread, spinning only near the send deadline.
 #[inline]
 pub fn spin_sleep_until(deadline: Instant) {
     loop {
@@ -93,8 +92,11 @@ pub fn spin_sleep_until(deadline: Instant) {
             return;
         }
         let remaining = deadline.saturating_duration_since(now);
-        if remaining > Duration::from_micros(250) {
-            thread::sleep(remaining - Duration::from_micros(150));
+        // A 150 us spin per shard consumes a significant fraction of a core
+        // at 1080p. Unix timers can sleep through most of that interval.
+        let spin = if cfg!(windows) { Duration::from_micros(150) } else { Duration::from_micros(30) };
+        if remaining > spin * 2 {
+            thread::sleep(remaining - spin);
         } else {
             std::hint::spin_loop();
         }
@@ -168,6 +170,8 @@ pub struct PacerSnapshot {
 }
 
 impl PacerStats {
+    pub fn sent_packets(&self) -> u64 { self.sent_packets.load(Ordering::Relaxed) }
+
     /// Bytes accepted by the pacer that have not left it yet.
     ///
     /// Live: the pacing thread subtracts each shard as it departs, so a reader

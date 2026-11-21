@@ -792,3 +792,77 @@ mod tests {
         assert!(!latch.should_apply(24_000_000, true, origin + Duration::from_millis(500)));
     }
 }
+
+/// Leave capacity for audio, transport overhead and competing traffic.
+pub fn upload_share(upload_mbps: u32, active_players: u32) -> u32 {
+    ((u64::from(upload_mbps) * 800_000) / u64::from(active_players.max(1))).min(u64::from(u32::MAX))
+        as u32
+}
+
+pub fn codec_floor(codec: crate::protocol::VideoCodec) -> u32 {
+    if codec == crate::protocol::VideoCodec::H264 {
+        12_000_000
+    } else {
+        10_000_000
+    }
+}
+
+#[derive(Default)]
+pub struct StreamRate {
+    condition: Option<(bool, Instant)>,
+}
+
+impl StreamRate {
+    pub fn update(
+        &mut self,
+        now: Instant,
+        current: u32,
+        ceiling: u32,
+        codec: crate::protocol::VideoCodec,
+        congested: bool,
+    ) -> u32 {
+        let floor = codec_floor(codec).min(ceiling);
+        let current = current.clamp(floor, ceiling);
+        let (previous, since) = self.condition.get_or_insert((congested, now));
+        if *previous != congested {
+            *previous = congested;
+            *since = now;
+        }
+        let interval = if congested {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(2)
+        };
+        if now.saturating_duration_since(*since) < interval {
+            return current;
+        }
+        *since = now;
+        let percent = if congested { 85 } else { 110 };
+        (u64::from(current) * percent / 100).clamp(u64::from(floor), u64::from(ceiling)) as u32
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn soft_floor_and_sustained_feedback() {
+    use crate::protocol::VideoCodec::Hevc;
+    assert_eq!(upload_share(30, 4), 6_000_000);
+    assert_eq!(upload_share(30, 1) / codec_floor(Hevc), 2);
+    let mut rate = StreamRate::default();
+    let start = Instant::now();
+    let mut apply = |ms, current, ceiling, bad| {
+        rate.update(
+            start + Duration::from_millis(ms),
+            current,
+            ceiling,
+            Hevc,
+            bad,
+        )
+    };
+    assert_eq!(apply(0, 20_000_000, 24_000_000, true), 20_000_000);
+    assert_eq!(apply(499, 20_000_000, 24_000_000, true), 20_000_000);
+    assert_eq!(apply(500, 20_000_000, 24_000_000, true), 17_000_000);
+    assert_eq!(apply(510, 17_000_000, 24_000_000, false), 17_000_000);
+    assert_eq!(apply(2510, 17_000_000, 24_000_000, false), 18_700_000);
+    assert_eq!(apply(2600, 18_700_000, 6_000_000, true), 6_000_000);
+}

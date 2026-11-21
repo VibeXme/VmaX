@@ -62,6 +62,7 @@ interface StreamViewerProps {
   resolution: ResolutionOption;
   pingMs: number;
   packetLossPct?: number;
+  videoPacketsReceived: number;
   droppedFrames: number;
   hardwareCursor?: boolean;
   nativeFps: number;
@@ -299,6 +300,7 @@ export function StreamViewer({
   resolution,
   pingMs,
   packetLossPct,
+  videoPacketsReceived,
   droppedFrames,
   hardwareCursor = true,
   nativeFps,
@@ -326,6 +328,8 @@ export function StreamViewer({
   const [captureFps, setCaptureFps] = useState<number | null>(null);
   const [dropsPerSecond, setDropsPerSecond] = useState(0);
   const [decoderDropsPerSecond, setDecoderDropsPerSecond] = useState<number | null>(null);
+  const watchdogNetwork = useRef({ received: videoPacketsReceived, pingMs, path: connectionPathLabel(connectionPath, relayed) });
+  watchdogNetwork.current = { received: videoPacketsReceived, pingMs, path: connectionPathLabel(connectionPath, relayed) };
   const droppedFramesRef = useRef(droppedFrames);
   droppedFramesRef.current = droppedFrames;
   useEffect(() => {
@@ -788,8 +792,7 @@ export function StreamViewer({
     let drawnFrames = 0;
     let decodedFrames = 0;
     let discardedFrames = 0;
-    let lastDrawnAt = 0;
-    let lastVideoPacketAt = 0;
+    let lastPacketCount = watchdogNetwork.current.received;
     let lastStallResetAt = -Infinity;
     let decodeSamples = 0;
     let decodeTotalMs = 0;
@@ -811,7 +814,6 @@ export function StreamViewer({
         onSize: (width, height) => setStreamSize({ w: width, h: height }),
         onDrawn: () => {
           drawnFrames++;
-          lastDrawnAt = performance.now();
           if (!receivedFirstFrame) {
             receivedFirstFrame = true;
             setHasFirstFrame(true);
@@ -843,6 +845,18 @@ export function StreamViewer({
           superseded: presentWindow.superseded,
         });
       }
+      const net = watchdogNetwork.current;
+      const received = Math.max(0, net.received - lastPacketCount);
+      lastPacketCount = net.received;
+      if (subscribed && connectedRef.current && !nativeVideoRef.current) {
+        console.info("CLIENT", {
+          recv_pkts: received,
+          dec_fps: Math.round(decodedFrames * 1000 / elapsedMs),
+          render_fps: Math.round(drawnFrames * 1000 / elapsedMs),
+          rtt: net.pingMs,
+          path: net.path,
+        });
+      }
       const waitingForFirstFrame = nativeVideoRef.current
         ? !nativeFrameSeen.current
         : !receivedFirstFrame || awaitingKeyframe;
@@ -853,10 +867,9 @@ export function StreamViewer({
         connectedRef.current &&
         !nativeVideoRef.current &&
         !document.hidden &&
-        lastVideoPacketAt > 0 &&
-        now - lastVideoPacketAt < 1_000 &&
-        now - lastDrawnAt >= 1_000 &&
-        now - lastStallResetAt >= 2_000 &&
+        received > 0 &&
+        (decodedFrames === 0 || drawnFrames === 0) &&
+        now - lastStallResetAt >= 1_000 &&
         recoverStallsRef.current
       ) {
         lastStallResetAt = now;
@@ -865,7 +878,7 @@ export function StreamViewer({
       }
       lastPlaybackSample = now;
       videoBytes = drawnFrames = decodedFrames = discardedFrames = decodeSamples = decodeTotalMs = 0;
-    }, 500);
+    }, 1_000);
 
     /**
      * Asks the host for a clean reference.
@@ -1089,7 +1102,6 @@ export function StreamViewer({
           return;
         }
 
-        lastVideoPacketAt = performance.now();
         const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
         const frameId = view.getUint32(0, false);
         const tsUs = Number(view.getBigUint64(4, false));

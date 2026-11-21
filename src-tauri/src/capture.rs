@@ -235,7 +235,28 @@ pub fn sample_cpu_load_pct(prev: &mut Option<CpuTimeSample>) -> f32 {
 }
 
 #[cfg(target_os = "windows")]
+pub(crate) struct WindowsTimerPeriod(bool);
+
+#[cfg(target_os = "windows")]
+impl WindowsTimerPeriod {
+    pub(crate) fn new() -> Self {
+        Self(unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsTimerPeriod {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { windows::Win32::Media::timeEndPeriod(1) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 pub mod win {
+    mod worker { include!("capture/worker.rs"); }
+    pub use worker::CaptureWorker;
     use super::{fit_resolution, is_constant_fps};
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::RECT;
@@ -260,7 +281,7 @@ pub mod win {
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
         DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010, DXGI_MODE_ROTATION,
-        DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90, DXGI_MODE_ROTATION_ROTATE180,
+        DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_ROTATE90,
         DXGI_MODE_ROTATION_ROTATE270, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
     };
     use windows::Win32::Graphics::Dxgi::{
@@ -515,8 +536,6 @@ pub mod win {
         rotation: DXGI_MODE_ROTATION,
         work_tex: ID3D11Texture2D,
         staging_tex: Option<ID3D11Texture2D>,
-        scale_staging: Option<(u32, u32, ID3D11Texture2D)>,
-        scale_pixels: Vec<u8>,
         scaler: Option<VideoScaler>,
         pub native_width: u32,
         pub native_height: u32,
@@ -531,13 +550,10 @@ pub mod win {
         surface_size: (u32, u32),
         /// The desktop has stopped changing since the last captured frame.
         static_screen: bool,
-        /// Set once per motion -> static transition. The capture loop drains it
-        /// and asks the encoder for two near-lossless refinement frames.
-        refinement_requested: bool,
-        /// Remaining progressive refinement frames after desktop motion stops
+        /// Remaining repeated frames before switching to an idle cadence.
         refinement_frames_left: u8,
         /// Mouse pointer bitmap, captured separately by Desktop Duplication.
-        pointer_shape: Option<crate::cursor::PointerShape>,
+        pointer_shape: Option<std::sync::Arc<crate::cursor::PointerShape>>,
         /// Pointer position in desktop (native) pixels.
         pointer_position: (i32, i32),
         pointer_visible: bool,
@@ -762,7 +778,9 @@ pub mod win {
                     if !out_desc.AttachedToDesktop.as_bool() {
                         continue;
                     }
-                    if display.is_some_and(|id| id != display_id(&out_desc)) {
+                    let bounds = out_desc.DesktopCoordinates;
+                    let primary = bounds.left == 0 && bounds.top == 0;
+                    if !display.map_or(primary, |id| id == display_id(&out_desc)) {
                         continue;
                     }
                     let Ok(output1) = output.cast::<IDXGIOutput1>() else {
@@ -832,14 +850,16 @@ pub mod win {
             let (encode_w, encode_h) = fit_resolution(native_w, native_h, max_width, max_height);
             let rotation = unsafe { dupl.GetDesc() }.Rotation;
             let work_tex = create_bgra_texture(&device, encode_w, encode_h, false)?;
-            let scaler = if encode_w != native_w || encode_h != native_h {
-                VideoScaler::new(
-                    &device, &context, &work_tex, native_w, native_h, encode_w, encode_h,
-                )
-                .ok()
-            } else {
-                None
-            };
+            let scaler = if encode_w != native_w || encode_h != native_h || rotation.0 > 1 {
+                use windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ROTATION;
+                let portrait = matches!(rotation, DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270);
+                let (src_w, src_h) = if portrait { (native_h, native_w) } else { (native_w, native_h) };
+                let scaler = VideoScaler::new(&device, &context, &work_tex, src_w, src_h, encode_w, encode_h)?;
+                if rotation.0 > 1 {
+                    unsafe { scaler.video_context.VideoProcessorSetStreamRotation(&scaler.processor, 0, true, D3D11_VIDEO_PROCESSOR_ROTATION(rotation.0 - 1)); }
+                }
+                Some(scaler)
+            } else { None };
 
             let name_len = adapter_desc
                 .Description
@@ -860,8 +880,6 @@ pub mod win {
                 rotation,
                 work_tex,
                 staging_tex: None,
-                scale_staging: None,
-                scale_pixels: Vec::new(),
                 scaler,
                 native_width: native_w,
                 native_height: native_h,
@@ -878,7 +896,6 @@ pub mod win {
                 has_valid_frame: false,
                 surface_size: (0, 0),
                 static_screen: false,
-                refinement_requested: false,
                 refinement_frames_left: 2,
                 pointer_shape: None,
                 pointer_position: (0, 0),
@@ -897,9 +914,6 @@ pub mod win {
         }
 
         /// True exactly once per motion -> static transition.
-        pub fn take_refinement_request(&mut self) -> bool {
-            core::mem::replace(&mut self.refinement_requested, false)
-        }
 
         pub fn needs_recovery(&self) -> bool {
             unsafe { self.device.GetDeviceRemovedReason() }.is_err()
@@ -1001,25 +1015,21 @@ pub mod win {
                 hotspot_y: shape_info.HotSpot.y,
                 pixels,
             };
-            self.pointer_shape = shape.is_drawable().then_some(shape);
+            self.pointer_shape = shape.is_drawable().then(|| std::sync::Arc::new(shape));
         }
 
         pub fn has_valid_frame(&self) -> bool {
             self.has_valid_frame
         }
 
-        /// Handles static desktop refinement (2 progressive frames after motion stops)
-        /// followed by Parsec-style `0.06Mbps` idle heartbeat mode unless `Constant FPS` is enabled.
+        /// Reuse the last valid GPU texture when the desktop does not change.
         fn should_emit_static_frame(&mut self, force_frame: bool) -> bool {
             if !self.has_valid_frame {
                 return false;
             }
             if !self.static_screen {
-                // Motion just stopped: two progressive refinement frames at a
-                // much lower QP, then the idle heartbeat takes over.
                 self.static_screen = true;
                 self.refinement_frames_left = 2;
-                self.refinement_requested = true;
             }
             if self.refinement_frames_left > 0 {
                 self.refinement_frames_left -= 1;
@@ -1105,31 +1115,12 @@ pub mod win {
                     }
                     self.surface_size = (desc.Width, desc.Height);
 
-                    if matches!(
-                        self.rotation,
-                        DXGI_MODE_ROTATION_ROTATE90
-                            | DXGI_MODE_ROTATION_ROTATE180
-                            | DXGI_MODE_ROTATION_ROTATE270
-                    ) {
-                        self.scale_cpu_fallback(&src_tex)?;
-                    } else if self.encode_width == self.native_width
-                        && self.encode_height == self.native_height
-                        && desc.Width == self.encode_width
-                        && desc.Height == self.encode_height
-                    {
-                        unsafe {
-                            self.context.CopyResource(&self.work_tex, &src_tex);
-                        }
-                    } else if self
-                        .scaler
-                        .as_ref()
-                        .is_some_and(|scaler| scaler.scale(&src_tex).is_ok())
-                    {
+                    if let Some(scaler) = &self.scaler {
+                        scaler.scale(&src_tex)?;
                     } else {
-                        self.scale_cpu_fallback(&src_tex)?;
+                        unsafe { self.context.CopyResource(&self.work_tex, &src_tex); }
                     }
                     self.has_valid_frame = true;
-                    // Queue 2 progressive refinement frames so static text snaps to lossless clarity
                     self.refinement_frames_left = 2;
                     Ok(true)
                 }
@@ -1164,7 +1155,7 @@ pub mod win {
             let started = Instant::now();
             loop {
                 if let Ok(dupl) = unsafe { output1.DuplicateOutput(&self.device) } {
-                    self.rotation = unsafe { dupl.GetDesc() }.Rotation;
+                    if unsafe { dupl.GetDesc() }.Rotation != self.rotation { return false; }
                     self.duplication = Some(dupl);
                     return true;
                 }
@@ -1173,86 +1164,6 @@ pub mod win {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-        }
-
-        fn scale_cpu_fallback(&mut self, src_tex: &ID3D11Texture2D) -> Result<(), String> {
-            let mut source_desc = D3D11_TEXTURE2D_DESC::default();
-            unsafe { src_tex.GetDesc(&mut source_desc) };
-            let width = source_desc.Width;
-            let height = source_desc.Height;
-            if width == 0 || height == 0 {
-                return Err("Capture source has an empty surface".into());
-            }
-            if self
-                .scale_staging
-                .as_ref()
-                .is_none_or(|(w, h, _)| (*w, *h) != (width, height))
-            {
-                self.scale_staging = Some((
-                    width,
-                    height,
-                    create_bgra_texture(&self.device, width, height, true)?,
-                ));
-            }
-            let Some((_, _, staging)) = self.scale_staging.as_ref() else {
-                return Err("Capture scale staging texture is unavailable".into());
-            };
-            let dst_w = self.encode_width as usize;
-            let dst_h = self.encode_height as usize;
-            self.scale_pixels.resize(dst_w * dst_h * 4, 0);
-            unsafe {
-                self.context.CopyResource(staging, src_tex);
-            }
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            unsafe {
-                self.context
-                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            }
-            .map_err(|e| format!("staging Map failed: {e}"))?;
-
-            let raw_w = source_desc.Width as usize;
-            let raw_h = source_desc.Height as usize;
-            let (src_w, src_h) = match self.rotation {
-                DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => (raw_h, raw_w),
-                _ => (raw_w, raw_h),
-            };
-            let pitch = mapped.RowPitch as usize;
-            let src_ptr = mapped.pData as *const u8;
-
-            for y in 0..dst_h {
-                let sy = (y * src_h) / dst_h;
-                for x in 0..dst_w {
-                    let sx = (x * src_w) / dst_w;
-                    let (raw_x, raw_y) = match self.rotation {
-                        DXGI_MODE_ROTATION_ROTATE90 => (sy, src_w - 1 - sx),
-                        DXGI_MODE_ROTATION_ROTATE180 => (src_w - 1 - sx, src_h - 1 - sy),
-                        DXGI_MODE_ROTATION_ROTATE270 => (src_h - 1 - sy, sx),
-                        _ => (sx, sy),
-                    };
-                    let src_off = raw_y.min(raw_h - 1) * pitch + raw_x.min(raw_w - 1) * 4;
-                    let dst_off = (y * dst_w + x) * 4;
-                    unsafe {
-                        let px = core::ptr::read_unaligned(src_ptr.add(src_off) as *const u32);
-                        core::ptr::write_unaligned(
-                            self.scale_pixels.as_mut_ptr().add(dst_off) as *mut u32,
-                            px,
-                        );
-                    }
-                }
-            }
-
-            unsafe {
-                self.context.Unmap(staging, 0);
-                self.context.UpdateSubresource(
-                    &self.work_tex,
-                    0,
-                    None,
-                    self.scale_pixels.as_ptr().cast(),
-                    (dst_w * 4) as u32,
-                    0,
-                );
-            }
-            Ok(())
         }
 
         pub fn read_bgra_into(&mut self, dst: &mut Vec<u8>) -> Result<(), String> {
@@ -1302,9 +1213,7 @@ pub mod win {
             // size, and with the pointer position scaled by the same factor so
             // it lands where the user's cursor actually is.
             //
-            // A rotated output is skipped: the frame has already been rotated
-            // in the CPU fallback and the pointer would need the same
-            // transform to line up.
+            // A rotated display requires transformed pointer coordinates.
             if self.pointer_overlay
                 && self.pointer_visible
                 && self.rotation == DXGI_MODE_ROTATION_IDENTITY

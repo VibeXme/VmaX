@@ -57,9 +57,7 @@ interface SettingsModalProps {
 }
 
 const NVENC_NUMBER_OPTIONS = [
-  { key: "vbvFrames", label: "VBV size in frames", hint: "Limit the encoder buffer to one or two frames.", min: 1, max: 2 },
   { key: "aqStrength", label: "Adaptive quantization strength", hint: "Shift bits toward detail. Set to 0 to disable.", min: 0, max: 15 },
-  { key: "minQp", label: "Minimum QP", hint: "Lowest quantization the rate controller may use.", min: 0, max: 51 },
   { key: "refreshPeriod", label: "Intra refresh period in frames", hint: "Frames between refresh waves.", min: 2, max: 600 },
   { key: "refreshFrames", label: "Intra refresh length in frames", hint: "Frames over which each refresh wave is spread.", min: 1, max: 60 },
 ] as const;
@@ -269,11 +267,7 @@ function NvencControls({ settings, onChange }: { settings: NvencSettings; onChan
             options={[{ value: "4", label: "P4" }, { value: "3", label: "P3" }]}
             onChangeValue={(value) => onChange({ ...settings, preset: Number(value) })} />
         </SettingRow>
-        <SettingRow title="Encoder rate control" hint="VBR uses fewer bits on simple frames. CBR aims for a steadier rate.">
-          <SelectControl id="vmax-nvenc-rate-control" ariaLabel="NVENC rate control" value={settings.vbr ? "vbr" : "cbr"}
-            options={[{ value: "vbr", label: "Variable bitrate (VBR)" }, { value: "cbr", label: "Constant bitrate (CBR)" }]}
-            onChangeValue={(value) => onChange({ ...settings, vbr: value === "vbr" })} />
-        </SettingRow>
+        <SettingRow title="Encoder rate control" hint="CBR with a single-frame buffer and minimum QP 5."><span>CBR</span></SettingRow>
         <SettingRow title="Quarter-resolution multipass" hint="Run an additional low-resolution pass to improve bit allocation.">
           <ToggleSwitch ariaLabel="Quarter-resolution multipass" checked={settings.quarterPass}
             onToggle={() => onChange({ ...settings, quarterPass: !settings.quarterPass })} />
@@ -985,6 +979,14 @@ export function SettingsModal({
                     }
                     ariaLabel="Lock stream resolution"
                   />
+                </SettingRow>
+                <SettingRow title="Host upload speed" hint="Mbps available to the host. Video uses up to 80%.">
+                  <input aria-label="Host upload speed in Mbps" type="number" min={1} max={1000} value={config.video.hostUploadMbps}
+                    onChange={e => onUpdateVideo({ hostUploadMbps: Math.max(1, Math.min(1000, Math.round(Number(e.target.value)))) })} className="w-20 rounded bg-zinc-800 p-2" />
+                </SettingRow>
+                <SettingRow title="Enforce Minimum Quality (Limit Players)" hint="Reserve 10 Mbps for HEVC or 12 Mbps for H.264 per viewer.">
+                  <ToggleSwitch ariaLabel="Enforce minimum quality" checked={config.video.strictQuality}
+                    onToggle={() => onUpdateVideo({ strictQuality: !config.video.strictQuality })} />
                 </SettingRow>
                 <SettingRow
                   title="Bitrate mode"

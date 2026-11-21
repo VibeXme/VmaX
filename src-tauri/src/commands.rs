@@ -62,15 +62,14 @@ const MIN_ENCODE_FPS_SCALE: f32 = 0.5;
 /// of oscillating around the budget.
 const ENCODE_FPS_SCALE_STEP: f32 = 0.15;
 
+fn default_upload_mbps() -> u32 { 30 }
+
 fn default_resolution() -> String {
-    // Native = the host display's own size; see `parse_resolution_ceiling`.
-    "native".to_string()
+    "1080p".into()
 }
 
 fn default_framerate() -> u16 {
-    // Gaming baseline: high-refresh cadence. The client's panel refresh still
-    // caps the negotiated rate, so a 60 Hz viewer is never sent 120 FPS.
-    120
+    60
 }
 
 fn default_encoder() -> String {
@@ -128,6 +127,10 @@ pub struct StartSessionParams {
     #[serde(default)]
     pub relay_only: bool,
     pub max_bitrate_mbps: u32,
+    #[serde(default = "default_upload_mbps")]
+    pub host_upload_mbps: u32,
+    #[serde(default)]
+    pub strict_quality: bool,
     #[serde(default = "default_protocol")]
     pub protocol: String,
     #[serde(default = "default_resolution")]
@@ -207,6 +210,10 @@ pub struct VideoSettingsPayload {
     pub resolution: String,
     pub framerate: u16,
     pub bitrate_mbps: u32,
+    #[serde(default = "default_upload_mbps")]
+    pub host_upload_mbps: u32,
+    #[serde(default)]
+    pub strict_quality: bool,
     pub encoder: String,
     #[serde(default)]
     pub codec: String,
@@ -273,15 +280,13 @@ impl Default for VmaXSettingsPayload {
     fn default() -> Self {
         Self {
             video: VideoSettingsPayload {
-                // Match the frontend defaults so a session started without a
-                // settings payload still negotiates the host display's native
-                // size at a constant 120 FPS with the gaming preset's adaptive
-                // 60 Mbps ceiling.
-                resolution: "native".to_string(),
-                framerate: 120,
-                bitrate_mbps: 60,
-                encoder: "hardware".to_string(),
-                codec: "auto".to_string(),
+                resolution: "1080p".into(),
+                framerate: 60,
+                bitrate_mbps: 24,
+                host_upload_mbps: default_upload_mbps(),
+                strict_quality: false,
+                encoder: "hardware".into(),
+                codec: "hevc".into(),
                 chroma: "420".to_string(),
                 sharpness: default_sharpness(),
                 upscaling: "off".to_string(),
@@ -330,10 +335,6 @@ struct HostRuntimeControls {
     /// ceiling, encoding another frame only adds to it, and a dropped encoded
     /// frame costs the viewer a reference chain.
     send_backlog: crate::network::VideoBacklog,
-    /// The controller's latest "this move is worth an encoder round trip"
-    /// verdict. Stored rather than consumed: `RateLatch` in the capture loop
-    /// decides when to act on it.
-    reconfigure_recommended: Arc<AtomicBool>,
     desired_max_w: Arc<AtomicU32>,
     desired_max_h: Arc<AtomicU32>,
     desired_fps: Arc<AtomicU16>,
@@ -554,8 +555,16 @@ fn map_fec_group_size(redundancy_pct: u8) -> u8 {
     }
 }
 
-fn build_network_config(effective_signaling: String, params: &StartSessionParams) -> NetworkConfig {
-    let max_bps = params.max_bitrate_mbps.clamp(1, 200) * 1_000_000;
+fn session_video_budget(target_mbps: u32, upload_mbps: u32, role: SessionRole) -> u32 {
+    let target = target_mbps.clamp(1, 200) * 1_000_000;
+    match role {
+        SessionRole::Host => target.min(crate::bitrate::upload_share(upload_mbps.max(1), 1)),
+        SessionRole::Client => target,
+    }
+}
+
+fn build_network_config(effective_signaling: String, params: &StartSessionParams, role: SessionRole) -> NetworkConfig {
+    let max_bps = session_video_budget(params.max_bitrate_mbps, params.host_upload_mbps, role);
     NetworkConfig {
         signaling_url: effective_signaling,
         enable_stun: params.enable_stun,
@@ -563,12 +572,10 @@ fn build_network_config(effective_signaling: String, params: &StartSessionParams
         target_fps: params.framerate.clamp(30, 144),
         jitter_window_ms: params.jitter_window_ms.clamp(8, 80),
         max_bitrate_bps: max_bps,
-        initial_bitrate_bps: if params.unlimited_bitrate {
-            max_bps
-        } else {
-            (max_bps / 2).max(crate::bitrate::MIN_VIDEO_BITRATE_BPS)
-        },
+        initial_bitrate_bps: max_bps,
         fixed_bitrate: params.unlimited_bitrate,
+        strict_upload_bps: (role == SessionRole::Host && params.strict_quality)
+            .then(|| crate::bitrate::upload_share(params.host_upload_mbps, 1)),
         fec_group_size: map_fec_group_size(params.fec_redundancy_pct),
         congestion_sensitivity: params.congestion_sensitivity,
         ..Default::default()
@@ -607,25 +614,6 @@ pub fn report_client_decode_latency(decode_us: u32) -> f32 {
 #[tauri::command]
 pub fn set_constant_fps_mode(enabled: bool) {
     set_constant_fps(enabled);
-}
-
-#[cfg(target_os = "windows")]
-struct HighResTimerGuard(bool);
-
-#[cfg(target_os = "windows")]
-impl HighResTimerGuard {
-    fn new() -> Self {
-        Self(unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0)
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for HighResTimerGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            unsafe { windows::Win32::Media::timeEndPeriod(1) };
-        }
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -678,7 +666,7 @@ async fn spawn_host_capture_thread(
     wake_display: bool,
 ) -> Result<std::thread::JoinHandle<()>, String> {
     use crate::bitrate::CaptureCadence;
-    use crate::capture::win::DxgiCapturer;
+    use crate::capture::win::CaptureWorker;
     use crate::encoder::win::create_encoder;
     use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_NOSOCKET, MFStartup};
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
@@ -720,7 +708,7 @@ async fn spawn_host_capture_thread(
 
     let app_thread = app.clone();
     let thread = std::thread::Builder::new()
-        .name("vmax-host-capture".to_string())
+        .name("vmax-host-encoder".to_string())
         .spawn(move || {
             struct ComMfGuard {
                 com: bool,
@@ -738,7 +726,7 @@ async fn spawn_host_capture_thread(
             }
 
             let mut init_tx = Some(init_tx);
-            let _timer_guard = HighResTimerGuard::new();
+            let _timer_guard = crate::capture::WindowsTimerPeriod::new();
             let _priority_guard = HostPriorityGuard::raise();
             let _com_mf_guard = ComMfGuard {
                 com: unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() },
@@ -747,7 +735,7 @@ async fn spawn_host_capture_thread(
 
             let selected_display = params.capture_display.as_deref();
             let mut capturer = Some(
-                match DxgiCapturer::new(active_max_w, active_max_h, selected_display) {
+                match CaptureWorker::new(active_max_w, active_max_h, selected_display, controls.desired_fps.clone(), controls.connected.clone(), controls.hardware_cursor.clone()) {
                     Ok(c) => c,
                     Err(err) => {
                         if let Some(tx) = init_tx.take() {
@@ -762,7 +750,8 @@ async fn spawn_host_capture_thread(
                 *bounds = Some(cap.desktop_bounds);
             }
 
-            let mut preferred_codecs = vec![VideoCodec::H264];
+            let mut preferred_codecs = vec![VideoCodec::Hevc, VideoCodec::H264];
+            prioritize_codec(&mut preferred_codecs);
             let mut current_bitrate = max_bps;
             let mut next_bitrate_retry = Instant::now();
             let mut forced_refresh_frames = 0;
@@ -824,7 +813,8 @@ async fn spawn_host_capture_thread(
             let mut frame_id: u32 = 1;
             let mut cpu_sample = None;
             let mut encoded_frames: u32 = 0;
-            let mut captured_frames: u32 = 0;
+            let mut watchdog_encoded = 0u32;
+            let mut last_sent_packets = controls.send_backlog.sent_packets();
             let mut capture_sample_at = Instant::now();
             let mut ema_encode_ms: f32 = 0.0;
             let mut last_telemetry = Instant::now();
@@ -835,12 +825,6 @@ async fn spawn_host_capture_thread(
             let mut adaptive_resolution = crate::bitrate::CaptureResolution::default();
             let mut active_ceiling = (active_max_w, active_max_h);
             let mut applied_sharpness = 0u8;
-            // Encoder rate changes are coalesced here rather than applied on
-            // every controller tick: NVENC rebuilds its rate-control state and
-            // re-seeds the VBV on each reconfigure, so following a 100 ms
-            // controller exactly keeps the encoder permanently in transient.
-            let mut rate_latch = crate::bitrate::RateLatch::new();
-            rate_latch.note_applied(current_bitrate, Instant::now());
             // Smoothness guard state: encode-throughput scaling with hysteresis.
             let mut encode_fps_scale: f32 = 1.0;
             let mut last_scale_change = Instant::now();
@@ -858,9 +842,13 @@ async fn spawn_host_capture_thread(
             while !stop_flag.load(Ordering::Relaxed) {
                 let elapsed = capture_sample_at.elapsed();
                 if elapsed >= Duration::from_secs(1) {
+                    let captured_frames = capturer.as_ref().map_or(0, CaptureWorker::take_capture_count);
                     let capture_fps = (captured_frames as f64 / elapsed.as_secs_f64()).round() as u32;
                     capture_sample_at = Instant::now();
-                    captured_frames = 0;
+                    let sent_packets = controls.send_backlog.sent_packets();
+                    tracing::info!(sent_pkts = sent_packets.saturating_sub(last_sent_packets), cap_fps = capture_fps, enc_fps = (f64::from(watchdog_encoded) / elapsed.as_secs_f64()).round() as u32, bitrate = current_bitrate, "HOST");
+                    last_sent_packets = sent_packets;
+                    watchdog_encoded = 0;
                     if controls.connected.load(Ordering::Relaxed) {
                         let app = app_thread.clone();
                         let micros = if retry_capture { 0 } else { (ema_encode_ms * 1000.0) as u32 };
@@ -1020,11 +1008,12 @@ async fn spawn_host_capture_thread(
                     if dims_changed {
                         drop(encoder.take());
                         drop(capturer.take());
-                        match DxgiCapturer::new(next_max_w, next_max_h, selected_display) {
+                        match CaptureWorker::new(next_max_w, next_max_h, selected_display, controls.desired_fps.clone(), controls.connected.clone(), controls.hardware_cursor.clone()) {
                             Ok(new_cap) => {
                                 if let Ok(mut bounds) = controls.desktop_bounds.lock() {
                                     *bounds = Some(new_cap.desktop_bounds);
                                 }
+                                new_cap.set_sharpness(sharpness);
                                 capturer = Some(new_cap);
                             }
                             Err(err) => {
@@ -1146,16 +1135,10 @@ async fn spawn_host_capture_thread(
 
                 if desired_bps != current_bitrate
                     && now >= next_bitrate_retry
-                    && rate_latch.should_apply(
-                        desired_bps,
-                        controls.reconfigure_recommended.load(Ordering::Relaxed),
-                        now,
-                    )
                 {
                     match enc.set_bitrate_bps(desired_bps) {
                         Ok(()) => {
                             current_bitrate = desired_bps;
-                            rate_latch.note_applied(current_bitrate, now);
                         }
                         Err(error) => {
                             next_bitrate_retry = now + Duration::from_secs(1);
@@ -1199,21 +1182,13 @@ async fn spawn_host_capture_thread(
                     continue;
                 }
 
-                let capture_wait_ms = {
-                    // Event-driven capture: block only until the next deadline
-                    // minus the measured encode cost, so the acquire wakes as
-                    // the desktop presents and a missed present still leaves
-                    // room to emit the frame on the grid.
-                    pacing.set_fps(pace_fps);
-                    pacing.capture_wait_ms(Instant::now())
-                };
                 // Pointer policy is a live setting: the host draws the cursor
                 // into the frame unless the viewer paints its own.
                 cap.set_pointer_overlay(controls.hardware_cursor.load(Ordering::Relaxed));
                 let force_frame = controls.force_idr.load(Ordering::Acquire)
                     || controls.force_intra_refresh.load(Ordering::Acquire) > 0
                     || forced_refresh_frames > 0;
-                let valid_frame = match cap.capture_frame(capture_wait_ms, force_frame) {
+                let valid_frame = match cap.latest_frame(force_frame) {
                     Ok(true) => {
                         capture_errors = 0;
                         capture_waiting_since = None;
@@ -1269,12 +1244,6 @@ async fn spawn_host_capture_thread(
                             enc.request_intra_refresh(refresh_frames);
                         }
                     }
-                    captured_frames += 1;
-                    if cap.take_refinement_request() {
-                        // Motion stopped: two near-lossless frames before the
-                        // idle heartbeat thins the stream out.
-                        enc.request_refinement(2);
-                    }
                     let enc_started = Instant::now();
                     let ts_us = start_time.elapsed().as_micros() as u64;
                     match enc.encode(cap, ts_us) {
@@ -1284,6 +1253,7 @@ async fn spawn_host_capture_thread(
                             forced_refresh_frames = forced_refresh_frames.saturating_sub(1);
                             ema_encode_ms = enc.last_encode_latency_ms();
                             encoded_frames += 1;
+                            watchdog_encoded += 1;
 
                             let meta = {
                                 let mut meta =
@@ -1534,6 +1504,8 @@ fn register_session<'a>(
             #[cfg(target_os = "android")]
             let mut last_native_render_count = crate::android_jni::rendered_frames();
             #[cfg(target_os = "android")]
+            let mut native_progress = (Instant::now(), 0u64, last_native_render_count);
+            #[cfg(target_os = "android")]
             let mut native_video_size: Option<(u32, u32)> = None;
 
             use crate::haptics::{self, Rumble};
@@ -1672,6 +1644,27 @@ fn register_session<'a>(
                             #[cfg(target_os = "android")]
                             {
                                 let count = crate::android_jni::rendered_frames();
+                                if native_video_route != Some(true) {
+                                    native_progress = (Instant::now(), snapshot.video_packets_rx, count);
+                                } else if native_progress.0.elapsed() >= Duration::from_secs(1) {
+                                    let packets = snapshot.video_packets_rx.saturating_sub(native_progress.1);
+                                    let fps = (count.saturating_sub(native_progress.2) as f64
+                                        / native_progress.0.elapsed().as_secs_f64()).round() as u32;
+                                    tracing::info!(recv_pkts = packets, dec_fps = fps, render_fps = fps,
+                                        rtt = snapshot.rtt_ms, path = ?snapshot.connection_path, "CLIENT");
+                                    if packets > 0 && fps == 0 {
+                                        crate::android_jni::recover_stalled_decoder();
+                                        native_video_route = Some(false);
+                                        let _ = ctx.app.emit("vmax://native-video", NativeVideoState {
+                                            active: false, width: None, height: None,
+                                        });
+                                        let _ = session_tx.control_tx.try_send(ControlMessage::RequestKeyframe {
+                                            last_good_frame_id: None,
+                                            reason: "MediaCodec output stalled".into(),
+                                        });
+                                    }
+                                    native_progress = (Instant::now(), snapshot.video_packets_rx, count);
+                                }
                                 if native_video_route == Some(true) {
                                     displayed_frames = count
                                         .saturating_sub(last_native_render_count)
@@ -1847,6 +1840,10 @@ fn register_session<'a>(
                             let size = crate::android_jni::video_size();
                             if native_video_route != Some(native_video) || native_video_size != size
                             {
+                                if native_video_route != Some(native_video) {
+                                    // Start the native watchdog when delivery to the Surface begins.
+                                    native_progress = (Instant::now(), native_progress.1, crate::android_jni::rendered_frames());
+                                }
                                 native_video_route = Some(native_video);
                                 native_video_size = size;
                                 let (width, height) = match size {
@@ -1981,9 +1978,6 @@ fn register_session<'a>(
                             host_ctrl
                                 .target_bitrate_bps
                                 .store(decision.target_bitrate_bps, Ordering::Relaxed);
-                            host_ctrl
-                                .reconfigure_recommended
-                                .store(decision.encoder_reconfigure_recommended, Ordering::Relaxed);
                         }
                         let mbps = decision.target_bitrate_bps as f64 / 1_000_000.0;
                         emit_packet_log(
@@ -2430,6 +2424,10 @@ async fn start_host_session_internal(
     {
         return Err("Hosting was stopped or replaced".into());
     }
+    let codec = if params.codec == "h264" { VideoCodec::H264 } else { VideoCodec::Hevc };
+    if params.strict_quality && crate::bitrate::upload_share(params.host_upload_mbps, 1) < crate::bitrate::codec_floor(codec) {
+        return Err(crate::network::BANDWIDTH_FULL.into());
+    }
     let profile_endpoint = normalize_endpoint(&params.signaling_url)?;
     if params.relay_only && !profile_endpoint.starts_with("wss://") {
         return Err("Relay-only hosting requires a wss:// VmaX relay endpoint.".into());
@@ -2467,7 +2465,7 @@ async fn start_host_session_internal(
         None => ensure_local_relay_if_local(&app, state, &params.signaling_url).await?,
     };
 
-    let mut cfg = build_network_config(effective_signaling, &params);
+    let mut cfg = build_network_config(effective_signaling, &params, SessionRole::Host);
     cfg.relay_only = params.relay_only;
     cfg.identity_file = Some(identity_file);
     cfg.profile_endpoint = Some(profile_endpoint);
@@ -2521,7 +2519,6 @@ async fn start_host_session_internal(
         force_idr: Arc::new(AtomicBool::new(true)),
         force_intra_refresh: Arc::new(AtomicU32::new(0)),
         target_bitrate_bps: Arc::new(AtomicU32::new(initial_bps)),
-        reconfigure_recommended: Arc::new(AtomicBool::new(false)),
         send_backlog: handle.tx.video_backlog(),
         desired_max_w: Arc::new(AtomicU32::new(max_w)),
         desired_max_h: Arc::new(AtomicU32::new(max_h)),
@@ -2709,7 +2706,7 @@ pub async fn join_session(
     let endpoint = device
         .as_ref()
         .map_or_else(|| params.signaling_url.clone(), |device| device.0.clone());
-    let mut cfg = build_network_config(endpoint, &params);
+    let mut cfg = build_network_config(endpoint, &params, SessionRole::Client);
     cfg.identity_file = Some(identity_file);
     if device.is_some() {
         cfg.protocol = TransportProtocol::Quic;
@@ -3626,9 +3623,6 @@ pub async fn update_settings(
     state: State<'_, AppState>,
     settings: VmaXSettingsPayload,
 ) -> Result<(), String> {
-    // Up to 200 Mbps: on a LAN or a fast link the stream is allowed to spend
-    // the whole pipe rather than a conservative preset ceiling.
-    let clamped_bps = settings.video.bitrate_mbps.clamp(1, 200) * 1_000_000;
     crate::capture::set_lock_resolution(settings.video.lock_resolution);
     crate::capture::set_constant_fps(settings.video.constant_fps);
     let clamped_fps = settings.video.framerate.clamp(30, 144);
@@ -3646,7 +3640,8 @@ pub async fn update_settings(
 
     if let Some(tx) = state.active_tx.lock().await.clone() {
         tx.set_fec_group_size(fec_group);
-        tx.set_bitrate_policy(clamped_bps, settings.video.unlimited_bitrate);
+        let budget = session_video_budget(settings.video.bitrate_mbps, settings.video.host_upload_mbps, tx.role);
+        tx.set_bitrate_policy(budget, settings.video.unlimited_bitrate);
     }
 
     let mut applied_live = false;
@@ -3679,6 +3674,8 @@ pub async fn update_settings(
     {
         cfg.params.resolution = settings.video.resolution.clone();
         cfg.params.framerate = clamped_fps;
+        cfg.params.host_upload_mbps = settings.video.host_upload_mbps;
+        cfg.params.strict_quality = settings.video.strict_quality;
         cfg.params.max_bitrate_mbps = settings.video.bitrate_mbps.clamp(1, 200);
         cfg.params.encoder = settings.video.encoder.clone();
         cfg.params.codec = settings.video.codec.clone();

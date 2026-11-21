@@ -8,7 +8,7 @@
 //! * **No reordering.** `frameIntervalP = 1`, `numReorderFrames = 0`,
 //!   `maxDecFrameBuffering = 1`. A decoder may not hold a decoded picture
 //!   waiting for a B-frame, because there are none.
-//! * **No bitrate bursts.** VBR with a one-frame VBV, no lookahead, and a
+//! * **Bounded bitrate.** CBR with a one-frame VBV, no lookahead, and a
 //!   rolling intra-refresh instead of periodic IDR spikes.
 
 /// Encoder tier: P4 is the balanced quality/latency preset the SDK documents
@@ -39,19 +39,10 @@ impl Default for NvencSettings {
     fn default() -> Self {
         Self {
             preset: 4,
-            vbr: true,
-            // Two frame-times of rate-control buffer. One frame is the
-            // theoretical minimum and forces a QP cliff on every detailed
-            // frame; two still adds no pipeline delay because there are no
-            // B-frames and the VBV is a rate budget, not a reorder queue.
-            vbv_frames: 2,
+            vbr: false,
+            vbv_frames: 1,
             aq_strength: 8,
-            // A floor of 5 is where 4:2:0 text stops sharpening: the rate
-            // controller refuses to spend more bits on a static screen, so
-            // letters keep a soft edge forever. 3 lets a detailed frame use
-            // the VBR headroom (2x average peak, 2-frame VBV) and then repay
-            // it, which is exactly the read-a-page case.
-            min_qp: 3,
+            min_qp: 5,
             quarter_pass: true,
             intra_refresh: true,
             // One refreshing row per frame: the intra band is thin enough to
@@ -68,31 +59,14 @@ impl Default for NvencSettings {
 
 impl NvencSettings {
     pub fn vbv_bits(self, bitrate_bps: u32, fps: u32) -> u32 {
-        (bitrate_bps / fps.max(1))
-            .max(1)
-            .saturating_mul(u32::from(self.vbv_frames.clamp(1, 2)))
-    }
-
-    /// Peak bits VBR may spend on one frame.
-    ///
-    /// Setting this equal to the average (the old behaviour) turns VBR into
-    /// CBR: every detailed frame is clipped to `bitrate / fps` bits, the rate
-    /// controller raises QP on exactly the frames that need detail most, and
-    /// the result is the smeared, "liquid" look on pans and heavy scenes.
-    /// Doubling the peak lets a busy frame borrow bits while the average — and
-    /// therefore the long-term bitrate — stays where the user set it.
-    pub fn max_bitrate(self, bitrate_bps: u32) -> u32 {
-        bitrate_bps
-            .saturating_mul(2)
-            .max(bitrate_bps.saturating_add(1))
+        (bitrate_bps / fps.max(1)).max(1)
     }
 }
 
 /// Rate-control knobs that make or break latency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateControl {
-    /// VBR, not CBR: a static frame may spend almost nothing while the VBV
-    /// still caps every single frame at one frame of bits.
+    /// The streaming plan uses constant bitrate with one frame of VBV.
     pub vbr: bool,
     /// Per-frame VBV cap in bits (`averageBitRate / fps`).
     pub vbv_bits: u32,
@@ -190,7 +164,7 @@ impl NvencPlan {
                 count: 5,
             },
             rate_control: RateControl {
-                vbr: true,
+                vbr: false,
                 vbv_bits: frame_bits,
                 min_qp_inter_p: 5,
                 min_qp_intra: 5,
@@ -208,24 +182,6 @@ impl NvencPlan {
     /// Recompute the one-frame VBV after a bitrate or frame-rate change.
     pub fn set_bitrate(&mut self, bitrate_bps: u32, fps: u32) {
         self.rate_control.vbv_bits = (bitrate_bps / fps.max(1)).max(1);
-    }
-
-    /// Idle refinement: temporarily drop the QP floor so text and IDE edges
-    /// re-sharpen at near-lossless quality. Restore with [`Self::end_refinement`].
-    pub fn begin_refinement(&mut self) {
-        self.rate_control.min_qp_inter_p = 2;
-        self.rate_control.min_qp_intra = 2;
-        self.rate_control.aq_strength = 0;
-    }
-
-    pub fn end_refinement(&mut self) {
-        self.rate_control.min_qp_inter_p = 5;
-        self.rate_control.min_qp_intra = 5;
-        self.rate_control.aq_strength = 8;
-    }
-
-    pub fn refinement_active(&self) -> bool {
-        self.rate_control.min_qp_inter_p == 2
     }
 }
 
@@ -296,21 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn vbr_peak_is_above_the_average_so_busy_frames_can_borrow() {
-        let settings = NvencSettings::default();
-        assert_eq!(settings.max_bitrate(20_000_000), 40_000_000);
-        assert!(settings.max_bitrate(0) >= 1);
-        assert!(settings.max_bitrate(u32::MAX) >= u32::MAX);
-        // Default buffer spans two frame-times without adding reorder delay.
-        assert_eq!(settings.vbv_frames, 2);
-        assert_eq!(settings.vbv_bits(24_000_000, 60), 800_000);
-    }
-
-    #[test]
-    fn legacy_vbv_settings_are_capped_at_two_frame_budgets() {
-        let settings = NvencSettings { vbv_frames: 4, ..Default::default() };
-        assert_eq!(settings.vbv_bits(24_000_000, 60), 800_000);
-        assert_eq!(settings.vbv_bits(12_000_000, 60), 400_000);
+    fn legacy_vbv_settings_use_one_frame() {
+        let settings = NvencSettings {
+            vbv_frames: 4,
+            ..Default::default()
+        };
+        assert_eq!(settings.vbv_bits(24_000_000, 60), 400_000);
+        assert_eq!(settings.vbv_bits(12_000_000, 120), 100_000);
     }
 
     #[test]
@@ -338,7 +286,7 @@ mod tests {
     fn rate_control_never_enables_lookahead() {
         let plan = NvencPlan::streaming(120, 40_000_000, true);
         assert_eq!(plan.rate_control.lookahead_depth, 0);
-        assert!(plan.rate_control.vbr);
+        assert!(!plan.rate_control.vbr);
         assert!(plan.rate_control.multi_pass_quarter_res);
         assert_eq!(plan.rate_control.aq_strength, 8);
         assert_eq!(plan.preset, Preset::P3);
@@ -354,16 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn refinement_round_trip_restores_the_plan() {
-        let mut plan = NvencPlan::streaming(60, 10_000_000, false);
-        plan.begin_refinement();
-        assert!(plan.refinement_active());
-        assert_eq!(plan.rate_control.min_qp_inter_p, 2);
-        assert_eq!(plan.rate_control.aq_strength, 0);
-        plan.end_refinement();
-        assert!(!plan.refinement_active());
+    fn bitrate_changes_preserve_the_minimum_qp() {
+        let mut plan = NvencPlan::streaming(60, 24_000_000, false);
+        plan.set_bitrate(12_000_000, 60);
         assert_eq!(plan.rate_control.min_qp_inter_p, 5);
-        assert_eq!(plan.rate_control.aq_strength, 8);
+        assert_eq!(plan.rate_control.min_qp_intra, 5);
     }
 
     #[test]

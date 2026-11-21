@@ -47,6 +47,7 @@ export interface NetworkTelemetry {
   congestion_state: CongestionState;
   video_frames_tx: number;
   video_frames_rx: number;
+  video_packets_rx?: number;
   video_frames_dropped: number;
   fec_recovered_shards: number;
   audio_packets_tx: number;
@@ -172,6 +173,8 @@ export interface NvencSettings {
 }
 
 export interface StreamVideoSettings {
+  hostUploadMbps: number;
+  strictQuality: boolean;
   resolution: ResolutionOption;
   framerate: FramerateOption;
   bitrateMbps: number;

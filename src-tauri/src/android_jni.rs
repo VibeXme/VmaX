@@ -121,7 +121,7 @@ pub fn is_active() -> bool {
     DECODER_ACTIVE.load(Ordering::Acquire)
 }
 
-/// Frames discarded because the native decoder queue overflowed.
+/// Decoded buffers released to the Android Surface.
 pub fn rendered_frames() -> u64 {
     RENDERED_FRAMES.load(Ordering::Acquire)
 }
@@ -229,6 +229,13 @@ pub fn submit_video_frame(frame: &ReassembledFrame) -> FrameRoute {
         return FrameRoute::WebView;
     }
     FrameRoute::Native
+}
+
+pub(crate) fn recover_stalled_decoder() {
+    force_webview();
+    if let Some(queue) = QUEUE.get() {
+        lock(queue).reset_stream();
+    }
 }
 
 fn force_webview() {

@@ -147,15 +147,15 @@ pub mod win {
     use super::{EncodedAccessUnit, EncoderModePreference, bgra_to_nv12, is_keyframe};
     use crate::bitrate::FramePacing;
     use crate::capture::win::{
-        DxgiCapturer, NVIDIA_VENDOR_ID, VideoScaler, create_bgra_texture, create_capture_texture,
-        create_texture, open_nvidia_d3d11_device,
+        DxgiCapturer, NVIDIA_VENDOR_ID, VideoScaler, create_capture_texture,
+        create_texture,
     };
     use crate::protocol::VideoCodec;
     use core::ffi::c_void;
     use mini_nvcodec::guids::{
         NV_ENC_AV1_PROFILE_MAIN_GUID, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID,
         NV_ENC_CODEC_HEVC_GUID, NV_ENC_H264_PROFILE_HIGH_GUID, NV_ENC_HEVC_PROFILE_FREXT_GUID,
-        NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_PRESET_P1_GUID,
+        NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_HEVC_PROFILE_MAIN10_GUID, NV_ENC_PRESET_P2_GUID,
         NV_ENC_PRESET_P3_GUID,
     };
     use mini_nvcodec::nvenc_sys::*;
@@ -330,9 +330,6 @@ pub mod win {
         fn reconfigure_bitrate(&mut self, bitrate_bps: u32, _fps: u32) -> Result<(), String> {
             self.set_bitrate_bps(bitrate_bps)
         }
-        /// Ask for N near-lossless refinement frames. Used when the desktop
-        /// goes static so text snaps back to full clarity.
-        fn request_refinement(&mut self, _frames: u32) {}
         fn last_encode_latency_ms(&self) -> f32 {
             crate::capture::latest_encode_latency_ms()
         }
@@ -363,18 +360,14 @@ pub mod win {
         } else {
             preferred_codecs.to_vec()
         };
-        // Detail pacing (or a persisted P3 preference) is the one signal that
-        // says "spend more encoder time on this frame". Both the NVENC plan and
-        // the Media Foundation rate control read it, so a host without an
-        // NVIDIA GPU gets the same intent instead of a vendor default.
-        let quality_first = frame_pacing == FramePacing::Detail || nvenc.preset == 3;
+        let quality_first = frame_pacing == FramePacing::Detail;
 
         if mode == EncoderModePreference::Hardware {
             let p4 = preset_p4_guid();
             let presets = if nvenc.preset == 3 {
-                [NV_ENC_PRESET_P3_GUID, p4, NV_ENC_PRESET_P1_GUID]
+                [NV_ENC_PRESET_P3_GUID, p4, NV_ENC_PRESET_P2_GUID]
             } else {
-                [p4, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P1_GUID]
+                [p4, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P2_GUID]
             };
             for &codec in &codecs {
                 for preset in presets {
@@ -428,7 +421,6 @@ pub mod win {
         rung: NvencApiVersion,
         codec: VideoCodec,
         pipeline_label: String,
-        is_zero_copy: bool,
         _nv_device: ID3D11Device,
         nv_context: ID3D11DeviceContext,
         input_texture: ID3D11Texture2D,
@@ -444,11 +436,9 @@ pub mod win {
         force_idr_next: bool,
         force_ir_frames: u32,
         intra_refresh: crate::encoder_recovery::IntraRefreshConfig,
-        cpu_staging: Vec<u8>,
         last_encode_ms: f32,
         plan: crate::nvenc::NvencPlan,
         settings: crate::nvenc::NvencSettings,
-        refine_frames: u32,
     }
 
     enum YuvConverter {
@@ -618,24 +608,12 @@ pub mod win {
             let api =
                 try_init_nvenc().ok_or_else(|| "nvEncodeAPI64.dll not available".to_string())?;
 
-            let (is_zero_copy, nv_device, nv_context, input_texture) =
-                if capturer.adapter_vendor_id == NVIDIA_VENDOR_ID {
-                    (
-                        true,
-                        capturer.device.clone(),
-                        capturer.context.clone(),
-                        capturer.texture().clone(),
-                    )
-                } else {
-                    let (dev, ctx, _) = open_nvidia_d3d11_device()?;
-                    let tex = create_bgra_texture(
-                        &dev,
-                        capturer.encode_width,
-                        capturer.encode_height,
-                        false,
-                    )?;
-                    (false, dev, ctx, tex)
-                };
+            if capturer.adapter_vendor_id != NVIDIA_VENDOR_ID {
+                return Err("NVENC requires an NVIDIA display adapter for GPU-only input".into());
+            }
+            let nv_device = capturer.device.clone();
+            let nv_context = capturer.context.clone();
+            let input_texture = capturer.texture().clone();
 
             let main10 = codec == VideoCodec::HevcMain10;
             let full_chroma = codec == VideoCodec::Hevc444;
@@ -775,13 +753,9 @@ pub mod win {
             encode_config.gopLength = u32::MAX;
             encode_config.frameIntervalP = 1; // Strict IPP, zero B-frames
             encode_config.rcParams.version = rung.rc_params_ver();
-            encode_config.rcParams.rateControlMode = if settings.vbr {
-                NV_ENC_PARAMS_RC_MODE::VBR
-            } else {
-                NV_ENC_PARAMS_RC_MODE::CBR
-            };
+            encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::CBR;
             encode_config.rcParams.averageBitRate = bitrate_bps;
-            encode_config.rcParams.maxBitRate = settings.max_bitrate(bitrate_bps);
+            encode_config.rcParams.maxBitRate = bitrate_bps;
 
             let frame_bits = settings.vbv_bits(bitrate_bps, u32::from(fps));
             encode_config.rcParams.vbvBufferSize = frame_bits;
@@ -886,11 +860,11 @@ pub mod win {
                 bitrate_bps,
                 settings.preset == 3,
             );
-            plan.rate_control.vbr = settings.vbr;
+            plan.rate_control.vbr = false;
             plan.rate_control.vbv_bits = frame_bits;
             plan.rate_control.aq_strength = settings.aq_strength.min(15);
-            plan.rate_control.min_qp_intra = settings.min_qp.min(51);
-            plan.rate_control.min_qp_inter_p = settings.min_qp.min(51);
+            plan.rate_control.min_qp_intra = 5;
+            plan.rate_control.min_qp_inter_p = 5;
             plan.rate_control.multi_pass_quarter_res = settings.quarter_pass;
             plan.intra_refresh.enabled = intra_refresh.enabled;
             plan.intra_refresh.period = intra_refresh.period_frames;
@@ -914,12 +888,6 @@ pub mod win {
             if s != NVENCSTATUS::SUCCESS {
                 plan.rate_control.aq_strength = 0;
                 unsafe { apply_nvenc_plan(&mut encode_config, codec, &plan) };
-                init_params.encodeConfig = &mut encode_config;
-                s = unsafe { (api.nvEncInitializeEncoder)(encoder, &mut init_params) };
-            }
-            if s != NVENCSTATUS::SUCCESS && settings.vbr {
-                encode_config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::CBR;
-                plan.rate_control.vbr = false;
                 init_params.encodeConfig = &mut encode_config;
                 s = unsafe { (api.nvEncInitializeEncoder)(encoder, &mut init_params) };
             }
@@ -982,7 +950,6 @@ pub mod win {
                 rung,
                 codec,
                 pipeline_label,
-                is_zero_copy,
                 _nv_device: nv_device,
                 nv_context,
                 input_texture,
@@ -998,14 +965,12 @@ pub mod win {
                 force_idr_next: true,
                 force_ir_frames: 0,
                 intra_refresh,
-                cpu_staging: Vec::new(),
                 last_encode_ms: 0.0,
                 settings: crate::nvenc::NvencSettings {
                     aq_strength: plan.rate_control.aq_strength,
                     ..settings
                 },
                 plan,
-                refine_frames: 0,
             })
         }
     }
@@ -1050,7 +1015,7 @@ pub mod win {
                 .settings
                 .vbv_bits(bitrate_bps, self.init_params.frameRateNum);
             cfg_copy.rcParams.averageBitRate = bitrate_bps;
-            cfg_copy.rcParams.maxBitRate = self.settings.max_bitrate(bitrate_bps);
+            cfg_copy.rcParams.maxBitRate = bitrate_bps;
             cfg_copy.rcParams.vbvBufferSize = frame_bits;
             cfg_copy.rcParams.vbvInitialDelay = frame_bits;
             unsafe { apply_nvenc_plan(&mut cfg_copy, self.codec, &self.plan) };
@@ -1097,40 +1062,12 @@ pub mod win {
             }
         }
 
-        /// Idle refinement: drop the QP floor for a couple of frames so a
-        /// static desktop snaps to near-lossless clarity, then restore the
-        /// streaming plan automatically.
-        fn request_refinement(&mut self, frames: u32) {
-            self.refine_frames = frames.max(1);
-            let previous = self.plan.clone();
-            self.plan.begin_refinement();
-            let bps = self.encode_config.rcParams.averageBitRate;
-            if self.set_bitrate_bps(bps).is_err() {
-                self.plan = previous;
-                self.refine_frames = 0;
-            }
-        }
-
         fn encode(
             &mut self,
-            capturer: &mut DxgiCapturer,
+            _capturer: &mut DxgiCapturer,
             timestamp_us: u64,
         ) -> Result<Option<EncodedAccessUnit>, String> {
             let t_encode_start = Instant::now();
-
-            if !self.is_zero_copy {
-                capturer.read_bgra_into(&mut self.cpu_staging)?;
-                unsafe {
-                    self.nv_context.UpdateSubresource(
-                        &self.input_texture,
-                        0,
-                        None,
-                        self.cpu_staging.as_ptr().cast(),
-                        self.width * 4,
-                        0,
-                    );
-                }
-            }
 
             self.yuv_converter.convert(
                 &self.nv_context,
@@ -1227,18 +1164,6 @@ pub mod win {
 
             // Record exact Parsec-style wall-clock encode duration (microseconds -> EMA ms)
             self.last_encode_ms = crate::capture::record_encode_latency_us(encode_us);
-
-            if self.refine_frames > 0 {
-                self.refine_frames -= 1;
-                if self.refine_frames == 0 {
-                    self.plan.end_refinement();
-                    self.plan.rate_control.min_qp_intra = self.settings.min_qp.min(51);
-                    self.plan.rate_control.min_qp_inter_p = self.settings.min_qp.min(51);
-                    self.plan.rate_control.aq_strength = self.settings.aq_strength;
-                    let bps = self.encode_config.rcParams.averageBitRate;
-                    let _ = self.set_bitrate_bps(bps);
-                }
-            }
 
             Ok(Some(EncodedAccessUnit {
                 codec: self.codec,

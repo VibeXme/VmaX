@@ -1,23 +1,11 @@
 //! Rate-control policy for the non-NVENC encoder paths.
 //!
-//! The NVENC plan in [`crate::nvenc`] is explicit: VBR with a two-frame VBV, a
-//! peak above the average so a busy frame can borrow bits, and no lookahead.
-//! The Media Foundation path — which is what every AMD, Intel and
-//! software-encode host actually runs — was not: it negotiated plain CBR with a
-//! vendor default GOP. That combination is the "liquid" look: every detailed
-//! frame is clipped to `bitrate / fps`, the rate controller answers with a QP
-//! spike on exactly the frames that need detail, and a short default GOP keeps
-//! spending bits on I-frames that add nothing to a progressive stream.
-//!
-//! This module is the single place that decides those numbers, so the vendor
-//! MFT setup only has to push them through `ICodecAPI`. It is deliberately
-//! platform-independent and unit-tested: the Windows encoder cannot be tested
-//! on a CI box, the policy can.
+//! Media Foundation negotiates the supported rate control and GOP with the vendor MFT.
 
 /// `eAVEncCommonRateControlMode` values.
 pub const RC_CBR: u32 = 0;
 /// Peak-constrained VBR: the average is held, individual frames may spend up to
-/// `max_bitrate`. This is the closest Media Foundation gets to the NVENC plan.
+/// `max_bitrate`.
 pub const RC_PEAK_CONSTRAINED_VBR: u32 = 1;
 
 /// Two seconds of pictures between IDRs, matching the NVENC intra-refresh
@@ -52,10 +40,7 @@ pub struct MftRateControl {
 impl MftRateControl {
     /// Rate control for a stream at `bitrate_bps` and `fps`.
     ///
-    /// `detail` selects the quality-leaning encoder effort. It is the same
-    /// signal that picks NVENC P3 over P4: text, IDEs and UI benefit from the
-    /// slower search, and the frame budget is only generous enough for it when
-    /// the client asked for detail pacing.
+    /// Detail pacing requests a more thorough search from the MFT.
     pub fn for_stream(bitrate_bps: u32, fps: u16, detail: bool) -> Self {
         let fps = u32::from(fps.max(1));
         let mean = bitrate_bps.max(1);
@@ -92,9 +77,7 @@ impl MftRateControl {
     }
 }
 
-/// Twice the average, the same head-start NVENC gets from
-/// [`crate::nvenc::NvencSettings::max_bitrate`]. A busy frame borrows, the next
-/// quiet frame repays. `mean` is already clamped to at least 1 bit/s.
+/// Peak-constrained MFTs may spend twice their average rate on detailed frames.
 fn peak_for(mean: u32) -> u32 {
     mean.saturating_mul(2).max(mean.saturating_add(1))
 }

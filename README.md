@@ -116,15 +116,21 @@ network path or capture-to-display latency.
 
 ### Optional TURN over UDP
 
-With a VmaX 5.3.4 or later host, viewer and signaling server, the Windows
-host can use an authenticated IPv4 TURN allocation. Set these variables in
-the host application's launch environment:
+With a VmaX 5.3.4 or later viewer and signaling server, a compatible Windows
+host can use an authenticated IPv4 TURN allocation. To configure automatic
+credentials on a host with Cloudflare Realtime TURN support, create a TURN key
+in the Cloudflare dashboard and set
+`VMAX_CLOUDFLARE_TURN_KEY_ID` and `VMAX_CLOUDFLARE_TURN_API_TOKEN` in the
+host application's launch environment. The host requests temporary credentials
+and uses the first advertised UDP endpoint that successfully allocates a relay.
+Keep the scoped API token private and configure it only on the hosting machine.
+
+For another provider or a fallback when Cloudflare is unavailable, set:
 
 - `VMAX_TURN_SERVER` — UDP TURN endpoint as `hostname:port`, such as
   `turn.cloudflare.com:3478`.
 - `VMAX_TURN_USERNAME` and `VMAX_TURN_PASSWORD` — TURN client credentials
-  issued by your provider. For a managed service, use scoped, short-lived
-  credentials. Keep the provider's credential-issuing API token on your backend.
+  issued by your provider. Use scoped, short-lived credentials when available.
 
 The viewer does not need those credentials. VmaX verifies the UDP route with
 authenticated packets before switching traffic to it. Direct UDP takes

@@ -1104,6 +1104,8 @@ pub struct VideoReassembler {
     max_jitter_window: Duration,
     keyframe_jitter_window: Duration,
     max_in_flight: usize,
+    expected_shards: u64,
+    missing_shards: u64,
 }
 
 impl VideoReassembler {
@@ -1114,7 +1116,23 @@ impl VideoReassembler {
             max_jitter_window,
             keyframe_jitter_window: max_jitter_window,
             max_in_flight: 8,
+            expected_shards: 0,
+            missing_shards: 0,
         }
+    }
+
+    // Count data shards when an observed frame completes or expires. Recovered
+    // shards also indicate loss on the wire before FEC repaired the picture.
+    fn retire_frame(&mut self, id: u64) -> Option<FrameAssembly> {
+        let frame = self.in_flight.remove(&id)?;
+        self.expected_shards += frame.total_data_chunks as u64;
+        self.missing_shards += (frame.total_data_chunks - frame.received_data_count) as u64
+            + u64::from(frame.fec_recovered_shards);
+        Some(frame)
+    }
+
+    pub(crate) fn data_shard_counts(&self) -> (u64, u64) {
+        (self.expected_shards, self.missing_shards)
     }
 
     pub(crate) fn set_jitter_windows(&mut self, delta: Duration, keyframe: Duration) {
@@ -1151,7 +1169,7 @@ impl VideoReassembler {
         entry.insert_packet(&header, payload);
 
         if entry.is_complete() {
-            let Some(completed) = self.in_flight.remove(&header.frame_id) else {
+            let Some(completed) = self.retire_frame(header.frame_id) else {
                 return Ok(ReassembleOutcome::Incomplete);
             };
             let stale_ids: Vec<u64> = self
@@ -1162,7 +1180,7 @@ impl VideoReassembler {
                 .collect();
             let dropped_frames = dropped_from_sweep + stale_ids.len() as u32;
             for id in stale_ids {
-                self.in_flight.remove(&id);
+                self.retire_frame(id);
             }
             self.last_completed_frame = Some(header.frame_id);
             return Ok(ReassembleOutcome::Completed {
@@ -1197,12 +1215,12 @@ impl VideoReassembler {
             .collect();
         let mut dropped = expired.len() as u32;
         for id in expired {
-            self.in_flight.remove(&id);
+            self.retire_frame(id);
         }
 
         while self.in_flight.len() > self.max_in_flight {
             if let Some(oldest_id) = self.in_flight.keys().next().copied() {
-                self.in_flight.remove(&oldest_id);
+                self.retire_frame(oldest_id);
                 dropped += 1;
             }
         }

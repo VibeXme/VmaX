@@ -43,8 +43,6 @@ const PUNCH_MAGIC: &[u8] = b"VMAX_PUNCH_V1";
 const PUNCH_ACK_MAGIC: &[u8] = b"VMAX_PUNCH_ACK_V1";
 const DEFAULT_FEC_GROUP_SIZE: u8 = 10;
 const MAX_QUEUED_DELTA_BYTES: usize = 512 * 1024;
-const RELAY_STARTUP_BITRATE_BPS: u32 = 4_000_000;
-const HIGH_RTT_STARTUP_BITRATE_BPS: u32 = 6_000_000;
 const PLI_INTERVAL: Duration = Duration::from_millis(200);
 /// Maximum age of an encoded delta frame before it is considered stale.
 ///
@@ -114,16 +112,6 @@ fn pending_video_cap(
         + recovery_allowance;
     ((target_bps as f64 / 8.0 * budget.as_secs_f64()) as usize)
         .clamp(64 * 1024, MAX_QUEUED_DELTA_BYTES)
-}
-
-fn quic_startup_bitrate(initial_bps: u32, relayed: bool, rtt: Duration) -> u32 {
-    if relayed {
-        initial_bps.min(RELAY_STARTUP_BITRATE_BPS)
-    } else if rtt >= Duration::from_millis(60) {
-        initial_bps.min(HIGH_RTT_STARTUP_BITRATE_BPS)
-    } else {
-        initial_bps
-    }
 }
 
 fn is_local_candidate(address: SocketAddr) -> bool {
@@ -277,6 +265,8 @@ pub struct NetworkConfig {
     pub initial_bitrate_bps: u32,
     #[serde(default)]
     pub fixed_bitrate: bool,
+    #[serde(default)]
+    pub strict_upload_bps: Option<u32>,
     pub fec_group_size: u8,
     pub protocol: TransportProtocol,
     pub target_fps: u16,
@@ -311,6 +301,7 @@ impl Default for NetworkConfig {
             max_bitrate_bps: MAX_VIDEO_BITRATE_BPS,
             initial_bitrate_bps: DEFAULT_INITIAL_BITRATE_BPS,
             fixed_bitrate: false,
+            strict_upload_bps: None,
             fec_group_size: DEFAULT_FEC_GROUP_SIZE,
             protocol: TransportProtocol::Quic,
             target_fps: 60,
@@ -358,6 +349,8 @@ pub struct NetworkTelemetry {
     pub congestion_state: CongestionState,
     pub video_frames_tx: u64,
     pub video_frames_rx: u64,
+    #[serde(default)]
+    pub video_packets_rx: u64,
     pub video_frames_dropped: u64,
     pub fec_recovered_shards: u64,
     pub audio_packets_tx: u64,
@@ -393,6 +386,7 @@ impl Default for NetworkTelemetry {
             congestion_state: CongestionState::Stable,
             video_frames_tx: 0,
             video_frames_rx: 0,
+            video_packets_rx: 0,
             video_frames_dropped: 0,
             fec_recovered_shards: 0,
             audio_packets_tx: 0,
@@ -542,6 +536,7 @@ pub struct VideoBacklog {
     pacer: Arc<crate::transport::PacerStats>,
     quic_bytes: Arc<AtomicU64>,
     cap_bytes: Arc<AtomicU64>,
+    raw_video_packets: Arc<AtomicU64>,
 }
 
 impl VideoBacklog {
@@ -553,6 +548,10 @@ impl VideoBacklog {
     /// share its live queue with this view.
     pub fn pacer_stats(&self) -> Arc<crate::transport::PacerStats> {
         Arc::clone(&self.pacer)
+    }
+
+    pub fn sent_packets(&self) -> u64 {
+        self.pacer.sent_packets() + self.raw_video_packets.load(Ordering::Relaxed)
     }
 
     /// Bytes queued between the pacer and the wire.
@@ -583,6 +582,7 @@ impl VideoBacklog {
 /// Non-blocking sender handles for pushing video, audio, input, and control into the active QUIC loop.
 #[derive(Clone)]
 pub struct SessionTx {
+    pub role: SessionRole,
     pub video_tx: VideoSender,
     pub audio_tx: mpsc::Sender<AudioPacket>,
     pub input_tx: mpsc::Sender<InputPacket>,
@@ -1176,6 +1176,7 @@ async fn spawn_session(
     let loop_overrides = overrides.clone();
 
     let tx_handle = SessionTx {
+        role,
         video_tx: VideoSender(video_tx),
         audio_tx,
         input_tx,
@@ -1716,31 +1717,6 @@ async fn run_p2p_session(
         }
     }
     discard_waiting_audio(&mut audio_rx);
-    let startup_bitrate = quic_startup_bitrate(
-        config.initial_bitrate_bps,
-        _relay_task.is_some(),
-        connection.rtt(),
-    );
-    if role == SessionRole::Host
-        && !config.fixed_bitrate
-        && startup_bitrate < config.initial_bitrate_bps
-    {
-        config.initial_bitrate_bps = startup_bitrate;
-        telemetry.lock().await.target_bitrate_bps = config.initial_bitrate_bps;
-        let _ = event_tx.send(NetworkEvent::BitrateUpdated(BitrateDecision {
-            target_bitrate_bps: config.initial_bitrate_bps,
-            state: CongestionState::Stable,
-            rtt_ms: connection.rtt().as_secs_f64() * 1000.0,
-            min_rtt_ms: connection.rtt().as_secs_f64() * 1000.0,
-            loss_pct: 0.0,
-            reason: if _relay_task.is_some() {
-                "relay startup".into()
-            } else {
-                "high RTT startup".into()
-            },
-            encoder_reconfigure_recommended: true,
-        }));
-    }
     info!(
         ?role,
         relayed = _relay_task.is_some(),
@@ -1963,6 +1939,7 @@ impl QuicPeer<'_> {
 struct SessionCounters {
     media_bitrate: std::sync::Mutex<crate::telemetry::BitrateCounter>,
     video_frames_tx: AtomicU64,
+    video_packets_rx: AtomicU64,
     video_frames_rx: AtomicU64,
     video_frames_dropped: AtomicU64,
     fec_recovered_shards: AtomicU64,
@@ -1980,6 +1957,7 @@ impl Default for SessionCounters {
                 Duration::from_secs(1),
             )),
             video_frames_tx: AtomicU64::new(0),
+            video_packets_rx: AtomicU64::new(0),
             video_frames_rx: AtomicU64::new(0),
             video_frames_dropped: AtomicU64::new(0),
             fec_recovered_shards: AtomicU64::new(0),
@@ -2043,6 +2021,17 @@ fn allow_keyframe_request(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= PLI_INTERVAL)
 }
 
+fn allow_outgoing_control(message: &ControlMessage, last_pli: &mut Option<Instant>) -> bool {
+    if let ControlMessage::RequestKeyframe { .. } = message {
+        let now = Instant::now();
+        if !allow_keyframe_request(*last_pli, now) {
+            return false;
+        }
+        *last_pli = Some(now);
+    }
+    true
+}
+
 fn handle_inbound_media_datagram(
     dgram: &[u8],
     reassembler: &mut VideoReassembler,
@@ -2065,6 +2054,10 @@ fn handle_inbound_media_datagram(
     ) && let Ok(mut bitrate) = counters.media_bitrate.lock()
     {
         bitrate.add(dgram.len(), Instant::now());
+    }
+
+    if dgram[0] == ChannelId::Video as u8 {
+        counters.video_packets_rx.fetch_add(1, Ordering::Relaxed);
     }
 
     // Sample data and unweighted parity before reassembly so the host can
@@ -2180,6 +2173,7 @@ async fn publish_telemetry_snapshot(
         guard.target_bitrate_bps = decision.target_bitrate_bps;
         guard.congestion_state = decision.state;
         guard.video_frames_tx = counters.video_frames_tx.load(Ordering::Relaxed);
+        guard.video_packets_rx = counters.video_packets_rx.load(Ordering::Relaxed);
         guard.video_frames_rx = counters.video_frames_rx.load(Ordering::Relaxed);
         guard.video_frames_dropped = counters.video_frames_dropped.load(Ordering::Relaxed);
         guard.fec_recovered_shards = counters.fec_recovered_shards.load(Ordering::Relaxed);
@@ -2214,6 +2208,9 @@ fn sync_bitrate_decision(
     decision
 }
 
+pub const BANDWIDTH_FULL: &str = "Host upload bandwidth full";
+const KEYFRAME_SEND_DEADLINE: Duration = Duration::from_millis(500);
+
 fn video_reassembly_windows(
     base: Duration,
     rtt: Duration,
@@ -2221,14 +2218,9 @@ fn video_reassembly_windows(
 ) -> (Duration, Duration) {
     let allowance = (variation * 2).min(Duration::from_millis(60));
     let delta = (base.max(rtt / 2) + allowance).min(Duration::from_millis(140));
-    // A keyframe can be many times the size of a delta frame.  The pacer may
-    // legitimately need 50-100 ms to drain one at a low startup bitrate, so
-    // the keyframe window must outlive that spread.  This only delays giving
-    // up on an incomplete keyframe; a complete one is emitted immediately.
-    let keyframe = (base.max(rtt * 2) + allowance)
-        .max(Duration::from_millis(120))
-        .min(Duration::from_millis(500));
-    (delta, keyframe)
+    // The pacer may spend its entire recovery deadline serializing a large IDR.
+    // Completed frames are delivered immediately regardless of this window.
+    (delta, KEYFRAME_SEND_DEADLINE)
 }
 
 #[cfg(test)]
@@ -2277,24 +2269,20 @@ fn jitter_extends_recovery_without_changing_the_stable_path_window() {
     let ms = Duration::from_millis;
     assert_eq!(
         video_reassembly_windows(ms(18), ms(8), ms(0)),
-        (ms(18), ms(120))
+        (ms(18), ms(500))
     );
     assert_eq!(
         video_reassembly_windows(ms(18), ms(64), ms(0)),
-        (ms(32), ms(128))
+        (ms(32), ms(500))
     );
     assert_eq!(
         video_reassembly_windows(ms(18), ms(64), ms(14)),
-        (ms(60), ms(156))
+        (ms(60), ms(500))
     );
     assert_eq!(
         video_reassembly_windows(ms(18), ms(800), ms(150)),
         (ms(140), ms(500))
     );
-    assert_eq!(quic_startup_bitrate(20_000_000, false, ms(8)), 20_000_000);
-    assert_eq!(quic_startup_bitrate(20_000_000, false, ms(64)), 6_000_000);
-    assert_eq!(quic_startup_bitrate(20_000_000, true, ms(8)), 4_000_000);
-    assert_eq!(quic_startup_bitrate(2_500_000, false, ms(64)), 2_500_000);
     // Two 60 FPS frames would exceed the relay's 32 ms sender queue ceiling.
     assert_eq!(
         pending_video_cap(4_000_000, 60, ms(100), false, Duration::ZERO),
@@ -2568,6 +2556,9 @@ async fn run_quic_multiplex_loop(
         BitrateController::new(config.initial_bitrate_bps, config.max_bitrate_bps);
     let mut last_max_bitrate_bps = config.max_bitrate_bps;
     let mut reported_target = config.initial_bitrate_bps;
+    let mut stream_rate = crate::bitrate::StreamRate::default();
+    let mut stream_codec = VideoCodec::Hevc;
+    let mut last_outgoing_pli = None;
     let mut gcc = crate::congestion::GccController::with_sensitivity(
         config.initial_bitrate_bps,
         config.max_bitrate_bps,
@@ -2629,6 +2620,9 @@ async fn run_quic_multiplex_loop(
             }
             reason = conn.closed() => {
                 match reason {
+                    quinn::ConnectionError::ApplicationClosed(ref close)
+                        if close.error_code == 403u32.into() && close.reason.as_ref() == BANDWIDTH_FULL.as_bytes() =>
+                            break Err(NetworkError::Permission(BANDWIDTH_FULL.into())),
                     quinn::ConnectionError::LocallyClosed => break Ok(()),
                     quinn::ConnectionError::ApplicationClosed(ref close)
                         if close.error_code == 0u32.into() => break Ok(()),
@@ -2663,14 +2657,14 @@ async fn run_quic_multiplex_loop(
                 ));
             }
             Some(frame) = next_video_frame(&mut video_rx) => {
+                if config.strict_upload_bps.is_some_and(|budget| budget < crate::bitrate::codec_floor(frame.codec)) {
+                    conn.close(403u32.into(), BANDWIDTH_FULL.as_bytes());
+                    break Err(NetworkError::Permission(BANDWIDTH_FULL.into()));
+                }
+                stream_codec = frame.codec;
                 let queued = QUIC_DATAGRAM_BUFFER_BYTES.saturating_sub(conn.datagram_send_buffer_space())
                     .saturating_add(pacer.stats().queue_bytes as usize);
-                let adaptive_bps = if last_feedback.is_some_and(|stamp| stamp.elapsed() < Duration::from_millis(600)) {
-                    gcc.current_bitrate_bps()
-                } else {
-                    bitrate_ctrl.current_bitrate_bps()
-                };
-                let target_bitrate = overrides.target_bitrate(adaptive_bps);
+                let target_bitrate = overrides.target_bitrate(reported_target);
                 let configured_fec = overrides.fec_group_size.load(Ordering::Relaxed);
                 if live_fec_group != configured_fec {
                     live_fec_group = configured_fec;
@@ -2693,7 +2687,7 @@ async fn run_quic_multiplex_loop(
                 let gap = last_video_frame.is_some_and(|id| id.wrapping_add(1) != frame.frame_id);
                 let delta_send_deadline = max_capture_queue_age(frame.fps);
                 let max_frame_age = if frame.is_keyframe {
-                    Duration::from_millis(500)
+                    KEYFRAME_SEND_DEADLINE
                 } else {
                     delta_send_deadline
                 };
@@ -2740,7 +2734,6 @@ async fn run_quic_multiplex_loop(
                         continue;
                     }
                 };
-                let frame_bytes = packets.iter().map(Bytes::len).sum::<usize>();
                 let mut shards = Vec::with_capacity(packets.len());
                 for packet in packets {
                     if let Ok((header, _)) = crate::protocol::VideoChunkHeader::decode(&packet) {
@@ -2753,8 +2746,7 @@ async fn run_quic_multiplex_loop(
                         });
                     }
                 }
-                let complete = frame_bytes <= conn.datagram_send_buffer_space().saturating_sub(16 * 1200)
-                    && pacer.send_frame(
+                let complete = pacer.send_frame(
                         shards,
                         frame.captured_at + max_frame_age,
                         crate::transport::frame_budget(frame.fps) * 3 / 5,
@@ -2776,8 +2768,11 @@ async fn run_quic_multiplex_loop(
                     counters.audio_packets_tx.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Ok(error) = &mut input_writer_result => {
-                break Err(NetworkError::Io(io::Error::other(error)));
+            writer_result = &mut input_writer_result => {
+                break match writer_result {
+                    Ok(error) => Err(NetworkError::Io(io::Error::other(error))),
+                    Err(_) => Ok(()),
+                };
             }
             Some((input, permit)) = async {
                 let permit = reliable_input_tx.reserve().await.ok()?;
@@ -2807,6 +2802,7 @@ async fn run_quic_multiplex_loop(
                 let _ = conn.send_datagram(update.encode());
             }
             Some(ctrl) = control_rx.recv() => {
+                if !allow_outgoing_control(&ctrl, &mut last_outgoing_pli) { continue; }
                 let is_disc = matches!(ctrl, ControlMessage::Disconnect { .. });
                 let _ = send_framed_control(&mut ctrl_stream, &ctrl).await;
                 if is_disc {
@@ -2814,6 +2810,7 @@ async fn run_quic_multiplex_loop(
                 }
             }
             Some(ctrl) = internal_ctrl_rx.recv() => {
+                if !allow_outgoing_control(&ctrl, &mut last_outgoing_pli) { continue; }
                 let _ = send_framed_control(&mut ctrl_stream, &ctrl).await;
             }
             Some(mut packet) = feedback_rx.recv() => {
@@ -2898,11 +2895,6 @@ async fn run_quic_multiplex_loop(
                 }
                 let feedback_fresh = last_feedback
                     .is_some_and(|stamp| now.saturating_duration_since(stamp) < Duration::from_millis(600));
-                let active_bps = if feedback_fresh {
-                    gcc.current_bitrate_bps()
-                } else {
-                    bitrate_ctrl.current_bitrate_bps()
-                };
                 let sample = PathTelemetrySample {
                     rtt: qstats.path.rtt,
                     min_rtt: qstats.path.min_rtt,
@@ -2915,7 +2907,7 @@ async fn run_quic_multiplex_loop(
                     } else { Duration::from_secs_f64(
                         (QUIC_DATAGRAM_BUFFER_BYTES.saturating_sub(conn.datagram_send_buffer_space())
                             .saturating_add(pacer.stats().queue_bytes as usize) as f64)
-                            * 8.0 / overrides.target_bitrate(active_bps).max(1) as f64,
+                            * 8.0 / overrides.target_bitrate(reported_target).max(1) as f64,
                     ) },
                 };
                 let mut decision = if feedback_fresh {
@@ -2934,6 +2926,18 @@ async fn run_quic_multiplex_loop(
                     decision.target_bitrate_bps = gcc.current_bitrate_bps();
                 }
                 overrides.apply_bitrate_policy(&mut decision);
+                let (ceiling, fixed) = overrides.bitrate_policy();
+                if role == SessionRole::Host && !fixed {
+                    let congested = path_loss_permille > 20 || decision.loss_pct > 2.0
+                        || qstats.path.rtt > qstats.path.min_rtt + Duration::from_millis(25);
+                    decision.target_bitrate_bps = stream_rate.update(Instant::now(), reported_target, ceiling, stream_codec, congested);
+                    decision.encoder_reconfigure_recommended = decision.target_bitrate_bps != reported_target;
+                    if decision.encoder_reconfigure_recommended {
+                        decision.reason = if reported_target > ceiling { "upload or viewer limit" }
+                            else if congested { "sustained congestion" }
+                            else { "stable link" }.into();
+                    }
+                }
                 if role == SessionRole::Host && reported_target != decision.target_bitrate_bps {
                     reported_target = decision.target_bitrate_bps;
                     let _ = event_tx.send(NetworkEvent::BitrateUpdated(decision.clone()));
@@ -3004,7 +3008,10 @@ async fn run_raw_udp_loop(
         let _ = socket.send(&dgram).await;
     }
 
-    let mut reassembler = VideoReassembler::new(Duration::from_millis(config.jitter_window_ms));
+    let delta_window = Duration::from_millis(config.jitter_window_ms);
+    let mut reassembler = VideoReassembler::new(delta_window);
+    reassembler.set_jitter_windows(delta_window, KEYFRAME_SEND_DEADLINE);
+    let mut peer_loss_pct = 0.0;
     let latest_video = LatestVideo::default();
     let mut video_sync = VideoSyncRequest::default();
     let mut last_remote_pli = None;
@@ -3012,8 +3019,10 @@ async fn run_raw_udp_loop(
         BitrateController::new(config.initial_bitrate_bps, config.max_bitrate_bps);
     let mut last_max_bitrate_bps = config.max_bitrate_bps;
     let mut reported_target = config.initial_bitrate_bps;
+    let mut stream_rate = crate::bitrate::StreamRate::default();
+    let mut stream_codec = VideoCodec::Hevc;
+    let mut last_outgoing_pli = None;
     let mut telemetry_tick = interval(Duration::from_millis(200));
-    let mut sent_packets: u64 = 0;
     let mut last_rtt = Duration::from_millis(2);
     let mut min_rtt = Duration::from_millis(100);
     let mut last_peer_seen = Instant::now();
@@ -3063,8 +3072,14 @@ async fn run_raw_udp_loop(
                                             reason: reason.clone(),
                                         });
                                     }
-                                    ControlMessage::TelemetryFeedback { frames_dropped, .. } => {
+                                    ControlMessage::TelemetryFeedback { frames_dropped, loss_pct, .. } => {
+                                        if (0.0..=100.0).contains(loss_pct) {
+                                            peer_loss_pct = *loss_pct;
+                                        }
                                         counters.peer_frames_dropped.store(*frames_dropped, Ordering::Relaxed);
+                                    }
+                                    ControlMessage::Disconnect { reason } if reason == BANDWIDTH_FULL => {
+                                        return Err(NetworkError::Permission(BANDWIDTH_FULL.into()));
                                     }
                                     ControlMessage::Disconnect { .. } => {
                                         let _ = event_tx.send(NetworkEvent::ControlReceived(msg));
@@ -3096,6 +3111,14 @@ async fn run_raw_udp_loop(
                 }
             }
             Some(frame) = next_video_frame(&mut video_rx) => {
+                if config.strict_upload_bps.is_some_and(|budget| budget < crate::bitrate::codec_floor(frame.codec)) {
+                    let message = ControlMessage::Disconnect { reason: BANDWIDTH_FULL.into() };
+                    if let Ok(bytes) = message.encode_datagram() {
+                        let _ = socket.send(&bytes).await;
+                    }
+                    return Err(NetworkError::Permission(BANDWIDTH_FULL.into()));
+                }
+                stream_codec = frame.codec;
                 let fec_group = overrides.fec_group_size.load(Ordering::Relaxed);
                 let packets = match packetize_video(
                     frame.codec,
@@ -3118,24 +3141,24 @@ async fn run_raw_udp_loop(
                         continue;
                     }
                 };
+                let mut sent_video_packets = 0;
                 for pkt in packets {
                     if socket.send(&pkt).await.is_ok() {
-                        sent_packets += 1;
+                        sent_video_packets += 1;
                     }
                 }
+                overrides.backlog.raw_video_packets.fetch_add(sent_video_packets, Ordering::Relaxed);
                 counters.video_frames_tx.fetch_add(1, Ordering::Relaxed);
             }
             Some(audio) = audio_rx.recv() => {
                 let bytes = audio.encode();
                 if socket.send(&bytes).await.is_ok() {
-                    sent_packets += 1;
                     counters.audio_packets_tx.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Some(input) = input_rx.recv() => {
                 let bytes = input.encode();
                 if socket.send(&bytes).await.is_ok() {
-                    sent_packets += 1;
                     counters.input_events_tx.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -3144,6 +3167,7 @@ async fn run_raw_udp_loop(
                 let _ = socket.send(&update.encode()).await;
             }
             Some(ctrl) = control_rx.recv() => {
+                if !allow_outgoing_control(&ctrl, &mut last_outgoing_pli) { continue; }
                 let is_disc = matches!(ctrl, ControlMessage::Disconnect { .. });
                 if let Ok(dgram) = ctrl.encode_datagram() {
                     let _ = socket.send(&dgram).await;
@@ -3153,6 +3177,7 @@ async fn run_raw_udp_loop(
                 }
             }
             Some(ctrl) = internal_ctrl_rx.recv() => {
+                if !allow_outgoing_control(&ctrl, &mut last_outgoing_pli) { continue; }
                 if let Ok(dgram) = ctrl.encode_datagram() {
                     let _ = socket.send(&dgram).await;
                 }
@@ -3174,11 +3199,12 @@ async fn run_raw_udp_loop(
                 let frames_drop = counters.video_frames_dropped.load(Ordering::Relaxed);
                 let fec_rec = counters.fec_recovered_shards.load(Ordering::Relaxed);
                 let frames_rx = counters.video_frames_rx.load(Ordering::Relaxed);
+                let (expected, missing) = reassembler.data_shard_counts();
                 let sample = PathTelemetrySample {
                     rtt: last_rtt,
                     min_rtt: min_rtt.min(last_rtt),
-                    sent_packets,
-                    lost_packets: frames_drop,
+                    sent_packets: expected,
+                    lost_packets: missing,
                     congestion_events: 0,
                     peer_frames_dropped: counters.peer_frames_dropped.load(Ordering::Relaxed),
                     video_queue_delay: Duration::ZERO,
@@ -3190,7 +3216,21 @@ async fn run_raw_udp_loop(
                     live_max,
                     sample,
                 );
+                if role == SessionRole::Host {
+                    decision.loss_pct = peer_loss_pct;
+                }
                 overrides.apply_bitrate_policy(&mut decision);
+                let (ceiling, fixed) = overrides.bitrate_policy();
+                if role == SessionRole::Host && !fixed {
+                    let congested = decision.loss_pct > 2.0 || decision.rtt_ms > decision.min_rtt_ms + 25.0;
+                    decision.target_bitrate_bps = stream_rate.update(Instant::now(), reported_target, ceiling, stream_codec, congested);
+                    decision.encoder_reconfigure_recommended = decision.target_bitrate_bps != reported_target;
+                    if decision.encoder_reconfigure_recommended {
+                        decision.reason = if reported_target > ceiling { "upload or viewer limit" }
+                            else if congested { "sustained congestion" }
+                            else { "stable link" }.into();
+                    }
+                }
                 if role == SessionRole::Host && reported_target != decision.target_bitrate_bps {
                     reported_target = decision.target_bitrate_bps;
                     let _ = event_tx.send(NetworkEvent::BitrateUpdated(decision.clone()));
@@ -3354,6 +3394,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum TestRoute {
         Direct,
+        StrictBandwidth,
         DirectIpv6,
         DirectIpv4FromDualStack,
         UnreachableUdp,
@@ -3381,6 +3422,7 @@ mod tests {
             },
             relay_only: route == TestRoute::RelayOnly,
             protocol,
+            strict_upload_bps: (route == TestRoute::StrictBandwidth).then_some(11_000_000),
             ..Default::default()
         };
 
@@ -3435,6 +3477,21 @@ mod tests {
             wait_connected(&mut host.event_rx, route),
             wait_connected(&mut client.event_rx, route)
         );
+        if route == TestRoute::StrictBandwidth {
+            // HEVC would fit in this budget, but the negotiated H.264 fallback cannot.
+            host.tx.video_tx.publish(OutboundVideoFrame {
+                meta: crate::telemetry::FrameTelemetry::full_range_hardware(0, 1920, 1080),
+                codec: VideoCodec::H264, frame_id: 1, timestamp_us: 0,
+                captured_at: Instant::now(), fps: 60, is_keyframe: true,
+                payload: Bytes::from_static(b"first H.264 access unit"),
+            }).unwrap();
+            for session in [host, client] {
+                let result = timeout(Duration::from_secs(3), session.join_handle).await.unwrap().unwrap();
+                assert!(matches!(result, Err(NetworkError::Permission(ref reason)) if reason == BANDWIDTH_FULL), "{result:?}");
+            }
+            relay.stop();
+            return;
+        }
         if route == TestRoute::RelayUpgrade {
             timeout(Duration::from_secs(4), async {
                 loop {
@@ -3466,7 +3523,13 @@ mod tests {
             );
         }
 
-        let synthetic_hevc = Bytes::from(vec![0xAA; 24_000]);
+        // An IDR larger than the entire QUIC send buffer must still drain shard by shard.
+        let frame_bytes = if protocol == TransportProtocol::Quic && route == TestRoute::Direct {
+            QUIC_DATAGRAM_BUFFER_BYTES + 1
+        } else {
+            24_000
+        };
+        let synthetic_hevc = Bytes::from(vec![0xAA; frame_bytes]);
         if protocol == TransportProtocol::Quic {
             host.tx
                 .video_tx
@@ -3704,6 +3767,13 @@ mod tests {
             let _ = host.join_handle.await;
         }
         relay.stop();
+    }
+
+    #[tokio::test]
+    async fn strict_upload_checks_the_negotiated_codec_and_explains_rejection() {
+        for protocol in [TransportProtocol::Quic, TransportProtocol::RawUdp] {
+            assert_multiplexed_loopback(protocol, TestRoute::StrictBandwidth).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -30,6 +30,7 @@ pub mod native_client;
 #[cfg(target_os = "windows")]
 pub mod native_d3d11;
 
+pub(crate) mod net;
 pub mod network;
 pub mod nvenc;
 pub mod opus_audio;

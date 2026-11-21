@@ -464,6 +464,8 @@ export function App() {
       signaling_url: endpoint.trim() || DEFAULT_SIGNALING_URL,
       enable_stun: enableStun,
       max_bitrate_mbps: config.video.bitrateMbps,
+      host_upload_mbps: config.video.hostUploadMbps,
+      strict_quality: config.video.strictQuality,
       protocol: config.network.protocol,
       resolution: config.video.resolution,
       framerate: config.video.framerate,
@@ -836,6 +838,7 @@ export function App() {
             resolution={config.video.resolution}
             pingMs={livePingMs}
             packetLossPct={telemetry.peer_packet_loss_pct ?? undefined}
+            videoPacketsReceived={telemetry.video_packets_rx ?? 0}
             droppedFrames={telemetry.video_frames_dropped}
             hardwareCursor={config.network.hardwareCursor}
             nativeFps={hardware.fps}

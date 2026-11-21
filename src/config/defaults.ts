@@ -32,14 +32,10 @@ export const STREAM_FRAMERATES = [30, 60, 90, 120, 144] as const;
 
 const DEFAULT_NVENC: NvencSettings = {
   preset: 4,
-  vbr: true,
-  // Two frame-times of rate budget: one frame forces a quantiser cliff on
-  // every detailed frame, which is what made text look soft and then sharp.
-  vbvFrames: 2,
+  vbr: false,
+  vbvFrames: 1,
   aqStrength: 8,
-  // 5 was where 4:2:0 text stopped sharpening: the rate controller would not
-  // spend another bit on a static screen. 3 lets text use the VBR headroom.
-  minQp: 3,
+  minQp: 5,
   quarterPass: true,
   intraRefresh: true,
   refreshPeriod: 120,
@@ -48,34 +44,21 @@ const DEFAULT_NVENC: NvencSettings = {
 
 export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
   video: {
-    // High-end gaming baseline: encode at the host's own display resolution and
-    // hold a constant 120 FPS. `fit_resolution` never upscales, so "native" is
-    // exactly the monitor the host is capturing, and the client hands the
-    // stream to its panel at that same size. The 60 Mbps is an adaptive
-    // ceiling, not a fixed rate: congestion control gives back bitrate before
-    // it ever adds latency, so a relayed friend session softens its picture
-    // while a direct path gets the full detail. Lower the ceiling (or use the
-    // weakest-link preset) if either end is on a slow uplink.
-    resolution: "native",
-    framerate: 120,
-    bitrateMbps: 60,
+    resolution: "1080p",
+    framerate: 60,
+    bitrateMbps: 24,
+    hostUploadMbps: 30,
+    strictQuality: false,
     encoder: "hardware",
-    codec: "auto",
+    codec: "hevc",
     chroma: "420",
     framePacing: "motion",
     sharpness: 30,
-    // Contrast-adaptive sharpening after reconstruction: luma-only, so it
-    // crisps letter edges without amplifying 4:2:0 colour fringing. At 120 FPS
-    // the cost of this pass is negligible, so it runs strong enough to read
-    // HUD text and weapon detail through a 4:2:0 encode.
     viewerSharpness: 55,
     upscaling: "off",
     renderer: "auto",
     lockResolution: true,
     constantFps: true,
-    // Adaptive by default. The ceiling is still the user's bitrate, but
-    // congestion feedback may lower it: a link that cannot carry 60 Mbps
-    // should soften the picture, not drop frames or add bufferbloat.
     unlimitedBitrate: false,
     nvenc: DEFAULT_NVENC,
   },
@@ -94,9 +77,7 @@ export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
     // packet is a TCP retransmit stall rather than an isolated datagram.
     fecRedundancyPct: 5,
     hardwareCursor: true,
-    // One frame interval at 120 Hz: enough for a late packet to be repaired by
-    // parity before the frame is displayed without it. Complete frames are
-    // never held for this window, so this only bounds incomplete ones.
+    // Complete frames bypass the repair window.
     packetWindowMs: 16,
     congestionSensitivity: "low_latency",
   },
@@ -156,22 +137,6 @@ function asClampedNumber(val: unknown, min: number, max: number, fallback: numbe
 
 function asBoolean(val: unknown, fallback: boolean): boolean {
   return typeof val === "boolean" ? val : fallback;
-}
-
-/**
- * One frame of rate budget was the old default and the reason detailed frames
- * (text, UI chrome) collapsed: the VBV only allowed a single frame's bits, so
- * every busy frame hit the quantiser ceiling. Untouched values move to the
- * two-frame budget; a deliberate user choice is left alone.
- */
-function migrateVbvFrames(value: unknown): number {
-  return Math.round(asClampedNumber(value, 1, 2, DEFAULT_NVENC.vbvFrames));
-}
-
-/** A QP floor of 5 was the old default; 3 is the text-friendly one. */
-function migrateMinQp(value: unknown): number {
-  const qp = Math.round(asClampedNumber(value, 0, 51, DEFAULT_NVENC.minQp));
-  return qp === 5 ? DEFAULT_NVENC.minQp : qp;
 }
 
 /**
@@ -241,14 +206,7 @@ function migrateToNativeBaseline(config: VmaXConfig): VmaXConfig {
   });
 }
 
-/**
- * The native baseline that shipped next was native/60 at 20 Mbps, motion
- * pacing, 20 host / 30 viewer sharpening, 5% FEC, a 32 ms repair window and
- * low-latency congestion. A config that still matches that whole shape was
- * never tuned by hand, so it follows the new gaming default: 120 FPS, a 60 Mbps
- * adaptive ceiling, stronger sharpening, a one-frame repair window and 192 kbps
- * audio. Any deliberate change (or a preset the user picked) is left alone.
- */
+/** Upgrade the previously shipped picture profiles when their settings still match. */
 function migrateToGamingBaseline(config: VmaXConfig): VmaXConfig {
   const v = config.video;
   const n = config.network;
@@ -266,22 +224,32 @@ function migrateToGamingBaseline(config: VmaXConfig): VmaXConfig {
     n.fecRedundancyPct === 5 &&
     n.packetWindowMs === 32 &&
     n.congestionSensitivity === "low_latency";
-  if (!untouchedNativeBaseline) {
+  const previousGamingBaseline =
+    v.resolution === "native" && v.framerate === 120 && v.bitrateMbps === 60 &&
+    v.codec === "auto" && v.encoder === "hardware" && v.chroma === "420" &&
+    v.framePacing === "motion" && v.upscaling === "off" && v.renderer === "auto" &&
+    v.sharpness === 30 && v.viewerSharpness === 55 &&
+    v.lockResolution && v.constantFps && !v.unlimitedBitrate &&
+    n.fecRedundancyPct === 5 && n.packetWindowMs === 16 &&
+    n.congestionSensitivity === "low_latency";
+  if (!untouchedNativeBaseline && !previousGamingBaseline) {
     return config;
   }
   return {
     ...config,
     video: {
       ...v,
-      framerate: 120,
-      bitrateMbps: 60,
+      resolution: "1080p",
+      codec: "hevc",
+      framerate: 60,
+      bitrateMbps: 24,
       sharpness: 30,
       viewerSharpness: 55,
     },
     audio: {
       ...config.audio,
       // Only lift audio if it was never touched either.
-      bitrateKbps: config.audio.bitrateKbps === 128 ? 192 : config.audio.bitrateKbps,
+      bitrateKbps: untouchedNativeBaseline && config.audio.bitrateKbps === 128 ? 192 : config.audio.bitrateKbps,
     },
     network: {
       ...n,
@@ -307,10 +275,12 @@ function loadSavedConfig(): VmaXConfig {
     const n = isRecord(parsed.network) ? parsed.network : {};
     const c = isRecord(parsed.customization) ? parsed.customization : {};
 
-    return migrateToNativeBaseline({
+    const config: VmaXConfig = {
       video: {
         resolution: asResolution(v.resolution, DEFAULT_VMAX_CONFIG.video.resolution),
         framerate: asFramerate(v.framerate, DEFAULT_VMAX_CONFIG.video.framerate),
+        hostUploadMbps: Math.round(asClampedNumber(v.hostUploadMbps, 1, 1000, 30)),
+        strictQuality: asBoolean(v.strictQuality, false),
         bitrateMbps: asClampedNumber(v.bitrateMbps, 1, MAX_STREAM_BITRATE_MBPS, DEFAULT_VMAX_CONFIG.video.bitrateMbps),
         encoder: asEncoder(v.encoder, DEFAULT_VMAX_CONFIG.video.encoder),
         chroma: v.chroma === "444" ? "444" : "420",
@@ -328,10 +298,10 @@ function loadSavedConfig(): VmaXConfig {
         unlimitedBitrate: asBoolean(v.unlimitedBitrate, DEFAULT_VMAX_CONFIG.video.unlimitedBitrate),
         nvenc: {
           preset: nvenc.preset === 3 ? 3 : 4,
-          vbr: asBoolean(nvenc.vbr, DEFAULT_NVENC.vbr),
-          vbvFrames: migrateVbvFrames(nvenc.vbvFrames),
+          vbr: false,
+          vbvFrames: 1,
           aqStrength: Math.round(asClampedNumber(nvenc.aqStrength, 0, 15, DEFAULT_NVENC.aqStrength)),
-          minQp: migrateMinQp(nvenc.minQp),
+          minQp: 5,
           quarterPass: asBoolean(nvenc.quarterPass, DEFAULT_NVENC.quarterPass),
           intraRefresh: asBoolean(nvenc.intraRefresh, DEFAULT_NVENC.intraRefresh),
           refreshPeriod: migrateRefreshPeriod(nvenc.refreshPeriod),
@@ -372,7 +342,8 @@ function loadSavedConfig(): VmaXConfig {
         hapticsEnabled: asBoolean(c.hapticsEnabled, true),
         hapticsIntensity: Math.round(asClampedNumber(c.hapticsIntensity, 0, 100, 100)),
       },
-    });
+    };
+    return v.hostUploadMbps === undefined ? migrateToNativeBaseline(config) : config;
   } catch {
     return DEFAULT_VMAX_CONFIG;
   }
