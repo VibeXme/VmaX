@@ -18,7 +18,7 @@ const methods = new Map(
 
 for (const [name, descriptor] of [
   ["onNativeVideoFrame", "([BJIIIZ)V"],
-  ["layoutSurface", "(IIIIZ)V"],
+  ["layoutSurface", "(Landroid/app/Activity;Landroid/webkit/WebView;IIIIZ)V"],
   ["resetSession", "()V"],
 ]) {
   if (methods.get(name) !== descriptor) {

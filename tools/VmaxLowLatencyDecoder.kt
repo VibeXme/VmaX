@@ -52,57 +52,73 @@ object VmaxLowLatencyDecoder {
     @JvmStatic private external fun nativeReportVideoSize(width: Int, height: Int)
     @JvmStatic private external fun nativeNotifyFrameRendered()
 
-    fun attach(activity: Activity, web: WebView) {
-        web.setBackgroundColor(Color.TRANSPARENT)
-        web.post {
-            if (webView === web || activity.isDestroyed) return@post
-            val root = activity.findViewById<FrameLayout>(android.R.id.content) ?: return@post
-            view?.let { current -> (current.parent as? FrameLayout)?.removeView(current) }
-            val target = SurfaceView(activity)
-            view = target
-            webView = web
-            root.setBackgroundColor(Color.BLACK)
-            target.importantForAccessibility = SurfaceView.IMPORTANT_FOR_ACCESSIBILITY_NO
-            target.holder.addCallback(object : SurfaceHolder.Callback {
-                override fun surfaceCreated(holder: SurfaceHolder) {
-                    synchronized(this@VmaxLowLatencyDecoder) {
-                        if (view !== target) return
-                        surface = holder.surface
-                        failures = 0
-                        nativeSetDecoderCapabilities(runCatching { decoderCapabilities() }.getOrDefault(0))
+    private fun attach(activity: Activity, web: WebView) {
+        if (webView === web || activity.isDestroyed || !web.isAttachedToWindow) return
+        val root = activity.findViewById<FrameLayout>(android.R.id.content) ?: return
+        view?.let { current -> (current.parent as? FrameLayout)?.removeView(current) }
+        val target = SurfaceView(activity)
+        view = target
+        webView = web
+        root.setBackgroundColor(Color.BLACK)
+        target.importantForAccessibility = SurfaceView.IMPORTANT_FOR_ACCESSIBILITY_NO
+        target.holder.addCallback(object : SurfaceHolder.Callback {
+            private var registered = false
+
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                synchronized(this@VmaxLowLatencyDecoder) {
+                    if (view !== target) return
+                    surface = holder.surface
+                    failures = 0
+                    val codecs = runCatching { decoderCapabilities() }.getOrDefault(0)
+                    if (codecs == 0) return
+                    try {
+                        nativeSetDecoderCapabilities(codecs)
                         nativeSetDecoderActive(true)
-                    }
-                }
-
-                override fun surfaceChanged(holder: SurfaceHolder, pixelFormat: Int, width: Int, height: Int) {}
-
-                override fun surfaceDestroyed(holder: SurfaceHolder) {
-                    synchronized(this@VmaxLowLatencyDecoder) {
-                        if (view !== target) return
-                        nativeSetDecoderActive(false)
-                        release()
+                        registered = true
+                    } catch (error: LinkageError) {
                         surface = null
+                        android.util.Log.w("VmaX", "Native video callbacks unavailable", error)
                     }
                 }
-            })
-            target.addOnAttachStateChangeListener(object : android.view.View.OnAttachStateChangeListener {
-                override fun onViewAttachedToWindow(v: android.view.View) {}
-                override fun onViewDetachedFromWindow(v: android.view.View) {
-                    if (view === v) {
-                        view = null
-                        webView = null
-                    }
+            }
+
+            override fun surfaceChanged(holder: SurfaceHolder, pixelFormat: Int, width: Int, height: Int) {}
+
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                synchronized(this@VmaxLowLatencyDecoder) {
+                    if (view !== target) return
+                    if (registered) nativeSetDecoderActive(false)
+                    registered = false
+                    release()
+                    surface = null
                 }
-            })
-            root.addView(target, 0, FrameLayout.LayoutParams(1, 1))
-        }
+            }
+        })
+        target.addOnAttachStateChangeListener(object : android.view.View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: android.view.View) {}
+            override fun onViewDetachedFromWindow(v: android.view.View) {
+                if (view === v) {
+                    view = null
+                    webView = null
+                }
+            }
+        })
+        root.addView(target, 0, FrameLayout.LayoutParams(1, 1))
+        web.setBackgroundColor(Color.TRANSPARENT)
     }
 
     @JvmStatic
-    fun layoutSurface(x: Int, y: Int, width: Int, height: Int, visible: Boolean) {
+    fun layoutSurface(activity: Activity, web: WebView, x: Int, y: Int, width: Int, height: Int, visible: Boolean) {
         ui.post {
+            if (visible && webView !== web) {
+                try {
+                    attach(activity, web)
+                } catch (error: RuntimeException) {
+                    android.util.Log.w("VmaX", "Could not attach the native video surface", error)
+                }
+            }
             val target = view ?: return@post
-            val web = webView ?: return@post
+            if (webView !== web) return@post
             val root = target.parent as? FrameLayout ?: return@post
             if (!visible) {
                 target.layoutParams = FrameLayout.LayoutParams(1, 1)
@@ -126,7 +142,7 @@ object VmaxLowLatencyDecoder {
     fun resetSession() {
         release()
         failures = 0
-        layoutSurface(0, 0, 1, 1, false)
+        ui.post { view?.layoutParams = FrameLayout.LayoutParams(1, 1) }
     }
 
     @JvmStatic

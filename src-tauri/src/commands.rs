@@ -4020,8 +4020,17 @@ pub async fn layout_native_video(
 
 #[cfg(target_os = "android")]
 #[tauri::command]
-pub fn layout_native_video(layout: crate::native_d3d11::SurfaceLayout) -> Result<(), String> {
-    crate::android_jni::layout_surface(layout)
+pub fn layout_native_video(
+    window: tauri::WebviewWindow,
+    layout: crate::native_d3d11::SurfaceLayout,
+) -> Result<(), String> {
+    window.with_webview(move |webview| {
+        webview.jni_handle().exec(move |env, activity, webview| {
+            if let Err(error) = crate::android_jni::layout_surface(env, activity, webview, layout) {
+                tracing::warn!(%error, "Android native video surface unavailable");
+            }
+        });
+    }).map_err(|error| error.to_string())
 }
 
 /// Start Opus audio capture on host

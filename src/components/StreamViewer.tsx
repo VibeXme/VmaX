@@ -558,8 +558,7 @@ export function StreamViewer({
       const layout = {
         picture: pixels(bounds.rect.x + bounds.x, bounds.rect.y + bounds.y, bounds.width, bounds.height),
         controls,
-        visible: connected && !document.hidden &&
-          (windowsClient ? !inputBlocked : nativeVideoRef.current),
+        visible: connected && !document.hidden && (!windowsClient || !inputBlocked),
       };
       const key = JSON.stringify([layout, nativeVideoRef.current]);
       if (key === lastLayout) return;
