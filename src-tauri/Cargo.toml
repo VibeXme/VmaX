@@ -1,6 +1,6 @@
 [package]
 name = "vmax"
-version = "5.3.8"
+version = "5.3.9"
 description = "VmaX — Ultra-low-latency P2P remote desktop and game streaming"
 authors = ["VmaX Contributors"]
 edition = "2024"

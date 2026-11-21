@@ -7694,7 +7694,7 @@ dependencies = [
 
 [[package]]
 name = "vmax"
-version = "5.3.8"
+version = "5.3.9"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -1,4 +1,4 @@
-name: Rebuild v5.3.8 binaries
+name: Build and publish VmaX prerelease
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: vmax-v5.3.8-release-${{ github.ref }}
+  group: vmax-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -69,7 +69,7 @@ jobs:
         shell: pwsh
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'vmax-rust-tests.log'
-          cargo test --manifest-path src-tauri/Cargo.toml --lib --target x86_64-pc-windows-msvc --locked 2>&1 | Tee-Object -FilePath $log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --target x86_64-pc-windows-msvc --locked -- --test-threads=2 2>&1 | Tee-Object -FilePath $log
           $status = $LASTEXITCODE
           if ($status) {
             $tail = Get-Content $log -Tail 75
@@ -111,30 +111,32 @@ jobs:
           if ((Get-Item VmaX.exe).Length -lt 1000000) { throw 'VmaX.exe is unexpectedly small.' }
           if ((Get-Item VmaX-Android-arm64.apk).Length -lt 1000000) { throw 'APK is unexpectedly small.' }
 
-      - name: Publish v5.3.8 release after all builds succeed
+      - name: Publish the prerelease after all builds succeed
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "v$version"
+          gh release view $tag --repo VibeXme/VmaX --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "Release $tag already exists."
+            exit 0
+          }
           $notes = @'
-          ## VmaX 5.3.8
-
-          - Keep capture, encode, transport, and approved automatic sessions responsive when the window is minimized or unfocused.
-          - Disable Windows background timer coalescing and use bounded above-normal process priority to reduce focus-dependent ping spikes.
-
-          - Recover Windows desktop capture after a DXGI reset and keep static desktops streaming in Constant FPS mode.
-          - Keep one pending video frame per handoff to limit queue latency.
-          - Pace QUIC datagrams and request a fresh keyframe after frame loss.
-          - Reduce NVENC buffering and enable intra-refresh on supported GPUs.
-          - Show capture, decode, and presentation FPS, encode time, network RTT, packet loss, and frame drops in the stream HUD.
+          - Use native video presentation on supported Windows and Android devices, with capture and transport diagnostics in the HUD.
+          - Auto transport probes LAN and IPv6 routes, uses paced Raw UDP with forward error correction where reachable, and falls back to WebRTC with TURN.
+          - Host up to four players with an upload-aware shared bitrate budget, optional minimum-quality admission limits, and join and leave notifications.
+          - Join regional rooms by code or full invite. Self-hosted relays support short-lived credentials, UDP 3478, and TLS on TCP 443.
 
           ### Downloads
           - VmaX.exe — Windows portable
           - VmaX-Android-arm64.apk — Android ARM64
           - VmaX-Relay-Linux-x86_64.tar.gz — standalone Linux signaling relay
 
-          Relay hosting and bandwidth are supplied by the operator. Actual latency depends on the network path and devices.
+          Follow the [regional VPS guide](https://github.com/VibeXme/VmaX/blob/RELEASE_TAG/deploy/server/README.md) to deploy the relay. Public relay performance and sub-30 ms WAN latency still need field validation.
           '@
-          $notes | Set-Content -Encoding utf8 'release-v5.3.8.md'
-          gh release create v5.3.8 VmaX.exe VmaX-Android-arm64.apk VmaX-Relay-Linux-x86_64.tar.gz --target "${{ github.sha }}" --title 'VmaX 5.3.8' --notes-file release-v5.3.8.md --repo VibeXme/VmaX
+          $notesFile = Join-Path $env:RUNNER_TEMP 'vmax-release-notes.md'
+          $notes.Replace('RELEASE_TAG', $tag) | Set-Content -Encoding utf8 $notesFile
+          gh release create $tag VmaX.exe VmaX-Android-arm64.apk VmaX-Relay-Linux-x86_64.tar.gz --target $env:GITHUB_SHA --title "VmaX $version" --notes-file $notesFile --prerelease --repo VibeXme/VmaX
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
