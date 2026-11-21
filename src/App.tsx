@@ -755,7 +755,11 @@ export function App() {
     if (!host && !endpoint) return;
     let started = false;
     const connect = () => {
-      if (started || document.hidden || stopping.current) return;
+      // Do not gate networking on WebView visibility. A minimized/unfocused
+      // VmaX window must still establish its approved automatic session and
+      // keep the native transport alive; Windows background scheduling is
+      // handled by the Rust process policy, not by pausing the UI loop.
+      if (started || stopping.current) return;
       started = true;
       setAutomaticAttempts((attempts) => attempts + 1);
       if (endpoint) void handleStartHost(endpoint, true);

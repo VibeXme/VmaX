@@ -62,12 +62,12 @@ use tracing_subscriber::EnvFilter;
 
 /// Opts the process out of Windows' background power throttling.
 ///
-/// Windows 11 places a process that is not the foreground window under EcoQoS,
-/// which starves the capture/encode threads on the host and the WebView's
-/// decode/present tasks on the client. The picture stays smooth but arrives
-/// hundreds of milliseconds late, which is exactly the "worse when the app is
-/// out of focus" symptom. This is a per-process setting, so it covers both
-/// roles for the lifetime of the app.
+/// Windows 11 places a process that is not the foreground window under EcoQoS
+/// and may coalesce its timers. That starves the capture/encode threads on the
+/// host and the WebView's decode/present tasks on the client. The picture stays
+/// smooth but arrives hundreds of milliseconds late, which is exactly the
+/// "worse when the app is out of focus" symptom. This is a per-process setting,
+/// so it covers both roles for the lifetime of the app.
 #[cfg(target_os = "windows")]
 fn disable_power_throttling() {
     // PROCESS_POWER_THROTTLING_STATE. Declared locally with raw FFI so this
@@ -81,6 +81,7 @@ fn disable_power_throttling() {
     }
     const CURRENT_VERSION: u32 = 1;
     const EXECUTION_SPEED: u32 = 0x1;
+    const IGNORE_TIMER_RESOLUTION: u32 = 0x4;
     // ProcessPowerThrottling in PROCESS_INFORMATION_CLASS.
     const PROCESS_POWER_THROTTLING: i32 = 4;
 
@@ -97,8 +98,11 @@ fn disable_power_throttling() {
 
     let mut state = ProcessPowerThrottlingState {
         version: CURRENT_VERSION,
-        control_mask: EXECUTION_SPEED,
-        // A clear StateMask bit means "do not throttle execution speed".
+        // Opt out of both EcoQoS execution-speed throttling and background
+        // timer coalescing. The latter turns a 1–5 ms network tick into a
+        // visibly delayed ping when the window loses focus.
+        control_mask: EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION,
+        // A clear StateMask bit means "do not throttle".
         state_mask: 0,
     };
     // SAFETY: `state` is a correctly sized PROCESS_POWER_THROTTLING_STATE and
@@ -113,6 +117,21 @@ fn disable_power_throttling() {
     };
     if !applied {
         tracing::debug!("process power throttling opt-out was not applied");
+    }
+
+    // Keep the realtime path ahead of ordinary background work, but do not use
+    // REALTIME_PRIORITY_CLASS: VmaX must never starve input, audio, or the
+    // user's foreground applications.
+    const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x0000_8000;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetPriorityClass(process: *mut std::ffi::c_void, priority: u32) -> i32;
+    }
+    let priority_applied = unsafe {
+        SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) == 1
+    };
+    if !priority_applied {
+        tracing::debug!("process above-normal priority was not applied");
     }
 }
 
