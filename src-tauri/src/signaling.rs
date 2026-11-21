@@ -1620,8 +1620,10 @@ fn discovery_proof(domain: &[u8], nonce: &[u8], code: &str, port: u16) -> [u8; 1
 mod tests {
     #[tokio::test]
     async fn unreachable_first_address_does_not_block_working_alternative() {
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unreachable = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let unreachable = "192.0.2.1:9".parse().unwrap();
         let socket = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             super::connect_candidates(&[unreachable, listener.local_addr().unwrap()]),
