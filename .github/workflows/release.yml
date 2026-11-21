@@ -111,9 +111,22 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Set up the Android toolchain
+        shell: bash
         run: |
           rustup target add aarch64-linux-android
-          sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;29.0.14206865'
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$RUNNER_TEMP/android-sdk}}"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$sdkmanager" ]]; then
+            archive="$RUNNER_TEMP/android-cmdline-tools.zip"
+            curl --fail --location --retry 2 https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o "$archive"
+            unzip -q "$archive" -d "$RUNNER_TEMP/android-cli"
+            mv "$RUNNER_TEMP/android-cli/cmdline-tools" "$ANDROID_HOME/cmdline-tools/vmax"
+            sdkmanager="$ANDROID_HOME/cmdline-tools/vmax/bin/sdkmanager"
+          fi
+          yes | "$sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || test "${PIPESTATUS[1]}" = 0
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;29.0.14206865'
+          printf 'ANDROID_HOME=%s\n' "$ANDROID_HOME" >>"$GITHUB_ENV"
           printf 'NDK_HOME=%s/ndk/29.0.14206865\n' "$ANDROID_HOME" >>"$GITHUB_ENV"
           npm ci
       - name: Build the Android ARM64 APK
