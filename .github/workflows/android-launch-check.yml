@@ -11,18 +11,22 @@ jobs:
     steps:
       - name: Download released APK
         run: curl -fLsS --retry 2 https://github.com/VibeXme/VmaX/releases/download/v5.3.10/VmaX-Android-arm64.apk -o VmaX.apk
-      - name: Run Android 11 emulator
+      - name: Run Android 15 emulator
         run: |
           set -e
+          trap 'if [ -f emulator.log ]; then report=$(tail -n 18 emulator.log | head -c 1800); report=${report//$'\n'/'%0A'}; echo "::notice title=Emulator log tail::$report"; fi' EXIT
           test -e /dev/kvm
           sudo chmod a+rw /dev/kvm
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platform-tools' 'emulator' 'system-images;android-30;google_apis;x86_64'
-          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n vmax -k 'system-images;android-30;google_apis;x86_64'
-          "$ANDROID_HOME/emulator/emulator" -avd vmax -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -no-metrics >emulator.log 2>&1 &
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd -f -n vmax -k 'system-images;android-35;google_apis;x86_64'
+          "$ANDROID_HOME/emulator/emulator" -avd vmax -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -feature -Vulkan -skip-adb-auth -no-metrics >emulator.log 2>&1 &
           adb="$ANDROID_HOME/platform-tools/adb"
-          timeout 150 "$adb" wait-for-device
-          timeout 180 bash -c 'while ! "$1" shell getprop sys.boot_completed | grep -q "^1"; do sleep 2; done' _ "$adb"
+          echo "::notice title=Android emulator started::Waiting for ADB"
+          timeout 240 "$adb" wait-for-device
+          echo "::notice title=Android emulator connected::Waiting for boot completion"
+          timeout 420 bash -c 'while ! "$1" shell getprop sys.boot_completed | grep -q "^1"; do sleep 2; done' _ "$adb"
+          echo "::notice title=Android boot complete::Testing released APK"
           "$adb" shell input keyevent 82
           "$adb" shell getprop ro.product.cpu.abilist
           "$adb" install VmaX.apk
@@ -33,7 +37,7 @@ jobs:
           "$adb" logcat -b crash -d >crash.log
           "$adb" logcat -d >logcat.log
           {
-            echo '### Android 11 startup'
+            echo '### Android 15 startup'
             echo '\`\`\`text'
             grep -E 'FATAL EXCEPTION|NoSuchMethod|UnsatisfiedLink|Cannot start|signal [0-9]|com.vmax.app' crash.log | tail -45 || true
             grep -Ei 'vmax|chromium.*error' logcat.log | tail -30 || true
