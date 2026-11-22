@@ -690,7 +690,10 @@ async fn spawn_host_capture_thread(
     let mut target_fps = controls.desired_fps.load(Ordering::Relaxed).clamp(30, 144);
     let frame_pacing = params.frame_pacing;
     let best_connection = parse_transport_protocol(&params.protocol) == TransportProtocol::Auto;
-    let nvenc = params.nvenc;
+    let nvenc = crate::nvenc::NvencSettings {
+        quarter_pass: params.nvenc.quarter_pass && !best_connection,
+        ..params.nvenc
+    };
     let preferred_codec = match params.codec.as_str() {
         "h264" => Some(VideoCodec::H264),
         "hevc" => Some(VideoCodec::Hevc),

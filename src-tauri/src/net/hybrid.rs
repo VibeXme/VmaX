@@ -59,6 +59,7 @@ enum Incoming {
     Video(Box<ReassembledFrame>),
     Packet(Bytes),
     Keyframe,
+    VideoReady,
 }
 
 /// Both transports consume the same access unit and return the same decoded
@@ -70,6 +71,9 @@ trait StreamTransport: Send {
     }
     fn keyframe_in_flight(&self) -> bool {
         false
+    }
+    fn can_accept_video(&self) -> bool {
+        true
     }
     fn video(
         &mut self,
@@ -395,10 +399,10 @@ impl Room {
                             last_seen = Instant::now();
                             self.receive(index, &mut link, bytes, &mut last_pli).await?;
                         }
-                        Incoming::Video(_) => {}
+                        Incoming::Video(_) | Incoming::VideoReady => {}
                     }
                 }
-                Ok(()) = video.changed() => {
+                Ok(()) = video.changed(), if link.can_accept_video() => {
                     let frame = video.borrow_and_update().clone();
                     if let Some(frame) = frame {
                         self.state.0.codec.store(frame.codec as u32, Ordering::Relaxed);
@@ -912,6 +916,7 @@ async fn client_stream<T: StreamTransport>(
                     }
                 }
                 Incoming::Keyframe => waiting = true,
+                Incoming::VideoReady => {}
                 Incoming::Packet(bytes) => {
                     last_seen = Instant::now();
                     match bytes.first().and_then(|tag| ChannelId::try_from(*tag).ok()) {

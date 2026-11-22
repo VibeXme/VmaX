@@ -40,7 +40,7 @@ import {
   type ResolutionOption,
 } from "../types";
 import { FramePresenter } from "../lib/framePresenter";
-import { DecoderHealth } from "../lib/decodeHealth";
+import { DecoderHealth, STALL_RESET_MS } from "../lib/decodeHealth";
 import { buildDiagnosticsReport, copyDiagnostics } from "../lib/diagnostics";
 import { measureRefreshHz } from "../lib/displayRefresh";
 import { MAX_STREAM_BITRATE_MBPS } from "../config/defaults";
@@ -855,7 +855,7 @@ export function StreamViewer({
     let lastPlaybackSample = performance.now();
     let subscribed = false;
     let frameChannelId: number | undefined;
-    let acknowledgeTimer: number | undefined;
+    let cancelAcknowledgement: (() => void) | undefined;
     let lastCodecLabel = "";
 
     // Vsync-paced presentation: at most one draw per display refresh and the
@@ -1246,23 +1246,45 @@ export function StreamViewer({
         }
       };
 
-      const acknowledge = (deadline: number) => {
+      const acknowledge = () => {
         if (cancelled) return;
-        if (decoder && decoder.decodeQueueSize > 0) {
-          if (performance.now() < deadline) {
-            acknowledgeTimer = window.setTimeout(() => acknowledge(deadline), 4);
-            return;
+        const sendAck = () => {
+          if (!cancelled) {
+            void invoke("acknowledge_stream_frame", { channelId: onFrame.id }).catch(() => {});
           }
-          resetDecoder();
-          requestSyncKeyframe("decode_queue_stalled");
+        };
+        const active = decoder;
+        // Leave room for one queued access unit so IPC and decoding can overlap.
+        if (!active || active.decodeQueueSize < 2) {
+          sendAck();
+          return;
         }
-        void invoke("acknowledge_stream_frame", { channelId: onFrame.id }).catch(() => {});
+        const cleanup = () => {
+          active.removeEventListener("dequeue", onDequeue);
+          window.clearTimeout(timer);
+          cancelAcknowledgement = undefined;
+        };
+        const onDequeue = () => {
+          if (active.decodeQueueSize >= 2) return;
+          cleanup();
+          sendAck();
+        };
+        const timer = window.setTimeout(() => {
+          cleanup();
+          if (decoder === active && active.decodeQueueSize >= 2) {
+            resetDecoder();
+            requestSyncKeyframe("decode_queue_stalled");
+          }
+          sendAck();
+        }, STALL_RESET_MS);
+        cancelAcknowledgement = cleanup;
+        active.addEventListener("dequeue", onDequeue);
       };
       onFrame.onmessage = (payload) => {
         try {
           processFrame(payload);
         } finally {
-          acknowledge(performance.now() + 1_000);
+          acknowledge();
         }
       };
 
@@ -1282,7 +1304,7 @@ export function StreamViewer({
 
     return () => {
       cancelled = true;
-      window.clearTimeout(acknowledgeTimer);
+      cancelAcknowledgement?.();
       if (frameChannelId !== undefined) {
         void invoke("unsubscribe_stream_frames", { channelId: frameChannelId }).catch(() => {});
       }

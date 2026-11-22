@@ -30,7 +30,9 @@ const KEYFRAME_AGE: Duration = Duration::from_secs(5);
 const KEYFRAME_PACING_MARGIN: Duration = Duration::from_millis(150);
 const DELTA_AGE: Duration = Duration::from_millis(35);
 const TICK: Duration = Duration::from_millis(3);
-const VIDEO_PACING_CREDIT: Duration = Duration::from_millis(1);
+// Batch sub-millisecond packet slots into one wake while bounding the burst.
+const VIDEO_PACING_WINDOW: Duration = Duration::from_millis(2);
+const MAX_PACED_BATCH: usize = 64;
 
 pub(super) struct RawLink {
     socket: UdpSocket,
@@ -56,6 +58,7 @@ struct Pending {
     deadline: Instant,
     spacing: Duration,
     keyframe: bool,
+    blocked_until: Instant,
 }
 
 impl RawLink {
@@ -142,9 +145,15 @@ impl RawLink {
     }
 
     fn send_due_video(&mut self) -> Result<()> {
-        for _ in 0..8 {
+        let now = Instant::now();
+        let horizon = now + VIDEO_PACING_WINDOW;
+        for _ in 0..MAX_PACED_BATCH {
             let now = Instant::now();
-            let Some(video) = self.video.as_ref().filter(|video| video.next <= now) else {
+            let Some(video) = self
+                .video
+                .as_ref()
+                .filter(|video| video.next <= horizon && video.blocked_until <= now)
+            else {
                 break;
             };
             if now >= video.deadline {
@@ -158,7 +167,7 @@ impl RawLink {
             match self.socket.try_send(&sealed) {
                 Ok(_) => self.sent_packets += 1,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    video.next = now + Duration::from_millis(1);
+                    video.blocked_until = now + Duration::from_millis(1);
                     break;
                 }
                 Err(error)
@@ -169,10 +178,11 @@ impl RawLink {
                 Err(error) => return Err(error.into()),
             }
             video.shards.next();
-            video.next += video.spacing;
+            video.next = video.next.max(now) + video.spacing;
             self.next_video_slot = video.next;
             if video.shards.len() == 0 {
                 self.video = None;
+                self.input.push_back(Incoming::VideoReady);
                 break;
             }
         }
@@ -211,7 +221,7 @@ impl RawLink {
 
         let mut buffer = [0; 1500];
         let next = self.video.as_ref().map_or(Instant::now() + TICK, |video| {
-            video.next.min(Instant::now() + TICK)
+            video.next.max(video.blocked_until).min(Instant::now() + TICK)
         });
         tokio::select! {
             biased;
@@ -334,6 +344,10 @@ impl StreamTransport for RawLink {
         }
     }
 
+    fn can_accept_video(&self) -> bool {
+        self.video.is_none()
+    }
+
     async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<bool> {
         self.send_due_video()?;
         if self.video.is_some() || frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
@@ -358,9 +372,8 @@ impl StreamTransport for RawLink {
         // Charge only time in this one-frame send slot to the network budget.
         // Slow encode has already happened when the latest access unit arrives.
         let deadline = now + age;
-        // Carry the pacing schedule across frames. A bounded credit lets a
-        // small access unit finish without multiple sub-ms Tokio timer wakes.
-        let next = self.next_video_slot.max(now - VIDEO_PACING_CREDIT);
+        // Carry the pacing schedule across frames, including slots sent early.
+        let next = self.next_video_slot.max(now);
         if keyframe {
             self.input
                 .retain(|message| !matches!(message, Incoming::Keyframe));
@@ -371,6 +384,7 @@ impl StreamTransport for RawLink {
             deadline,
             spacing,
             keyframe,
+            blocked_until: now,
         });
         self.send_due_video()?;
         Ok(true)
@@ -604,12 +618,65 @@ mod tests {
                     incoming = viewer.next() => match incoming? {
                         Incoming::Video(frame) => return Ok::<_, anyhow::Error>(frame),
                         Incoming::Keyframe => bail!("viewer expired a paced keyframe"),
-                        Incoming::Packet(_) => {}
+                        Incoming::Packet(_) | Incoming::VideoReady => {}
                     }
                 }
             }
         }).await??;
         assert_eq!(delivered.payload, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn high_bitrate_delta_drains_and_wakes_the_host() -> Result<()> {
+        let sender = UdpSocket::bind("127.0.0.1:0").await?;
+        let receiver = UdpSocket::bind("127.0.0.1:0").await?;
+        let sender_addr = sender.local_addr()?;
+        let receiver_addr = receiver.local_addr()?;
+        let (mut host, mut viewer) = tokio::try_join!(
+            RawLink::new(sender, receiver_addr, [1; 32], [2; 32], true),
+            RawLink::new(receiver, sender_addr, [2; 32], [1; 32], false),
+        )?;
+        let payload = Bytes::from(vec![0x41; 180_000]);
+        let frame = OutboundVideoFrame {
+            meta: FrameTelemetry::full_range_hardware(2, 1920, 1080),
+            codec: VideoCodec::H264,
+            frame_id: 1,
+            timestamp_us: 0,
+            captured_at: Instant::now(),
+            fps: 144,
+            is_keyframe: false,
+            payload: payload.clone(),
+        };
+        assert!(host.video(frame, 200_000_000).await?);
+        assert!(!host.can_accept_video());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut ready = false;
+            let mut delivered = false;
+            while !ready || !delivered {
+                tokio::select! {
+                    outgoing = host.next(), if !ready => {
+                        match outgoing? {
+                            Incoming::VideoReady => ready = true,
+                            Incoming::Keyframe => bail!("sender expired the delta frame"),
+                            _ => {}
+                        }
+                    }
+                    incoming = viewer.next(), if !delivered => {
+                        match incoming? {
+                            Incoming::Video(frame) => {
+                                assert_eq!(frame.payload, payload);
+                                delivered = true;
+                            }
+                            Incoming::Keyframe => bail!("viewer expired the delta frame"),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        assert!(host.can_accept_video());
         Ok(())
     }
 

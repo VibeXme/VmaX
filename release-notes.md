@@ -1,9 +1,12 @@
-## VmaX 6.0.1
+## VmaX 6.0.2
 
 - Best Connection keeps the selected FPS as the host target and reuses the last valid capture on static screens. Actual playback depends on the encoder, viewer, and link.
 - Direct Raw UDP gives recovery keyframes time to finish at the current link rate. The sender retains shards during socket backpressure and keeps an in-flight keyframe through repeated recovery requests. Small frames can use up to 1 ms of pacing credit.
 - WebRTC sizes media packets for the underlying carrier, preserves pending recovery keyframes, and sends keyframe requests over the reliable control channel alongside RTP feedback.
 - The Best Connection bitrate display measures received video traffic during frame recovery.
+
+- Best Connection batches Direct Raw UDP packet sends and waits for the active frame before submitting the next one. This reduces timer overhead and avoids unnecessary keyframe recovery at high bitrates.
+- Best Connection uses single-pass NVENC, and WebView playback overlaps frame delivery with decoding.
 
 ### Downloads
 
@@ -13,4 +16,4 @@
 
 Android may require a clean install if your existing build uses a different signing certificate. Uninstalling removes local app data.
 
-See the [regional relay guide](https://github.com/VibeXme/VmaX/blob/v6.0.1/deploy/server/README.md) for self-hosting.
+See the [regional relay guide](https://github.com/VibeXme/VmaX/blob/v6.0.2/deploy/server/README.md) for self-hosting.
