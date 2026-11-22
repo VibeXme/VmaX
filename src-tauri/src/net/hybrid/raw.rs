@@ -27,7 +27,7 @@ const FRAME_INFO: usize = 1 + 8 + 4 + TELEMETRY_LEN;
 const GROUP: usize = 16;
 const MAX_SHARDS: usize = 4096;
 const KEYFRAME_AGE: Duration = Duration::from_secs(5);
-const KEYFRAME_PACING_MARGIN: Duration = Duration::from_millis(150);
+const KEYFRAME_PACING_MARGIN: Duration = Duration::from_millis(350);
 const DELTA_AGE: Duration = Duration::from_millis(35);
 const TICK: Duration = Duration::from_millis(3);
 // Batch sub-millisecond packet slots into one wake while bounding the burst.
@@ -147,6 +147,7 @@ impl RawLink {
     fn send_due_video(&mut self) -> Result<()> {
         let now = Instant::now();
         let horizon = now + VIDEO_PACING_WINDOW;
+        let oldest_slot = now - VIDEO_PACING_WINDOW;
         for _ in 0..MAX_PACED_BATCH {
             let now = Instant::now();
             let Some(video) = self
@@ -178,7 +179,9 @@ impl RawLink {
                 Err(error) => return Err(error.into()),
             }
             video.shards.next();
-            video.next = video.next.max(now) + video.spacing;
+            // Keep the schedule across late timer wakes without accumulating
+            // more than one window of catch-up traffic.
+            video.next = video.next.max(oldest_slot) + video.spacing;
             self.next_video_slot = video.next;
             if video.shards.len() == 0 {
                 self.video = None;
