@@ -1,4 +1,6 @@
-## VmaX 6.0.2
+## VmaX 6.0.3
+- Direct Raw UDP requests 8 MiB media socket buffers and drains queued datagrams in bounded bursts to reduce receive overflow during high-bitrate bursts.
+- Pending stale delta frames are replaced by the newest delta while in-flight keyframes remain protected for decoder recovery.
 
 - Best Connection keeps the selected FPS as the host target and reuses the last valid capture on static screens. Actual playback depends on the encoder, viewer, and link.
 - Direct Raw UDP gives recovery keyframes time to finish at the current link rate. The sender retains shards during socket backpressure and keeps an in-flight keyframe through repeated recovery requests. Small frames can use up to 1 ms of pacing credit.
@@ -16,4 +18,4 @@
 
 Android may require a clean install if your existing build uses a different signing certificate. Uninstalling removes local app data.
 
-See the [regional relay guide](https://github.com/VibeXme/VmaX/blob/v6.0.2/deploy/server/README.md) for self-hosting.
+See the [regional relay guide](https://github.com/VibeXme/VmaX/blob/v6.0.3/deploy/server/README.md) for self-hosting.

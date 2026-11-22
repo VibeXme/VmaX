@@ -33,7 +33,8 @@ const TICK: Duration = Duration::from_millis(3);
 // Batch sub-millisecond packet slots into one wake while bounding the burst.
 const VIDEO_PACING_WINDOW: Duration = Duration::from_millis(2);
 const MAX_PACED_BATCH: usize = 64;
-const VIDEO_RECEIVE_BUFFER: usize = 1024 * 1024;
+const VIDEO_RECEIVE_BUFFER: usize = 8 * 1024 * 1024;
+const RECEIVE_DRAIN_LIMIT: usize = 256;
 
 pub(super) struct RawLink {
     socket: UdpSocket,
@@ -72,7 +73,9 @@ impl RawLink {
     ) -> Result<Self> {
         // Keep several paced batches in the kernel if the receiver is
         // briefly descheduled. Reassembly still enforces its frame deadline.
-        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(VIDEO_RECEIVE_BUFFER);
+        let sock = socket2::SockRef::from(&socket);
+        let _ = sock.set_recv_buffer_size(VIDEO_RECEIVE_BUFFER);
+        let _ = sock.set_send_buffer_size(VIDEO_RECEIVE_BUFFER);
         socket
             .connect(socket_target(peer_addr, socket.local_addr()?.is_ipv6()))
             .await?;
@@ -253,24 +256,36 @@ impl RawLink {
                     Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset) => return Ok(()),
                     Err(error) => return Err(error.into()),
                 };
-                let Some(bytes) = self.cipher.open(&mut buffer[..len]) else { return Ok(()) };
-                match bytes.first().copied() {
-                    Some(ENET) if bytes.len() <= MTU_MAX + 1 => {
-                        self.enet.socket_mut().incoming.push_back((self.peer_addr, Bytes::copy_from_slice(&bytes[1..])));
-                    }
-                    Some(tag) if tag == ChannelId::Video as u8 => {
-                        self.packets += 1;
-                        self.received_video_bytes += bytes.len() as u64;
-                        if let Some(frame) = self.collect(bytes)? {
-                            self.input.push_back(Incoming::Video(Box::new(frame)));
-                        }
-                    }
-                    Some(tag) if matches!(ChannelId::try_from(tag), Ok(ChannelId::Audio | ChannelId::Haptics)) => {
-                        self.input.push_back(Incoming::Packet(Bytes::copy_from_slice(bytes)));
-                    }
-                    _ => {}
+                self.consume_datagram(&mut buffer[..len])?;
+                // A paced keyframe can still arrive as a short burst after the
+                // task wakes. Drain what is already available before returning
+                // to Tokio so the kernel queue cannot overflow between wakes.
+                for _ in 0..RECEIVE_DRAIN_LIMIT {
+                    let Ok(len) = self.socket.try_recv(&mut buffer) else { break };
+                    self.consume_datagram(&mut buffer[..len])?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn consume_datagram(&mut self, buffer: &mut [u8]) -> Result<()> {
+        let Some(bytes) = self.cipher.open(buffer) else { return Ok(()) };
+        match bytes.first().copied() {
+            Some(ENET) if bytes.len() <= MTU_MAX + 1 => {
+                self.enet.socket_mut().incoming.push_back((self.peer_addr, Bytes::copy_from_slice(&bytes[1..])));
+            }
+            Some(tag) if tag == ChannelId::Video as u8 => {
+                self.packets += 1;
+                self.received_video_bytes += bytes.len() as u64;
+                if let Some(frame) = self.collect(bytes)? {
+                    self.input.push_back(Incoming::Video(Box::new(frame)));
+                }
+            }
+            Some(tag) if matches!(ChannelId::try_from(tag), Ok(ChannelId::Audio | ChannelId::Haptics)) => {
+                self.input.push_back(Incoming::Packet(Bytes::copy_from_slice(bytes)));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -360,7 +375,13 @@ impl StreamTransport for RawLink {
 
     async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<bool> {
         self.send_due_video()?;
-        if self.video.is_some() || frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
+        if frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
+            return Ok(false);
+        }
+        // Keep one pending access unit, but replace stale deltas instead of
+        // rejecting the newest frame. Never replace an in-flight keyframe: a
+        // decoder without a clean reference would otherwise need an IDR.
+        if self.video.as_ref().is_some_and(|pending| pending.keyframe && !frame.is_keyframe) {
             return Ok(false);
         }
         let wire_rate = crate::transport::paced_wire_rate(rate, 125).max(1);

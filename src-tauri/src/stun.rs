@@ -27,9 +27,12 @@ pub fn free_ice_endpoints() -> Vec<IceEndpoint> {
     default_free_ice_endpoints()
 }
 
-/// Request 256 KiB per direction on a media socket. Linux reports twice the request.
+/// Request an 8 MiB kernel queue per direction on a media socket. Linux reports
+/// twice the request, while Windows may clamp it to the system maximum. The
+/// application still drains aggressively; this is burst tolerance, not latency
+/// buffering.
 pub(crate) fn tune_media_buffers(socket: &socket2::Socket) -> io::Result<()> {
-    const SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+    const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
     socket.set_send_buffer_size(SOCKET_BUFFER_BYTES)?;
     socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES)
 }
