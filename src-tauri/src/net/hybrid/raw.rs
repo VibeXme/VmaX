@@ -183,9 +183,12 @@ impl RawLink {
                 Err(error) => return Err(error.into()),
             }
             video.shards.next();
-            // Keep the schedule across late timer wakes without accumulating
-            // more than one window of catch-up traffic.
-            video.next = video.next.max(oldest_slot) + video.spacing;
+            // Recovery frames must keep their original send schedule across
+            // late wakes. Short-lived deltas cap how far they can catch up.
+            if !video.keyframe {
+                video.next = video.next.max(oldest_slot);
+            }
+            video.next += video.spacing;
             self.next_video_slot = video.next;
             if video.shards.len() == 0 {
                 self.video = None;
