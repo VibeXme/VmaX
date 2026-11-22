@@ -1,7 +1,7 @@
 ## VmaX 6.0.1
 
 - Best Connection keeps the selected FPS as the host target and reuses the last valid capture on static screens. Actual playback depends on the encoder, viewer, and link.
-- Direct Raw UDP gives recovery keyframes time to finish at the current link rate. The sender retains shards during socket backpressure and keeps an in-flight keyframe through repeated recovery requests.
+- Direct Raw UDP gives recovery keyframes time to finish at the current link rate. The sender retains shards during socket backpressure and keeps an in-flight keyframe through repeated recovery requests. Small frames can use up to 1 ms of pacing credit.
 - WebRTC sizes media packets for the underlying carrier, preserves pending recovery keyframes, and sends keyframe requests over the reliable control channel alongside RTP feedback.
 - The Best Connection bitrate display measures received video traffic during frame recovery.
 

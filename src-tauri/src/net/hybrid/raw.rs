@@ -30,6 +30,7 @@ const KEYFRAME_AGE: Duration = Duration::from_secs(5);
 const KEYFRAME_PACING_MARGIN: Duration = Duration::from_millis(150);
 const DELTA_AGE: Duration = Duration::from_millis(35);
 const TICK: Duration = Duration::from_millis(3);
+const VIDEO_PACING_CREDIT: Duration = Duration::from_millis(1);
 
 pub(super) struct RawLink {
     socket: UdpSocket,
@@ -39,6 +40,7 @@ pub(super) struct RawLink {
     cipher: Cipher,
     input: VecDeque<Incoming>,
     video: Option<Pending>,
+    next_video_slot: Instant,
     assembly: BTreeMap<u32, Assembly>,
     packets: u64,
     received_video_bytes: u64,
@@ -90,6 +92,7 @@ impl RawLink {
             cipher: Cipher::new(send_key, recv_key)?,
             input: VecDeque::new(),
             video: None,
+            next_video_slot: Instant::now(),
             assembly: BTreeMap::new(),
             packets: 0,
             received_video_bytes: 0,
@@ -167,6 +170,7 @@ impl RawLink {
             }
             video.shards.next();
             video.next += video.spacing;
+            self.next_video_slot = video.next;
             if video.shards.len() == 0 {
                 self.video = None;
                 break;
@@ -354,13 +358,21 @@ impl StreamTransport for RawLink {
         // Charge only time in this one-frame send slot to the network budget.
         // Slow encode has already happened when the latest access unit arrives.
         let deadline = now + age;
+        // Carry the pacing schedule across frames. A bounded credit lets a
+        // small access unit finish without multiple sub-ms Tokio timer wakes.
+        let next = self.next_video_slot.max(now - VIDEO_PACING_CREDIT);
+        if keyframe {
+            self.input
+                .retain(|message| !matches!(message, Incoming::Keyframe));
+        }
         self.video = Some(Pending {
             shards: shards.into_iter(),
-            next: now,
+            next,
             deadline,
             spacing,
             keyframe,
         });
+        self.send_due_video()?;
         Ok(true)
     }
 
