@@ -33,6 +33,7 @@ const TICK: Duration = Duration::from_millis(3);
 // Batch sub-millisecond packet slots into one wake while bounding the burst.
 const VIDEO_PACING_WINDOW: Duration = Duration::from_millis(2);
 const MAX_PACED_BATCH: usize = 64;
+const VIDEO_RECEIVE_BUFFER: usize = 1024 * 1024;
 
 pub(super) struct RawLink {
     socket: UdpSocket,
@@ -69,6 +70,9 @@ impl RawLink {
         recv_key: [u8; 32],
         host: bool,
     ) -> Result<Self> {
+        // Keep several paced batches in the kernel if the receiver is
+        // briefly descheduled. Reassembly still enforces its frame deadline.
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(VIDEO_RECEIVE_BUFFER);
         socket
             .connect(socket_target(peer_addr, socket.local_addr()?.is_ipv6()))
             .await?;
