@@ -43,6 +43,7 @@ const COLD_ENCODE_ESTIMATE: Duration = Duration::from_millis(3);
 /// host-side latency we control, and burning half a millisecond of sleep
 /// instead of a full one keeps the capture-to-present path that much shorter
 /// without costing a whole scheduler quantum.
+#[cfg(not(target_os = "windows"))]
 const SPIN_BUDGET: Duration = Duration::from_micros(500);
 /// Longest the capture call may block. Idle desktop modes drop to a few frames
 /// per second, and a control message (keyframe request, bitrate change) must
@@ -159,12 +160,17 @@ impl FrameCadence {
     pub fn wait_next_frame(&mut self) {
         let now = Instant::now();
         if let Some(deadline) = self.advance(now) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining > SPIN_BUDGET {
-                std::thread::sleep(remaining - SPIN_BUDGET);
-            }
-            while Instant::now() < deadline {
-                std::hint::spin_loop();
+            #[cfg(target_os = "windows")]
+            crate::transport::spin_sleep_until(deadline);
+            #[cfg(not(target_os = "windows"))]
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining > SPIN_BUDGET {
+                    std::thread::sleep(remaining - SPIN_BUDGET);
+                }
+                while Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
             }
         }
     }

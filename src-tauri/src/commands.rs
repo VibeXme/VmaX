@@ -689,6 +689,7 @@ async fn spawn_host_capture_thread(
     let active_max_h = controls.desired_max_h.load(Ordering::Relaxed);
     let mut target_fps = controls.desired_fps.load(Ordering::Relaxed).clamp(30, 144);
     let frame_pacing = params.frame_pacing;
+    let best_connection = parse_transport_protocol(&params.protocol) == TransportProtocol::Auto;
     let nvenc = params.nvenc;
     let preferred_codec = match params.codec.as_str() {
         "h264" => Some(VideoCodec::H264),
@@ -933,7 +934,7 @@ async fn spawn_host_capture_thread(
                 let max_w = controls.desired_max_w.load(Ordering::Relaxed);
                 let max_h = controls.desired_max_h.load(Ordering::Relaxed);
                 let max_fps = controls.desired_fps.load(Ordering::Relaxed).clamp(30, 144);
-                let constant_fps = crate::capture::is_constant_fps();
+                let constant_fps = best_connection || crate::capture::is_constant_fps();
                 let lock_resolution = crate::capture::is_lock_resolution();
                 let next_fps = if constant_fps {
                     max_fps
@@ -1246,7 +1247,7 @@ async fn spawn_host_capture_thread(
                 let force_frame = controls.force_idr.load(Ordering::Acquire)
                     || controls.force_intra_refresh.load(Ordering::Acquire) > 0
                     || forced_refresh_frames > 0;
-                let valid_frame = match cap.latest_frame(force_frame) {
+                let valid_frame = match cap.latest_frame(force_frame || constant_fps) {
                     Ok(true) => {
                         capture_errors = 0;
                         capture_waiting_since = None;
@@ -1432,7 +1433,7 @@ async fn spawn_host_capture_thread(
                     );
                     telemetry.on_decode((latest_decode_latency_ms() * 1000.0) as u32);
                     telemetry.on_rtt(crate::capture::latest_network_latency_ms() * 2.0);
-                    telemetry.idle = cap.is_static_screen() && !crate::capture::is_constant_fps();
+                    telemetry.idle = cap.is_static_screen() && !constant_fps;
                     let _ = app_thread.emit("vmax://telemetry-tick", telemetry.tick());
                     last_telemetry = Instant::now();
                 }

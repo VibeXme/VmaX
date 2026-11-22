@@ -635,11 +635,15 @@ export function SettingsModal({
                     title="Constant FPS"
                     hint={`Keep sending at the selected ${config.video.framerate} FPS, even when the desktop is static.`}
                   >
-                    <ToggleSwitch
-                      checked={config.video.constantFps}
-                      onToggle={() => onUpdateVideo({ constantFps: !config.video.constantFps })}
-                      ariaLabel="Constant FPS"
-                    />
+                    {config.network.protocol === "auto" ? (
+                      <span className="text-sm text-zinc-400">On in Auto</span>
+                    ) : (
+                      <ToggleSwitch
+                        checked={config.video.constantFps}
+                        onToggle={() => onUpdateVideo({ constantFps: !config.video.constantFps })}
+                        ariaLabel="Constant FPS"
+                      />
+                    )}
                   </SettingRow>
 
                   {/* Target Bitrate Slider + Synchronized Speedometer */}

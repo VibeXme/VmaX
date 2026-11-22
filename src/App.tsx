@@ -1092,9 +1092,10 @@ export function App() {
                           }}>
                             {STREAM_FRAMERATES.map((fps) => <option key={fps} value={fps}>{fps} FPS</option>)}
                           </select>
-                          <button type="button" className="vmax-secondary" aria-pressed={config.video.constantFps}
+                          <button type="button" className="vmax-secondary" aria-pressed={config.network.protocol === "auto" || config.video.constantFps}
+                            disabled={config.network.protocol === "auto"}
                             onClick={() => updateVideo({ constantFps: !config.video.constantFps })}>
-                            Constant FPS {config.video.constantFps ? "on" : "off"}
+                            {config.network.protocol === "auto" ? "Constant FPS in Auto" : `Constant FPS ${config.video.constantFps ? "on" : "off"}`}
                           </button>
                         </div>
                         <label htmlFor="vmax-dashboard-bitrate" className="vmax-inline">Bitrate <span>{config.video.bitrateMbps} Mbps</span></label>

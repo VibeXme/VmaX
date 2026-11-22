@@ -56,6 +56,8 @@ pub(super) struct RtcLink {
     received: u64,
     sent: u64,
     receive_base: u64,
+    receive_bytes_base: u64,
+    received_video_bytes: u64,
     send_base: u64,
     configured_rate: u32,
     connected: bool,
@@ -110,7 +112,16 @@ impl RtcLink {
         let own_turn = turn.as_ref().and_then(TurnRelay::local_addr);
         let virtual_local = virtual_addr(host);
         let virtual_remote = virtual_addr(!host);
+        // The virtual ICE pair puts an entire encrypted RTP packet inside an
+        // Iroh datagram. Reserve room for SRTP and the custom frame extension.
+        let carrier_mtu = carrier
+            .max_datagram_size()
+            .unwrap_or(str0m::DATAGRAM_MTU_TARGET);
+        let target_mtu = carrier_mtu
+            .saturating_sub(80)
+            .clamp(str0m::DATAGRAM_MTU_TARGET_MIN, 1070);
         let rtc = Rtc::builder()
+            .set_mtu(target_mtu..=carrier_mtu.max(target_mtu))
             .clear_codecs()
             .enable_h264(true)
             .enable_h265(true)
@@ -148,6 +159,8 @@ impl RtcLink {
             received: 0,
             sent: 0,
             receive_base: 0,
+            receive_bytes_base: 0,
+            received_video_bytes: 0,
             send_base: 0,
             configured_rate: 0,
             connected: false,
@@ -400,6 +413,8 @@ impl RtcLink {
             Event::MediaIngressStats(stats) if Some(stats.mid) == self.video => {
                 self.received += stats.packets.saturating_sub(self.receive_base);
                 self.receive_base = stats.packets;
+                self.received_video_bytes += stats.bytes.saturating_sub(self.receive_bytes_base);
+                self.receive_bytes_base = stats.bytes;
             }
             Event::MediaEgressStats(stats) if Some(stats.mid) == self.video => {
                 self.sent += stats.packets.saturating_sub(self.send_base);
@@ -438,8 +453,14 @@ impl RtcLink {
                             fec_recovered_shards: 0,
                             payload: Bytes::from_owner(data.data),
                         };
-                        if self.pending_frame.replace(frame).is_some() {
+                        if frame.is_keyframe {
+                            self.queue
+                                .retain(|message| !matches!(message, Incoming::Keyframe));
+                            self.pending_frame = Some(frame);
+                        } else if self.pending_frame.is_some() {
                             self.queue.push_back(Incoming::Keyframe);
+                        } else {
+                            self.pending_frame = Some(frame);
                         }
                     }
                     RtpMeta::Audio(header) => {
@@ -512,6 +533,7 @@ impl StreamTransport for RtcLink {
         if !frame.is_keyframe && self.video_needs_sync {
             return Ok(false);
         }
+        self.drain().await?;
         let queued = self
             .rtc
             .direct_api()
@@ -519,9 +541,7 @@ impl StreamTransport for RtcLink {
             .and_then(|stream| stream.queue_info())
             .and_then(|info| info.first_unsent())
             .is_some_and(|first| first.elapsed() > Duration::from_millis(18));
-        self.drain().await?;
-        if queued || (!frame.is_keyframe && frame.captured_at.elapsed() > Duration::from_millis(35))
-        {
+        if queued {
             self.video_needs_sync = true;
             if !self
                 .queue
@@ -564,15 +584,10 @@ impl StreamTransport for RtcLink {
         ) && let Some(mid) = self.video
             && let Some(mut writer) = self.rtc.writer(mid)
         {
-            let requested = writer
-                .request_keyframe(None, KeyframeRequestKind::Pli)
-                .is_ok();
+            let _ = writer.request_keyframe(None, KeyframeRequestKind::Pli);
             self.drain().await?;
-            // Before the first RTP arrives the reliable control channel can
-            // reach the host even if the receiver has no media SSRC yet.
-            if requested && self.received != 0 {
-                return Ok(());
-            }
+            // Also use the ordered control channel. RTP feedback can be lost
+            // on the same path that dropped the video reference.
         }
         if packet.first() == Some(&(ChannelId::Audio as u8))
             && let Some(mid) = self.audio
@@ -623,6 +638,10 @@ impl StreamTransport for RtcLink {
             }
             self.pump().await?;
         }
+    }
+
+    fn take_video_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.received_video_bytes)
     }
 
     fn take_video_packets(&mut self) -> u64 {

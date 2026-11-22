@@ -26,7 +26,7 @@ const BODY: usize = 1160 - HEADER - 24; // ciphertext and sequence number fit in
 const FRAME_INFO: usize = 1 + 8 + 4 + TELEMETRY_LEN;
 const GROUP: usize = 16;
 const MAX_SHARDS: usize = 4096;
-const KEYFRAME_AGE: Duration = Duration::from_secs(2);
+const KEYFRAME_AGE: Duration = Duration::from_secs(5);
 const KEYFRAME_PACING_MARGIN: Duration = Duration::from_millis(150);
 const DELTA_AGE: Duration = Duration::from_millis(35);
 const TICK: Duration = Duration::from_millis(3);
@@ -41,6 +41,7 @@ pub(super) struct RawLink {
     video: Option<Pending>,
     assembly: BTreeMap<u32, Assembly>,
     packets: u64,
+    received_video_bytes: u64,
     sent_packets: u64,
     traffic_class: Option<u32>,
     last_completed: Option<u32>,
@@ -52,6 +53,7 @@ struct Pending {
     next: Instant,
     deadline: Instant,
     spacing: Duration,
+    keyframe: bool,
 }
 
 impl RawLink {
@@ -90,6 +92,7 @@ impl RawLink {
             video: None,
             assembly: BTreeMap::new(),
             packets: 0,
+            received_video_bytes: 0,
             sent_packets: 0,
             traffic_class: None,
             last_completed: None,
@@ -106,17 +109,7 @@ impl RawLink {
     }
 
     async fn packet(&mut self, bytes: &[u8]) -> Result<()> {
-        use crate::wan_transport::{DSCP_AF41, DSCP_EF, mark_traffic_class};
-        let class = if bytes.first() == Some(&(ChannelId::Video as u8)) {
-            DSCP_AF41
-        } else {
-            DSCP_EF
-        };
-        if self.traffic_class != Some(class) {
-            mark_traffic_class(&socket2::SockRef::from(&self.socket), class);
-            self.traffic_class = Some(class);
-        }
-        let sealed = self.cipher.seal(bytes)?;
+        let sealed = self.seal_packet(bytes)?;
         match self.socket.send(&sealed).await {
             Ok(_) => Ok(()),
             Err(error)
@@ -131,6 +124,57 @@ impl RawLink {
         }
     }
 
+    fn seal_packet(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        use crate::wan_transport::{DSCP_AF41, DSCP_EF, mark_traffic_class};
+        let class = if bytes.first() == Some(&(ChannelId::Video as u8)) {
+            DSCP_AF41
+        } else {
+            DSCP_EF
+        };
+        if self.traffic_class != Some(class) {
+            mark_traffic_class(&socket2::SockRef::from(&self.socket), class);
+            self.traffic_class = Some(class);
+        }
+        self.cipher.seal(bytes)
+    }
+
+    fn send_due_video(&mut self) -> Result<()> {
+        for _ in 0..8 {
+            let now = Instant::now();
+            let Some(video) = self.video.as_ref().filter(|video| video.next <= now) else {
+                break;
+            };
+            if now >= video.deadline {
+                self.video = None;
+                self.input.push_back(Incoming::Keyframe);
+                break;
+            }
+            let shard = video.shards.as_slice()[0].clone();
+            let sealed = self.seal_packet(&shard)?;
+            let video = self.video.as_mut().unwrap();
+            match self.socket.try_send(&sealed) {
+                Ok(_) => self.sent_packets += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    video.next = now + Duration::from_millis(1);
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+            video.shards.next();
+            video.next += video.spacing;
+            if video.shards.len() == 0 {
+                self.video = None;
+                break;
+            }
+        }
+        Ok(())
+    }
+
     async fn flush_enet(&mut self) -> Result<()> {
         self.enet.flush();
         while let Some(data) = self.enet.socket_mut().outgoing.pop_front() {
@@ -143,6 +187,7 @@ impl RawLink {
     }
 
     async fn pump(&mut self) -> Result<()> {
+        self.send_due_video()?;
         for _ in 0..32 {
             match self.enet.service()?.map(|event| event.no_ref()) {
                 Some(EventNoRef::Connect { peer, .. }) => self.peer = Some(peer),
@@ -167,19 +212,7 @@ impl RawLink {
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(next.into()) => {
-                for _ in 0..8 {
-                    let Some(video) = self.video.as_mut().filter(|video| video.next <= Instant::now()) else { break };
-                    if Instant::now() >= video.deadline {
-                        self.video = None;
-                        self.input.push_back(Incoming::Keyframe);
-                    } else if let Some(shard) = video.shards.next() {
-                        video.next += video.spacing;
-                        self.packet(&shard).await?;
-                        self.sent_packets += 1;
-                    } else {
-                        self.video = None;
-                    }
-                }
+                self.send_due_video()?;
                 let expired: Vec<_> = self.assembly.iter().filter(|(_, item)| item.started.elapsed() >= item.age())
                     .map(|(&id, _)| id).collect();
                 for id in expired {
@@ -203,6 +236,7 @@ impl RawLink {
                     }
                     Some(tag) if tag == ChannelId::Video as u8 => {
                         self.packets += 1;
+                        self.received_video_bytes += bytes.len() as u64;
                         if let Some(frame) = self.collect(bytes)? {
                             self.input.push_back(Incoming::Video(Box::new(frame)));
                         }
@@ -268,6 +302,10 @@ impl StreamTransport for RawLink {
         true
     }
 
+    fn keyframe_in_flight(&self) -> bool {
+        self.video.as_ref().is_some_and(|frame| frame.keyframe)
+    }
+
     fn path(&self) -> Path {
         let rtt = self
             .peer
@@ -293,16 +331,13 @@ impl StreamTransport for RawLink {
     }
 
     async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<bool> {
+        self.send_due_video()?;
         if self.video.is_some() || frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
             return Ok(false);
         }
         let wire_rate = crate::transport::paced_wire_rate(rate, 125).max(1);
         let spacing = Duration::from_secs_f64(1160.0 * 8.0 / f64::from(wire_rate));
         let keyframe = frame.is_keyframe;
-        let captured_at = frame.captured_at;
-        if captured_at.elapsed() >= DELTA_AGE {
-            return Ok(false);
-        }
         let shards = shards(frame)?;
         let age = if keyframe {
             // Include every FEC shard in the time budget while retaining the
@@ -315,12 +350,16 @@ impl StreamTransport for RawLink {
         } else {
             DELTA_AGE
         };
-        let deadline = captured_at + age;
+        let now = Instant::now();
+        // Charge only time in this one-frame send slot to the network budget.
+        // Slow encode has already happened when the latest access unit arrives.
+        let deadline = now + age;
         self.video = Some(Pending {
             shards: shards.into_iter(),
-            next: Instant::now(),
+            next: now,
             deadline,
             spacing,
+            keyframe,
         });
         Ok(true)
     }
@@ -358,6 +397,10 @@ impl StreamTransport for RawLink {
             }
             self.pump().await?;
         }
+    }
+
+    fn take_video_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.received_video_bytes)
     }
 
     fn take_video_packets(&mut self) -> u64 {
@@ -518,7 +561,7 @@ mod tests {
     use crate::protocol::VideoCodec;
 
     #[tokio::test]
-    async fn paced_join_keyframe_can_take_more_than_half_a_second() -> Result<()> {
+    async fn paced_join_keyframe_survives_an_encoder_stall_and_a_slow_link() -> Result<()> {
         let sender = UdpSocket::bind("127.0.0.1:0").await?;
         let receiver = UdpSocket::bind("127.0.0.1:0").await?;
         let sender_addr = sender.local_addr()?;
@@ -534,13 +577,13 @@ mod tests {
             codec: VideoCodec::H264,
             frame_id: 1,
             timestamp_us: 0,
-            captured_at: Instant::now(),
+            captured_at: Instant::now() - Duration::from_millis(100),
             fps: 60,
             is_keyframe: true,
             payload: payload.clone(),
         };
-        assert!(host.video(frame, 4_000_000).await?);
-        let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+        assert!(host.video(frame, 1_700_000).await?);
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 tokio::select! {
                     outgoing = host.next() => {

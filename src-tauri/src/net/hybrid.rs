@@ -68,6 +68,9 @@ trait StreamTransport: Send {
     fn supports_main10(&self) -> bool {
         false
     }
+    fn keyframe_in_flight(&self) -> bool {
+        false
+    }
     fn video(
         &mut self,
         frame: OutboundVideoFrame,
@@ -76,6 +79,7 @@ trait StreamTransport: Send {
     fn send(&mut self, packet: Bytes) -> impl Future<Output = Result<()>> + Send;
     fn next(&mut self) -> impl Future<Output = Result<Incoming>> + Send;
     fn take_video_packets(&mut self) -> u64;
+    fn take_video_bytes(&mut self) -> u64;
     fn take_sent_packets(&mut self) -> u64;
 }
 
@@ -407,7 +411,9 @@ impl Room {
                             || last_frame.is_some_and(|last| last.wrapping_add(1) != frame.frame_id))
                         {
                             waiting_for_keyframe = true;
-                            self.request_idr(&mut last_pli);
+                            if !link.keyframe_in_flight() {
+                                self.request_idr(&mut last_pli);
+                            }
                         } else {
                             let id = frame.frame_id;
                             waiting_for_keyframe = !link.video(frame, self.rate()).await?;
@@ -438,7 +444,9 @@ impl Room {
                         }
                         player.path = Some(path);
                     }
-                    if waiting_for_keyframe { self.request_idr(&mut last_pli); }
+                    if waiting_for_keyframe && !link.keyframe_in_flight() {
+                        self.request_idr(&mut last_pli);
+                    }
                     link.send(ControlMessage::Ping { client_ts_us: 0 }.encode_datagram()?).await?;
                 }
             }
@@ -472,7 +480,11 @@ impl Room {
                     )
                     .await?;
                 }
-                ControlMessage::RequestKeyframe { .. } => self.request_idr(last_pli),
+                ControlMessage::RequestKeyframe { .. } => {
+                    if !link.keyframe_in_flight() {
+                        self.request_idr(last_pli);
+                    }
+                }
                 ControlMessage::ClientBitrateLimit { mbps } => {
                     let mut slots = self.state.0.slots.lock().unwrap();
                     slots[slot].as_mut().unwrap().limit = Some(mbps.clamp(1, 200) * 1_000_000);
@@ -870,7 +882,7 @@ async fn client_stream<T: StreamTransport>(
     let mut packets = 0;
     let mut recovered = 0;
     let mut audio = 0;
-    let mut window_bytes = 0usize;
+    let mut window_bytes = 0u64;
     let mut window_start = Instant::now();
     let mut relative_motion = motion::History::default();
     let mut motion_replay: Option<(Instant, Bytes)> = None;
@@ -879,22 +891,25 @@ async fn client_stream<T: StreamTransport>(
             incoming = link.next() => match incoming? {
                 Incoming::Video(frame) => {
                     last_seen = Instant::now();
-                    window_bytes += frame.payload.len();
                     let newer = latest_frame.is_none_or(|last: u32| (frame.frame_id.wrapping_sub(last) as i32) > 0);
                     if !newer { continue; }
                     waiting |= latest_frame.is_some_and(|last: u32| frame.frame_id != last.wrapping_add(1));
-                    latest_frame = Some(frame.frame_id);
                     if waiting && !frame.is_keyframe {
                         dropped += 1;
                         continue;
                     }
-                    last_video = last_seen;
-                    frames += 1;
-                    recovered += u64::from(frame.fec_recovered_shards);
+                    let id = frame.frame_id;
                     let keyframe = frame.is_keyframe;
+                    let repaired = frame.fec_recovered_shards;
                     let overflow = queue_received_video(&pending, events, *frame);
                     dropped += u64::from(overflow);
                     waiting = overflow && !keyframe;
+                    if !waiting {
+                        latest_frame = Some(id);
+                        last_video = last_seen;
+                        frames += 1;
+                        recovered += u64::from(repaired);
+                    }
                 }
                 Incoming::Keyframe => waiting = true,
                 Incoming::Packet(bytes) => {
@@ -955,6 +970,7 @@ async fn client_stream<T: StreamTransport>(
                     waiting = true;
                 }
                 packets += link.take_video_packets();
+                window_bytes += link.take_video_bytes();
                 let path = link.path();
                 link.send(ControlMessage::TelemetryFeedback {
                     rtt_ms: path.rtt.as_secs_f64() * 1000.0, loss_pct: path.loss,
@@ -1258,12 +1274,18 @@ mod tests {
             while host.telemetry.lock().await.active_players != 1 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            host.tx.video_tx.publish(frame(1)).unwrap();
+            let mut video = frame(1);
+            let mut payload = video.payload.to_vec();
+            payload.resize(24_000, 0x55);
+            video.payload = Bytes::from(payload);
+            let expected = video.payload.clone();
+            host.tx.video_tx.publish(video).unwrap();
             loop {
                 match viewer.event_rx.recv().await.unwrap() {
                     NetworkEvent::VideoFrameReceived(unit) => {
                         assert_eq!(unit.frame_id, 1);
                         assert_eq!(unit.meta.width, 1920);
+                        assert_eq!(unit.payload, expected);
                         break;
                     }
                     NetworkEvent::PhaseChanged(ConnectionPhase::Failed) => {
