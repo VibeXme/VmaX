@@ -89,10 +89,61 @@ pub fn spin_sleep_until(deadline: Instant) {
         // at 1080p. Unix timers can sleep through most of that interval.
         let spin = if cfg!(windows) { Duration::from_micros(150) } else { Duration::from_micros(30) };
         if remaining > spin * 2 {
-            thread::sleep(remaining - spin);
+            let sleep = remaining - spin;
+            #[cfg(target_os = "windows")]
+            if windows_pacing_wait::sleep(sleep) || sleep < Duration::from_millis(1) {
+                std::hint::spin_loop();
+                continue;
+            }
+            thread::sleep(sleep);
         } else {
             std::hint::spin_loop();
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_pacing_wait {
+    use std::time::Duration;
+    use windows::Win32::{
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+        System::Threading::{
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW,
+            SYNCHRONIZATION_SYNCHRONIZE, SetWaitableTimer, TIMER_MODIFY_STATE,
+            WaitForSingleObject,
+        },
+    };
+    use windows_core::PCWSTR;
+
+    struct Timer(HANDLE);
+
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    thread_local! {
+        static TIMER: Option<Timer> = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_MODIFY_STATE.0 | SYNCHRONIZATION_SYNCHRONIZE.0,
+            ).ok().map(Timer)
+        };
+    }
+
+    pub(super) fn sleep(duration: Duration) -> bool {
+        // Relative timers use negative 100 ns units. Thread sleep on older
+        // Windows runtimes can round sub-ms packet waits up to the next tick.
+        let ticks = (duration.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64;
+        TIMER.with(|timer| {
+            timer.as_ref().is_some_and(|timer| unsafe {
+                SetWaitableTimer(timer.0, &-ticks, 0, None, None, false).is_ok()
+                    && WaitForSingleObject(timer.0, u32::MAX) == WAIT_OBJECT_0
+            })
+        })
     }
 }
 

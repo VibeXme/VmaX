@@ -68,7 +68,7 @@ jobs:
         shell: pwsh
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'vmax-rust-tests.log'
-          cargo test --manifest-path src-tauri/Cargo.toml --lib --target x86_64-pc-windows-msvc --locked -- --test-threads=2 2>&1 | Tee-Object -FilePath $log
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --target x86_64-pc-windows-msvc --locked -- --test-threads=1 2>&1 | Tee-Object -FilePath $log
           $status = $LASTEXITCODE
           if ($status) {
             $tail = Get-Content $log -Tail 75

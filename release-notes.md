@@ -6,7 +6,7 @@
 - Windows native playback adds adjustable FidelityFX CAS. Supported single-viewer Raw UDP sessions can negotiate HEVC Main10.
 - Android opens the lobby before attaching native video. MediaCodec uses low-latency tuning and reports decode and render timings separately.
 - Windows hosts can opt in to matching the selected display to the stream resolution and viewer refresh limit. VmaX restores the previous mode when it still owns the mode change.
-- App-owned streaming UDP sockets request 256 KiB buffers in each direction. Direct Raw UDP and WebRTC apply best-effort DSCP marking.
+- Windows QUIC packet pacing uses a high-resolution timer. App-owned streaming UDP sockets request 256 KiB buffers in each direction. Direct Raw UDP and WebRTC apply best-effort DSCP marking.
 
 ### Downloads
 

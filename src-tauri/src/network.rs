@@ -3890,6 +3890,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_direct_and_relay_streams_survive_repeated_frame_gaps() {
+        // The real Windows host requests this timer resolution while streaming.
+        #[cfg(target_os = "windows")]
+        let _timer = crate::capture::WindowsTimerPeriod::new();
         let mut relay = LocalSignalingServer::start("127.0.0.1:0").await.unwrap();
         let test_session = |relay_only| {
             let endpoint = relay.ws_url.clone();
