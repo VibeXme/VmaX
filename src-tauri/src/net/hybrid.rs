@@ -1,4 +1,5 @@
 //! Persistent, authenticated room with separate transport and queues per viewer.
+mod motion;
 mod raw;
 mod rtc;
 mod setup;
@@ -29,7 +30,7 @@ use crate::{
     net::regional,
     network::{
         ConnectionPath, ConnectionPhase, NetworkConfig, NetworkError, NetworkEvent,
-        NetworkTelemetry, OutboundVideoFrame, VideoBacklog, set_phase,
+        NetworkTelemetry, OutboundVideoFrame, VideoBacklog, queue_received_video, set_phase,
     },
     protocol::{AudioPacket, ChannelId, ControlMessage, InputPacket, ReassembledFrame, VideoCodec},
 };
@@ -64,6 +65,9 @@ enum Incoming {
 /// wire messages. A transport owns its packetization, pacing and feedback.
 trait StreamTransport: Send {
     fn path(&self) -> Path;
+    fn supports_main10(&self) -> bool {
+        false
+    }
     fn video(
         &mut self,
         frame: OutboundVideoFrame,
@@ -101,6 +105,8 @@ struct Player {
     codecs: Vec<VideoCodec>,
     remote_loss: f64,
     min_rtt: Option<Duration>,
+    last_relative_motion: Option<u64>,
+    display: Option<crate::handshake::ClientDisplay>,
 }
 
 struct Slot {
@@ -308,6 +314,8 @@ impl Room {
                 codecs,
                 remote_loss: 0.0,
                 min_rtt: None,
+                last_relative_motion: None,
+                display: None,
             });
             index
         };
@@ -446,8 +454,11 @@ impl Room {
     ) -> Result<()> {
         match bytes.first().and_then(|tag| ChannelId::try_from(*tag).ok()) {
             Some(ChannelId::Input) => {
-                if let Ok(packet) = InputPacket::decode(&bytes) {
-                    let _ = self.events.send(NetworkEvent::PlayerInput { slot, packet });
+                let mut slots = self.state.0.slots.lock().unwrap();
+                if let Some(player) = &mut slots[slot] {
+                    motion::receive(&bytes, &mut player.last_relative_motion, |packet| {
+                        let _ = self.events.send(NetworkEvent::PlayerInput { slot, packet });
+                    });
                 }
             }
             Some(ChannelId::Control) => match ControlMessage::decode_datagram(&bytes)? {
@@ -467,11 +478,18 @@ impl Room {
                     slots[slot].as_mut().unwrap().limit = Some(mbps.clamp(1, 200) * 1_000_000);
                 }
                 ControlMessage::ClientCapabilities {
-                    preferred_codecs, ..
+                    preferred_codecs,
+                    mut display,
                 } => {
                     let mut slots = self.state.0.slots.lock().unwrap();
                     let player = slots[slot].as_mut().unwrap();
                     player.codecs = supported_codecs(preferred_codecs);
+                    if let Some(display) = &mut display {
+                        display.hevc_main10 &=
+                            link.supports_main10() && player.codecs.contains(&VideoCodec::Hevc);
+                        display.hevc_444 = false;
+                    }
+                    player.display = display;
                 }
                 ControlMessage::TelemetryFeedback { loss_pct, .. }
                     if (0.0..=100.0).contains(&loss_pct) =>
@@ -629,6 +647,7 @@ pub(crate) async fn run_host(
     let mut previous = None;
     let mut previous_rate = room.config.initial_bitrate_bps;
     let mut previous_codecs = vec![];
+    let mut previous_display = None;
     let mut abr = StreamRate::default();
     loop {
         tokio::select! {
@@ -640,7 +659,7 @@ pub(crate) async fn run_host(
                 }
             }
             _ = tick.tick() => {
-                let (count, path, codecs, ceiling, congested) = {
+                let (count, path, codecs, ceiling, congested, display) = {
                     let slots = room.state.0.slots.lock().unwrap();
                     let count = slots.iter().flatten().filter(|peer| peer.active).count();
                     let path = slots.iter().flatten().filter_map(|peer| peer.path)
@@ -655,7 +674,12 @@ pub(crate) async fn run_host(
                             || path.estimate.is_some_and(|estimate| estimate < previous_rate * 9 / 10)
                         })
                     });
-                    (count, path, codecs, ceiling, congested)
+                    let display = if count == 1 {
+                        slots.iter().flatten().find(|peer| peer.active).and_then(|peer| peer.display)
+                    } else {
+                        None
+                    };
+                    (count, path, codecs, ceiling, congested, display)
                 };
                 let new_phase = if count == 0 { ConnectionPhase::WaitingForPeer } else { ConnectionPhase::Connected };
                 let rate = if room.state.0.fixed.load(Ordering::Relaxed) || count == 0 { ceiling } else {
@@ -668,9 +692,13 @@ pub(crate) async fn run_host(
                     snapshot.target_bitrate_bps = rate;
                     report_path(&mut snapshot, path);
                 }
-                if count > 0 && previous_codecs != codecs {
+                if count > 0 && (previous_codecs != codecs || previous_display != display) {
                     previous_codecs = codecs.clone();
-                    let _ = events.send(NetworkEvent::ControlReceived(ControlMessage::ClientCapabilities { preferred_codecs: codecs, display: None }));
+                    previous_display = display;
+                    let _ = events.send(NetworkEvent::ControlReceived(ControlMessage::ClientCapabilities { preferred_codecs: codecs, display }));
+                } else if count == 0 {
+                    previous_codecs.clear();
+                    previous_display = None;
                 }
                 if rate != previous_rate {
                     previous_rate = rate;
@@ -834,7 +862,7 @@ async fn client_stream<T: StreamTransport>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_seen = Instant::now();
     let mut last_video = last_seen;
-    let mut last_pli = None;
+    let mut last_pli = last_seen;
     let mut latest_frame = None;
     let mut waiting = true;
     let mut frames = 0;
@@ -844,6 +872,8 @@ async fn client_stream<T: StreamTransport>(
     let mut audio = 0;
     let mut window_bytes = 0usize;
     let mut window_start = Instant::now();
+    let mut relative_motion = motion::History::default();
+    let mut motion_replay: Option<(Instant, Bytes)> = None;
     loop {
         tokio::select! {
             incoming = link.next() => match incoming? {
@@ -858,21 +888,13 @@ async fn client_stream<T: StreamTransport>(
                         dropped += 1;
                         continue;
                     }
-                    waiting = false;
                     last_video = last_seen;
                     frames += 1;
                     recovered += u64::from(frame.fec_recovered_shards);
-                    // The existing app receiver takes this slot on delivery.
-                    let mut slot = pending.lock().unwrap();
-                    if slot.as_ref().is_some_and(|prior: &ReassembledFrame| prior.is_keyframe) && !frame.is_keyframe {
-                        dropped += 1;
-                        waiting = true;
-                    } else if slot.replace(*frame).is_some() {
-                        dropped += 1;
-                        waiting = true;
-                    } else {
-                        let _ = events.send(NetworkEvent::VideoFramePending(pending.clone()));
-                    }
+                    let keyframe = frame.is_keyframe;
+                    let overflow = queue_received_video(&pending, events, *frame);
+                    dropped += u64::from(overflow);
+                    waiting = overflow && !keyframe;
                 }
                 Incoming::Keyframe => waiting = true,
                 Incoming::Packet(bytes) => {
@@ -894,7 +916,25 @@ async fn client_stream<T: StreamTransport>(
                     }
                 }
             },
-            Some(packet) = input.recv() => link.send(packet.encode()).await?,
+            Some(packet) = input.recv() => {
+                let relative = motion::relative(&packet);
+                let bytes = relative_motion.encode(packet);
+                if relative {
+                    // At the end of a mouse movement there may be no next sample
+                    // to carry the history. Send one trailing repair copy.
+                    motion_replay = Some((Instant::now() + Duration::from_millis(6), bytes.clone()));
+                }
+                link.send(bytes).await?;
+            }
+            _ = async {
+                if let Some((deadline, _)) = &motion_replay {
+                    tokio::time::sleep_until((*deadline).into()).await;
+                }
+            }, if motion_replay.is_some() => {
+                if let Some((_, bytes)) = motion_replay.take() {
+                    link.send(bytes).await?;
+                }
+            }
             Some(message) = controls.recv() => {
                 if matches!(message, ControlMessage::RequestKeyframe { .. }) {
                     waiting = true;
@@ -902,14 +942,17 @@ async fn client_stream<T: StreamTransport>(
                     link.send(message.encode_datagram()?).await?;
                 }
             }
+            _ = tokio::time::sleep_until((last_pli + PLI_INTERVAL).into()), if waiting => {
+                last_pli = Instant::now();
+                link.send(ControlMessage::RequestKeyframe {
+                    last_good_frame_id: None,
+                    reason: "viewer lost a reference".into(),
+                }.encode_datagram()?).await?;
+            }
             _ = tick.tick() => {
                 ensure!(last_seen.elapsed() < IDLE_TIMEOUT, "Host stopped responding");
                 if last_video.elapsed() >= VIDEO_SILENCE {
                     waiting = true;
-                }
-                if waiting && last_pli.is_none_or(|time: Instant| time.elapsed() >= PLI_INTERVAL) {
-                    last_pli = Some(Instant::now());
-                    link.send(ControlMessage::RequestKeyframe { last_good_frame_id: None, reason: "viewer lost a reference".into() }.encode_datagram()?).await?;
                 }
                 packets += link.take_video_packets();
                 let path = link.path();

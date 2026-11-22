@@ -119,6 +119,8 @@ pub struct StartSessionParams {
     pub exclude_discord_audio: bool,
     pub capture_display: Option<String>,
     #[serde(default)]
+    pub match_viewer_display: bool,
+    #[serde(default)]
     pub host_only_input: bool,
     #[serde(default)]
     pub guest_controller_only: bool,
@@ -822,6 +824,9 @@ async fn spawn_host_capture_thread(
             let mut cpu_sample = None;
             let mut encoded_frames: u32 = 0;
             let mut watchdog_encoded = 0u32;
+            let mut encode_total_ms = 0.0f32;
+            let mut color_submit_total_ms = 0.0f32;
+            let mut color_samples = 0u32;
             let mut last_sent_packets = controls.send_backlog.sent_packets();
             let mut capture_sample_at = Instant::now();
             let mut ema_encode_ms: f32 = 0.0;
@@ -846,17 +851,62 @@ async fn spawn_host_capture_thread(
             let mut retry_capture = false;
             let mut retry_delay = Duration::from_millis(15);
             let mut next_retry = Instant::now();
+            let mut matched_mode = None;
+            let mut attempted_mode = None;
 
             while !stop_flag.load(Ordering::Relaxed) {
+                if let Some(monitor) = selected_display.filter(|_| params.match_viewer_display) {
+                    let requested = controls.connected.load(Ordering::Relaxed).then(|| {
+                        controls.client_display.lock().ok().and_then(|display| *display)
+                    }).flatten()
+                        .filter(|display| (30..=240).contains(&display.max_refresh_hz))
+                        .map(|display| {
+                            let width = controls.desired_max_w.load(Ordering::Relaxed);
+                            let height = controls.desired_max_h.load(Ordering::Relaxed);
+                            let fps = controls.desired_fps.load(Ordering::Relaxed);
+                            let (_, _, hz) = display.constrain(width, height, fps);
+                            (width, height, u32::from(hz))
+                        });
+                    if requested != attempted_mode {
+                        attempted_mode = requested;
+                        if matched_mode.is_some() || requested.is_some() {
+                            drop(encoder.take());
+                            drop(capturer.take());
+                            drop(matched_mode.take());
+                            if let Some(target) = requested {
+                                match crate::capture::win::DisplayMode::apply(monitor, target) {
+                                    Ok(guard) => matched_mode = guard,
+                                    Err(error) => emit_packet_log(&app_thread, "CAPTURE", "WARN", error),
+                                }
+                            }
+                            retry_capture = true;
+                            next_retry = Instant::now();
+                        }
+                    }
+                }
                 let elapsed = capture_sample_at.elapsed();
                 if elapsed >= Duration::from_secs(1) {
-                    let captured_frames = capturer.as_ref().map_or(0, CaptureWorker::take_capture_count);
+                    let (captured_frames, capture_time) = capturer
+                        .as_ref()
+                        .map_or((0, Duration::ZERO), CaptureWorker::take_capture_sample);
                     let capture_fps = (captured_frames as f64 / elapsed.as_secs_f64()).round() as u32;
                     capture_sample_at = Instant::now();
                     let sent_packets = controls.send_backlog.sent_packets();
-                    tracing::info!(sent_pkts = sent_packets.saturating_sub(last_sent_packets), cap_fps = capture_fps, enc_fps = (f64::from(watchdog_encoded) / elapsed.as_secs_f64()).round() as u32, bitrate = current_bitrate, "HOST");
+                    tracing::info!(
+                        sent_pkts = sent_packets.saturating_sub(last_sent_packets),
+                        cap_fps = capture_fps,
+                        capture_ms = capture_time.as_secs_f64() * 1000.0 / f64::from(captured_frames.max(1)),
+                        color_submit_ms = ?(color_samples != 0).then(|| color_submit_total_ms / color_samples as f32),
+                        encode_ms = encode_total_ms / watchdog_encoded.max(1) as f32,
+                        enc_fps = (f64::from(watchdog_encoded) / elapsed.as_secs_f64()).round() as u32,
+                        bitrate = current_bitrate,
+                        "HOST"
+                    );
                     last_sent_packets = sent_packets;
                     watchdog_encoded = 0;
+                    encode_total_ms = 0.0;
+                    color_submit_total_ms = 0.0;
+                    color_samples = 0;
                     if controls.connected.load(Ordering::Relaxed) {
                         let app = app_thread.clone();
                         let micros = if retry_capture { 0 } else { (ema_encode_ms * 1000.0) as u32 };
@@ -1260,6 +1310,13 @@ async fn spawn_host_capture_thread(
                             encoder_waiting_since = None;
                             forced_refresh_frames = forced_refresh_frames.saturating_sub(1);
                             ema_encode_ms = enc.last_encode_latency_ms();
+                            let color_ms = enc.last_color_submit_ms();
+                            if let Some(ms) = color_ms {
+                                color_submit_total_ms += ms;
+                                color_samples += 1;
+                            }
+                            encode_total_ms += (enc_started.elapsed().as_secs_f32() * 1000.0
+                                - color_ms.unwrap_or(0.0)).max(0.0);
                             encoded_frames += 1;
                             watchdog_encoded += 1;
 
@@ -1534,13 +1591,15 @@ fn register_session<'a>(
             #[cfg(target_os = "windows")]
             let mut last_windows_playback = native_client::Playback::default();
             #[cfg(target_os = "windows")]
-            let mut windows_sample = (Instant::now(), 0u64, last_windows_playback);
+            let mut windows_sample = (Instant::now(), 0u64, last_windows_playback, 0u64);
             #[cfg(target_os = "android")]
             let mut native_video_route: Option<bool> = None;
             #[cfg(target_os = "android")]
             let mut last_native_render_count = crate::android_jni::rendered_frames();
             #[cfg(target_os = "android")]
-            let mut native_progress = (Instant::now(), 0u64, last_native_render_count);
+            let mut native_progress = (
+                Instant::now(), 0u64, last_native_render_count, 0u64, crate::android_jni::playback_timing(),
+            );
             #[cfg(target_os = "android")]
             let mut native_video_size: Option<(u32, u32)> = None;
 
@@ -1722,29 +1781,45 @@ fn register_session<'a>(
                                     displayed_frames = playback.presented.saturating_sub(last_windows_playback.presented) as u32;
                                     let seconds = windows_sample.0.elapsed().as_secs_f64();
                                     if seconds >= 1.0 {
+                                        let decoded = playback.decoded.saturating_sub(windows_sample.2.decoded);
+                                        let attempts = playback.render_attempts.saturating_sub(windows_sample.2.render_attempts);
                                         tracing::info!(
                                             recv_pkts = snapshot.video_packets_rx.saturating_sub(windows_sample.1),
-                                            dec_fps = (playback.decoded.saturating_sub(windows_sample.2.decoded) as f64 / seconds).round() as u32,
+                                            recv_fps = (snapshot.video_frames_rx.saturating_sub(windows_sample.3) as f64 / seconds).round() as u32,
+                                            dec_fps = (decoded as f64 / seconds).round() as u32,
+                                            decode_ms = playback.decode_us.saturating_sub(windows_sample.2.decode_us) as f64 / (1000.0 * decoded.max(1) as f64),
+                                            render_submit_ms = playback.render_submit_us.saturating_sub(windows_sample.2.render_submit_us) as f64 / (1000.0 * attempts.max(1) as f64),
                                             render_fps = (playback.presented.saturating_sub(windows_sample.2.presented) as f64 / seconds).round() as u32,
-                                            rtt = snapshot.rtt_ms, path = ?snapshot.connection_path, "CLIENT");
-                                        windows_sample = (Instant::now(), snapshot.video_packets_rx, playback);
+                                            net_rtt_ms = snapshot.rtt_ms, path = ?snapshot.connection_path, "CLIENT");
+                                        windows_sample = (Instant::now(), snapshot.video_packets_rx, playback, snapshot.video_frames_rx);
                                     }
                                 } else {
-                                    windows_sample = (Instant::now(), snapshot.video_packets_rx, playback);
+                                    windows_sample = (Instant::now(), snapshot.video_packets_rx, playback, snapshot.video_frames_rx);
                                 }
                                 last_windows_playback = playback;
                             }
                             #[cfg(target_os = "android")]
                             {
                                 let count = crate::android_jni::rendered_frames();
+                                let timing = crate::android_jni::playback_timing();
                                 if native_video_route != Some(true) {
-                                    native_progress = (Instant::now(), snapshot.video_packets_rx, count);
+                                    native_progress = (Instant::now(), snapshot.video_packets_rx, count, snapshot.video_frames_rx, timing);
                                 } else if native_progress.0.elapsed() >= Duration::from_secs(1) {
                                     let packets = snapshot.video_packets_rx.saturating_sub(native_progress.1);
-                                    let fps = (count.saturating_sub(native_progress.2) as f64
-                                        / native_progress.0.elapsed().as_secs_f64()).round() as u32;
-                                    tracing::info!(recv_pkts = packets, dec_fps = fps, render_fps = fps,
-                                        rtt = snapshot.rtt_ms, path = ?snapshot.connection_path, "CLIENT");
+                                    let seconds = native_progress.0.elapsed().as_secs_f64();
+                                    let fps = (count.saturating_sub(native_progress.2) as f64 / seconds).round() as u32;
+                                    let previous = native_progress.4;
+                                    tracing::info!(
+                                        recv_pkts = packets,
+                                        recv_fps = (snapshot.video_frames_rx.saturating_sub(native_progress.3) as f64 / seconds).round() as u32,
+                                        dec_fps = (timing.decoded.saturating_sub(previous.decoded) as f64 / seconds).round() as u32,
+                                        decode_ms = timing.decode_us.saturating_sub(previous.decode_us) as f64
+                                            / (1000.0 * timing.decode_samples.saturating_sub(previous.decode_samples).max(1) as f64),
+                                        render_ms = timing.render_us.saturating_sub(previous.render_us) as f64
+                                            / (1000.0 * timing.render_samples.saturating_sub(previous.render_samples).max(1) as f64),
+                                        render_fps = fps, net_rtt_ms = snapshot.rtt_ms,
+                                        path = ?snapshot.connection_path, "CLIENT"
+                                    );
                                     if packets > 0 && fps == 0 {
                                         crate::android_jni::recover_stalled_decoder();
                                         native_video_route = Some(false);
@@ -1756,7 +1831,7 @@ fn register_session<'a>(
                                             reason: "MediaCodec output stalled".into(),
                                         });
                                     }
-                                    native_progress = (Instant::now(), snapshot.video_packets_rx, count);
+                                    native_progress = (Instant::now(), snapshot.video_packets_rx, count, snapshot.video_frames_rx, timing);
                                 }
                                 if native_video_route == Some(true) {
                                     displayed_frames = count
@@ -1973,7 +2048,10 @@ fn register_session<'a>(
                             {
                                 if native_video_route != Some(native_video) {
                                     // Start the native watchdog when delivery to the Surface begins.
-                                    native_progress = (Instant::now(), native_progress.1, crate::android_jni::rendered_frames());
+                                    native_progress = (
+                                        Instant::now(), native_progress.1, crate::android_jni::rendered_frames(),
+                                        native_progress.3, crate::android_jni::playback_timing(),
+                                    );
                                 }
                                 native_video_route = Some(native_video);
                                 native_video_size = size;
@@ -2067,7 +2145,11 @@ fn register_session<'a>(
                                 let bounds = ctx.host_controls.as_ref().and_then(|host| {
                                     host.desktop_bounds.lock().ok().and_then(|bounds| *bounds)
                                 });
-                                let accepted = held_inputs.inject(&pkt, bounds);
+                                let accepted = if slot.is_some() && matches!(pkt.event, InputEvent::MouseMoveRel { .. }) {
+                                    held_inputs.inject_ordered_relative_motion(&pkt.event, bounds)
+                                } else {
+                                    held_inputs.inject(&pkt, bounds)
+                                };
                                 if !accepted
                                     && last_input_rejection
                                         .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))

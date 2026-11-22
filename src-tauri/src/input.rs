@@ -137,6 +137,15 @@ pub fn desktop_point(
 
 #[cfg(target_os = "windows")]
 impl HeldRemoteInputs {
+    pub(crate) fn inject_ordered_relative_motion(
+        &self,
+        event: &InputEvent,
+        bounds: Option<windows::Win32::Foundation::RECT>,
+    ) -> bool {
+        // The hybrid link has already de-duplicated its separate motion lane.
+        win32::inject_win32_input(event, bounds)
+    }
+
     pub fn release_keyboard(&mut self) {
         for scan_code in self.keys.drain() {
             win32::inject_win32_input(

@@ -333,6 +333,9 @@ pub mod win {
         fn last_encode_latency_ms(&self) -> f32 {
             crate::capture::latest_encode_latency_ms()
         }
+        fn last_color_submit_ms(&self) -> Option<f32> {
+            None
+        }
         /// Start an intra-refresh wave. Encoders without a rolling refresh
         /// implementation fall back to a keyframe, which is still better than
         /// leaving the decoder on a broken reference chain.
@@ -437,6 +440,7 @@ pub mod win {
         force_ir_frames: u32,
         intra_refresh: crate::encoder_recovery::IntraRefreshConfig,
         last_encode_ms: f32,
+        last_color_submit_ms: f32,
         plan: crate::nvenc::NvencPlan,
         settings: crate::nvenc::NvencSettings,
     }
@@ -712,6 +716,21 @@ pub mod win {
             }
             let tuning = NV_ENC_TUNING_INFO::ULTRA_LOW_LATENCY;
 
+            for (name, query) in [
+                ("subframe_readback", NV_ENC_CAPS::SUPPORT_SUBFRAME_READBACK),
+                ("10bit_encode", NV_ENC_CAPS::SUPPORT_10BIT_ENCODE),
+                ("ref_pic_invalidation", NV_ENC_CAPS::SUPPORT_REF_PIC_INVALIDATION),
+            ] {
+                let mut caps: NV_ENC_CAPS_PARAM = unsafe { core::mem::zeroed() };
+                caps.version = rung.caps_param_ver();
+                caps.capsToQuery = query;
+                let mut value = 0;
+                let status = unsafe {
+                    (api.nvEncGetEncodeCaps)(encoder, codec_guid, &mut caps, &mut value)
+                };
+                tracing::debug!(?codec, capability = name, value, ?status, "NVENC capability");
+            }
+
             let mut preset_cfg: NV_ENC_PRESET_CONFIG = unsafe { core::mem::zeroed() };
             preset_cfg.version = rung.preset_config_ver();
             preset_cfg.presetCfg.version = rung.config_ver();
@@ -966,6 +985,7 @@ pub mod win {
                 force_ir_frames: 0,
                 intra_refresh,
                 last_encode_ms: 0.0,
+                last_color_submit_ms: 0.0,
                 settings: crate::nvenc::NvencSettings {
                     aq_strength: plan.rate_control.aq_strength,
                     ..settings
@@ -1007,6 +1027,10 @@ pub mod win {
 
         fn last_encode_latency_ms(&self) -> f32 {
             self.last_encode_ms
+        }
+
+        fn last_color_submit_ms(&self) -> Option<f32> {
+            Some(self.last_color_submit_ms)
         }
 
         fn set_bitrate_bps(&mut self, bitrate_bps: u32) -> Result<(), String> {
@@ -1075,6 +1099,7 @@ pub mod win {
                 self.width,
                 self.height,
             )?;
+            self.last_color_submit_ms = t_encode_start.elapsed().as_secs_f32() * 1000.0;
 
             let mut map: NV_ENC_MAP_INPUT_RESOURCE = unsafe { core::mem::zeroed() };
             map.version = self.rung.map_input_resource_ver();

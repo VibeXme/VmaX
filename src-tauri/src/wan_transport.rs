@@ -53,12 +53,9 @@ pub const WAN_KEEPALIVE: Duration = Duration::from_millis(200);
 /// Wi-Fi -> LTE transition and short enough to release a dead peer.
 pub const WAN_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 4 MiB kernel buffers absorb the capture cadence while the pacer smooths the
-/// wire.  Must match `crate::transport::SOCKET_BUFFER_BYTES`.
-pub const SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-
 /// DSCP Expedited Forwarding (46 << 2).  On Wi-Fi this maps to WMM AC_VO.
 pub const DSCP_EF: u32 = 0xB8;
+pub const DSCP_AF41: u32 = 34 << 2;
 
 pub const PUNCH_INTERVAL: Duration = Duration::from_millis(20);
 pub const PUNCH_ROUNDS: u32 = 25; // ~500 ms, matching ICE connectivity checks
@@ -144,15 +141,18 @@ pub fn bind_dual_stack(port: u16) -> io::Result<UdpSocket> {
     Ok(socket.into())
 }
 
-/// Apply 4 MiB buffers and DSCP EF.  Buffer sizing is mandatory; QoS marking is
+/// Apply bounded socket buffers and DSCP EF. Buffer sizing is mandatory; QoS marking is
 /// best effort because some Windows Wi-Fi drivers and vendor Android kernels
 /// reject the socket option, and a failed mark must never fail a session.
 pub fn tune_wan_socket(socket: &Socket) -> io::Result<()> {
-    socket.set_send_buffer_size(SOCKET_BUFFER_BYTES)?;
-    socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES)?;
-    let _ = socket.set_tos_v4(DSCP_EF);
-    let _ = mark_ipv6_traffic_class(socket, DSCP_EF);
+    crate::stun::tune_media_buffers(socket)?;
+    mark_traffic_class(socket, DSCP_EF);
     Ok(())
+}
+
+pub(crate) fn mark_traffic_class(socket: &Socket, class: u32) {
+    let _ = socket.set_tos_v4(class);
+    let _ = mark_ipv6_traffic_class(socket, class);
 }
 
 /// `IPV6_TCLASS` / `IP_TOS` for an `AF_INET6` socket.  `socket2` exposes the

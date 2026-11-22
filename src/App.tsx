@@ -174,6 +174,7 @@ export function App() {
   }
   const [displays, setDisplays] = useState<{ id: string; width: number; height: number; x: number; y: number }[]>([]);
   const [captureDisplay, setCaptureDisplay] = useState("");
+  const [matchViewerDisplay, setMatchViewerDisplay] = useState(false);
   const [hostOnlyInput, setHostOnlyInput] = useState(false);
   const [guestControllerOnly, setGuestControllerOnly] = useState(false);
   const [guestPermissions, setGuestPermissions] = useState<GuestPermissions>({ keyboard: true, mouse: true, controller: true });
@@ -486,6 +487,7 @@ export function App() {
       stream_computer_audio: config.audio.streamComputerAudio,
       audio_output_id: config.audio.outputDeviceId || null,
       capture_display: captureDisplay || null,
+      match_viewer_display: !!captureDisplay && matchViewerDisplay,
       host_only_input: hostOnlyInput,
       guest_controller_only: guestControllerOnly,
       audio_process_id: config.audio.gameOnly ? Number(config.audio.gamePid) : null,
@@ -983,6 +985,10 @@ export function App() {
                         onClick={() => void refreshDisplays()}><RefreshCw size={16} /></button>
                     </div>
                     {displayError && <p className="vmax-error" role="alert">{displayError}</p>}
+                    <label className="flex items-center gap-2">
+                      <input type="checkbox" checked={matchViewerDisplay} disabled={!captureDisplay || busy || isSessionActive}
+                        onChange={(event) => setMatchViewerDisplay(event.target.checked)} /> Match the display to one viewer’s stream
+                    </label>
                     <label className="flex items-center gap-2">
                       <input type="checkbox" checked={hostOnlyInput} disabled={busy || isSessionActive}
                         onChange={(event) => setHostOnlyInput(event.target.checked)} /> Host-only input

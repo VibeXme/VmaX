@@ -27,13 +27,6 @@ pub const MAX_APP_DATAGRAM_BYTES: usize = 1170;
 /// it represents ~70 ms instead of >500 ms of hidden queueing.
 pub const QUIC_DATAGRAM_BUFFER_BYTES: usize = 512 * 1024;
 
-/// DSCP Expedited Forwarding (46 << 2). Networks may ignore or remark it.
-pub const DSCP_EF: u32 = 0xB8;
-
-/// 4 MiB kernel buffers absorb bursty capture cadence while the pacer smooths
-/// the wire.  Larger values mostly waste memory on mobile.
-pub const SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-
 pub fn paced_wire_rate(video_bps: u32, parity_permille: u16) -> u32 {
     // Include parity and transport headers so a full encoder frame does not
     // consume more than one frame interval on a healthy link.

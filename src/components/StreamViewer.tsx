@@ -558,6 +558,7 @@ export function StreamViewer({
       const layout = {
         picture: pixels(bounds.rect.x + bounds.x, bounds.rect.y + bounds.y, bounds.width, bounds.height),
         controls,
+        sharpness: Math.round(Math.max(0, Math.min(100, viewerSharpness))),
         visible: connected && !document.hidden && (!windowsClient || !inputBlocked),
       };
       const key = JSON.stringify([layout, nativeVideoRef.current]);
@@ -579,7 +580,7 @@ export function StreamViewer({
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", update);
     };
-  }, [windowsClient, androidClient, connected, inputBlocked]);
+  }, [windowsClient, androidClient, connected, inputBlocked, viewerSharpness]);
 
   useEffect(() => {
     if (!fullscreen || !connected || inputBlocked) releaseKeyboardCapture();
@@ -1395,12 +1396,31 @@ export function StreamViewer({
     };
   }, [connected, inputBlocked, releaseKeyboardCapture, releaseMouse]);
 
+  const mouseMotion = useRef<Extract<RemoteInputPayload, { kind: "mouse_move_abs" | "mouse_move_rel" }> | null>(null);
+  const flushMouseMotion = useCallback(() => {
+    const input = mouseMotion.current;
+    mouseMotion.current = null;
+    if (!input) return Promise.resolve();
+    const locked = document.pointerLockElement === canvasRef.current && canvasRef.current !== null;
+    if (locked !== (input.kind === "mouse_move_rel")) return Promise.resolve();
+    return dispatchRemoteInput(input);
+  }, []);
+
+  useEffect(() => {
+    if (!connected || inputBlocked) return;
+    const timer = window.setInterval(() => void flushMouseMotion(), 5);
+    return () => {
+      window.clearInterval(timer);
+      mouseMotion.current = null;
+    };
+  }, [connected, inputBlocked, flushMouseMotion]);
+
   const handleCanvasPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.pointerType === "touch") {
       desktopTouch.move(event);
       return;
     }
-    if (inputBlocked) {
+    if (!connected || inputBlocked) {
       return;
     }
     const canvas = canvasRef.current;
@@ -1412,18 +1432,23 @@ export function StreamViewer({
       const dx = Math.round(event.movementX);
       const dy = Math.round(event.movementY);
       if (dx !== 0 || dy !== 0) {
-        dispatchRemoteInput({ kind: "mouse_move_rel", dx, dy });
+        const pending = mouseMotion.current;
+        mouseMotion.current = {
+          kind: "mouse_move_rel",
+          dx: dx + (pending?.kind === "mouse_move_rel" ? pending.dx : 0),
+          dy: dy + (pending?.kind === "mouse_move_rel" ? pending.dy : 0),
+        };
       }
       return;
     }
 
     const coords = mapCanvasPointerNormalized(canvas, event.clientX, event.clientY, true);
     if (coords) {
-      dispatchRemoteInput({
+      mouseMotion.current = {
         kind: "mouse_move_abs",
         xNorm: coords.xNorm,
         yNorm: coords.yNorm,
-      });
+      };
     }
   };
 
@@ -1445,6 +1470,11 @@ export function StreamViewer({
       return;
     }
     const canvas = canvasRef.current;
+    if (canvas && document.pointerLockElement === canvas) {
+      void flushMouseMotion();
+    } else {
+      mouseMotion.current = null;
+    }
     if (canvas && document.pointerLockElement !== canvas) {
       canvas.focus({ preventScroll: true });
       const coords = mapCanvasPointerNormalized(canvas, event.clientX, event.clientY, true);

@@ -54,7 +54,7 @@ export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
     chroma: "420",
     framePacing: "motion",
     sharpness: 30,
-    viewerSharpness: 55,
+    viewerSharpness: 45,
     upscaling: "off",
     renderer: "auto",
     lockResolution: true,
@@ -139,15 +139,11 @@ function asBoolean(val: unknown, fallback: boolean): boolean {
   return typeof val === "boolean" ? val : fallback;
 }
 
-/**
- * The shipped sharpening default was 40, which leaves text soft on a 4:2:0
- * stream. Untouched settings move to the new default; a chosen value is kept.
- */
+// Preserve the saved slider value. New profiles use the default.
 function migrateViewerSharpness(value: unknown): number {
-  const sharpness = Math.round(
+  return Math.round(
     asClampedNumber(value, 0, 100, DEFAULT_VMAX_CONFIG.video.viewerSharpness),
   );
-  return sharpness === 40 ? DEFAULT_VMAX_CONFIG.video.viewerSharpness : sharpness;
 }
 
 /**

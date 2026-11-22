@@ -15,6 +15,9 @@ pub struct SurfaceLayout {
     pub picture: SurfaceRect,
     #[cfg(target_os = "windows")]
     pub controls: Vec<SurfaceRect>,
+    #[cfg(target_os = "windows")]
+    #[serde(default)]
+    pub sharpness: u8,
     pub visible: bool,
 }
 

@@ -257,6 +257,8 @@ impl Drop for WindowsTimerPeriod {
 pub mod win {
     mod worker { include!("capture/worker.rs"); }
     pub use worker::CaptureWorker;
+    mod display_mode { include!("capture/display_mode.rs"); }
+    pub(crate) use display_mode::DisplayMode;
     use super::{fit_resolution, is_constant_fps};
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::RECT;
@@ -457,8 +459,8 @@ pub mod win {
             else {
                 return;
             };
-            let span = range.Maximum - range.Minimum;
-            let target = range.Minimum + span * i32::from(level.min(100)) / 100;
+            let span = range.Maximum - range.Default;
+            let target = range.Default + span * i32::from(level.min(100)) / 100;
             let _ = unsafe {
                 self.video_context.VideoProcessorSetStreamFilter(
                     &self.processor,

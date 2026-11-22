@@ -29,6 +29,7 @@ use crate::{
     stun::{canonical_addr, gather_candidates, socket_target},
     telemetry::{FrameTelemetry, TELEMETRY_LEN},
     turn_relay::TurnRelay,
+    wan_transport::{DSCP_AF41, DSCP_EF, mark_traffic_class},
 };
 
 const CONTROL: &str = "vmax-control";
@@ -59,6 +60,8 @@ pub(super) struct RtcLink {
     configured_rate: u32,
     connected: bool,
     video_needs_sync: bool,
+    video_payload_types: [bool; 128],
+    traffic_class: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -149,6 +152,8 @@ impl RtcLink {
             configured_rate: 0,
             connected: false,
             video_needs_sync: true,
+            video_payload_types: [false; 128],
+            traffic_class: None,
         };
         link.drain().await?;
         if !relay_only {
@@ -258,6 +263,17 @@ impl RtcLink {
                                 let _ = allocation.conn().send_to(&packet.contents, target).await;
                             }
                         } else {
+                            let bytes = &packet.contents;
+                            let video = bytes.len() >= 12
+                                && bytes[0] >> 6 == 2
+                                && !(192..=223).contains(&bytes[1])
+                                && self.video_payload_types[usize::from(bytes[1] & 0x7f)];
+                            let class = if video { DSCP_AF41 } else { DSCP_EF };
+                            if self.traffic_class != Some(class) {
+                                let socket = socket2::SockRef::from(&self.udp);
+                                mark_traffic_class(&socket, class);
+                                self.traffic_class = Some(class);
+                            }
                             let _ = self.udp.try_send_to(
                                 &packet.contents,
                                 socket_target(target, self.udp.local_addr()?.is_ipv6()),
@@ -458,10 +474,16 @@ impl RtcLink {
         let pt = writer
             .payload_params()
             .find(|params| params.spec().codec == codec)
-            .map(|params| params.pt());
-        let Some(pt) = pt else {
+            .map(|params| (params.pt(), params.resend()));
+        let Some((pt, resend)) = pt else {
             bail!("Codec was not negotiated for WebRTC");
         };
+        if Some(mid) == self.video {
+            self.video_payload_types[usize::from(*pt)] = true;
+            if let Some(rtx) = resend {
+                self.video_payload_types[usize::from(*rtx)] = true;
+            }
+        }
         writer.user_extension_value(meta).write(
             pt,
             Instant::now(),

@@ -136,6 +136,7 @@ pub(super) async fn negotiate(
             std::net::UdpSocket::bind(config.bind_addr)?
         };
         bound.set_nonblocking(true)?;
+        crate::transport::tune_udp_socket(&bound)?;
         UdpSocket::from_std(bound)
     };
     let mut socket = bind()?;

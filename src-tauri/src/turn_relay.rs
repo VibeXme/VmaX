@@ -221,6 +221,7 @@ impl TurnRelay {
 
     async fn allocate(server: String, username: String, password: String) -> io::Result<Self> {
         let conn = UdpSocket::bind("0.0.0.0:0").await?;
+        crate::stun::tune_media_buffers(&socket2::SockRef::from(&conn))?;
         Self::allocate_on(server, username, password, Arc::new(conn)).await
     }
 

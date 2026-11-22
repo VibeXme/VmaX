@@ -138,7 +138,7 @@ fn bind_media_socket(address: SocketAddr, public_signaling: bool) -> io::Result<
     } else {
         StdUdpSocket::bind(address)?
     };
-    // 4 MiB send/recv buffers + WMM/DSCP EF.  DSCP is best-effort; the
+    // Bounded send/recv buffers + WMM/DSCP EF. DSCP is best-effort; the
     // buffer sizes are required for the pacer on weak Wi-Fi.
     crate::transport::tune_udp_socket(&socket)?;
     Ok(socket)
@@ -651,6 +651,24 @@ impl SessionTx {
 }
 
 type LatestVideo = Arc<std::sync::Mutex<Option<ReassembledFrame>>>;
+
+/// Queue one decodable access unit and report whether this caused a frame drop.
+/// An inter frame can depend on the pending frame, so only keyframes may replace it.
+pub(crate) fn queue_received_video(
+    pending: &LatestVideo,
+    events: &mpsc::UnboundedSender<NetworkEvent>,
+    frame: ReassembledFrame,
+) -> bool {
+    let mut slot = pending.lock().unwrap_or_else(|error| error.into_inner());
+    if slot.is_some() && !frame.is_keyframe {
+        return true;
+    }
+    let dropped = slot.replace(frame).is_some();
+    if !dropped {
+        let _ = events.send(NetworkEvent::VideoFramePending(Arc::clone(pending)));
+    }
+    dropped
+}
 
 pub struct SessionEvents(mpsc::UnboundedReceiver<NetworkEvent>);
 
@@ -2168,14 +2186,11 @@ fn handle_inbound_media_datagram(
                 if keyframe {
                     sync.waiting_for_keyframe = false;
                 }
-                let mut slot = latest_video.lock().unwrap_or_else(|error| error.into_inner());
-                let replaced = slot.replace(frame).is_some();
-                if replaced {
+                let overflow = queue_received_video(latest_video, event_tx, frame);
+                if overflow {
                     counters.video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    let _ = event_tx.send(NetworkEvent::VideoFramePending(Arc::clone(latest_video)));
                 }
-                if !keyframe && (replaced || dropped_frames > 0) {
+                if !keyframe && (overflow || dropped_frames > 0) {
                     sync.lost_reference(ctrl_tx);
                 }
             }
@@ -3335,6 +3350,36 @@ async fn send_framed_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_queue_preserves_references_and_accepts_recovery_keyframes() {
+        let (events, rx) = mpsc::unbounded_channel();
+        let mut receiver = SessionEvents(rx);
+        let pending = LatestVideo::default();
+        let frame = |frame_id, is_keyframe| ReassembledFrame {
+            frame_id,
+            codec: VideoCodec::H264 as u8,
+            timestamp_us: u64::from(frame_id) * 16_667,
+            is_keyframe,
+            fec_recovered_shards: 0,
+            payload: Bytes::from_static(b"frame"),
+            meta: crate::telemetry::FrameTelemetry::full_range_hardware(0, 1920, 1080),
+        };
+
+        assert!(!queue_received_video(&pending, &events, frame(1, true)));
+        assert!(queue_received_video(&pending, &events, frame(2, false)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(NetworkEvent::VideoFrameReceived(frame)) if frame.frame_id == 1
+        ));
+        assert!(!queue_received_video(&pending, &events, frame(3, false)));
+        assert!(queue_received_video(&pending, &events, frame(4, true)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(NetworkEvent::VideoFrameReceived(frame)) if frame.frame_id == 4
+        ));
+        assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
 
     #[tokio::test]
     async fn video_handoff_keeps_only_the_latest_frame() {

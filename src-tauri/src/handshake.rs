@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceType {
     Desktop,
@@ -10,7 +10,7 @@ pub enum DeviceType {
 
 /// Optional limits in the reliable ClientCapabilities message. Zero means
 /// unknown. max_decode_mbps is measured in megabits per second.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientDisplay {
     pub device_type: DeviceType,

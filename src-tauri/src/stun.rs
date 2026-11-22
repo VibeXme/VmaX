@@ -27,6 +27,13 @@ pub fn free_ice_endpoints() -> Vec<IceEndpoint> {
     default_free_ice_endpoints()
 }
 
+/// Request 256 KiB per direction on a media socket. Linux reports twice the request.
+pub(crate) fn tune_media_buffers(socket: &socket2::Socket) -> io::Result<()> {
+    const SOCKET_BUFFER_BYTES: usize = 256 * 1024;
+    socket.set_send_buffer_size(SOCKET_BUFFER_BYTES)?;
+    socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES)
+}
+
 #[derive(Debug, Error)]
 pub enum StunError {
     #[error("I/O error during STUN transaction: {0}")]

@@ -3,7 +3,7 @@ use super::*;
 use std::ops::{Deref, DerefMut};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use windows::Win32::Graphics::Direct3D11::ID3D11Multithread;
@@ -18,6 +18,8 @@ struct Mailbox {
     position: (i32, i32),
     visible: bool,
     error: Option<String>,
+    capture_count: u32,
+    capture_time: Duration,
 }
 
 pub struct CaptureWorker {
@@ -25,7 +27,6 @@ pub struct CaptureWorker {
     // GPU commands copying into and out of this surface are ordered by the mailbox mutex.
     snapshot: ID3D11Texture2D,
     mailbox: Arc<Mutex<Mailbox>>,
-    frames: Arc<AtomicU32>,
     sharpness: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -102,14 +103,12 @@ impl CaptureWorker {
             view,
             snapshot,
             mailbox: Default::default(),
-            frames: Default::default(),
             sharpness: Arc::new(AtomicU8::new(35)),
             stop: Default::default(),
             thread: None,
         };
         let target = worker.snapshot.clone();
         let mailbox = worker.mailbox.clone();
-        let frames = worker.frames.clone();
         let stop = worker.stop.clone();
         let sharpness = worker.sharpness.clone();
         worker.thread = Some(
@@ -117,35 +116,48 @@ impl CaptureWorker {
                 .name("vmax-dxgi-capture".into())
                 .spawn(move || {
                     let _timer = super::super::WindowsTimerPeriod::new();
-                    let mut cadence = crate::pacing::FrameCadence::new(
-                        Instant::now(),
-                        fps.load(Ordering::Relaxed),
-                    );
                     let mut previous_sharpness = None;
+                    let mut last_published: Option<Instant> = None;
                     while !stop.load(Ordering::Acquire) {
                         if !connected.load(Ordering::Relaxed) {
+                            last_published = None;
                             thread::park_timeout(Duration::from_millis(25));
-                            cadence.resync(Instant::now());
                             continue;
                         }
-                        cadence.set_fps(fps.load(Ordering::Relaxed));
                         let level = sharpness.load(Ordering::Relaxed);
                         if previous_sharpness != Some(level) {
                             source.set_sharpness(level);
                             previous_sharpness = Some(level);
                         }
                         source.set_pointer_overlay(pointer.load(Ordering::Relaxed));
-                        let result =
-                            source.capture_frame(cadence.capture_wait_ms(Instant::now()), false);
+                        // DXGI wakes for a desktop present. Shorter waits keep
+                        // the static-screen path responsive above 60 Hz.
+                        let target_fps = fps.load(Ordering::Relaxed).max(1);
+                        let wait_ms = (1000 / u32::from(target_fps)).clamp(1, 16);
+                        let started = Instant::now();
+                        let result = source.capture_frame(wait_ms, false);
+                        let capture_time = started.elapsed();
+                        let retry = matches!(&result, Ok(false)) && !source.has_valid_frame();
                         {
                             let mut slot = mailbox.lock().unwrap_or_else(|e| e.into_inner());
                             if source.take_capture_discontinuity() {
                                 slot.discontinuity = true;
                                 slot.ready = false;
                                 slot.texture_changed = false;
+                                last_published = None;
                             }
                             match result {
                                 Ok(true) => {
+                                    let now = Instant::now();
+                                    if source.static_screen
+                                        && last_published.is_some_and(|last| {
+                                            now.duration_since(last)
+                                                < Duration::from_millis(u64::from(wait_ms))
+                                        })
+                                    {
+                                        continue;
+                                    }
+                                    last_published = Some(now);
                                     if !source.static_screen {
                                         slot.texture_changed = true;
                                         unsafe {
@@ -157,7 +169,8 @@ impl CaptureWorker {
                                     slot.pointer = source.pointer_shape.clone();
                                     slot.position = source.pointer_position;
                                     slot.visible = source.pointer_visible;
-                                    frames.fetch_add(1, Ordering::Relaxed);
+                                    slot.capture_count += 1;
+                                    slot.capture_time += capture_time;
                                 }
                                 Ok(false) => {}
                                 Err(error) => {
@@ -166,7 +179,10 @@ impl CaptureWorker {
                                 }
                             }
                         }
-                        cadence.wait_next_frame();
+                        // Recreating a lost duplication can return immediately.
+                        if retry {
+                            thread::park_timeout(Duration::from_millis(5));
+                        }
                     }
                 })
                 .map_err(|e| e.to_string())?,
@@ -177,8 +193,12 @@ impl CaptureWorker {
     pub fn set_sharpness(&self, level: u8) {
         self.sharpness.store(level, Ordering::Relaxed);
     }
-    pub fn take_capture_count(&self) -> u32 {
-        self.frames.swap(0, Ordering::Relaxed)
+    pub fn take_capture_sample(&self) -> (u32, Duration) {
+        let mut slot = self.mailbox.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            std::mem::take(&mut slot.capture_count),
+            std::mem::take(&mut slot.capture_time),
+        )
     }
 
     pub fn latest_frame(&mut self, force: bool) -> Result<bool, String> {

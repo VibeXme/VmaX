@@ -5,7 +5,6 @@ use crate::protocol::ReassembledFrame;
 use jni::objects::{GlobalRef, JClass, JObject, JValue};
 use jni::sys::{JNI_FALSE, jboolean, jint};
 use jni::{JNIEnv, JavaVM};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -34,8 +33,13 @@ static DECODER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CODECS: AtomicU32 = AtomicU32::new(0);
 /// Set when a fresh decoder needs a key frame before it can produce output.
 static NEEDS_KEYFRAME: AtomicBool = AtomicBool::new(false);
-/// Incremented by Kotlin for every decoded buffer released to the Surface.
+/// Counts from decoder output and MediaCodec's Surface render callback.
 static RENDERED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static DECODED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static DECODE_US: AtomicU64 = AtomicU64::new(0);
+static DECODE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static RENDER_US: AtomicU64 = AtomicU64::new(0);
+static RENDER_SAMPLES: AtomicU64 = AtomicU64::new(0);
 /// Set when a configured codec never produced output. Frames go back to the
 /// WebView until the surface is reattached or the session restarts.
 static FORCE_WEBVIEW: AtomicBool = AtomicBool::new(false);
@@ -50,10 +54,6 @@ static NATIVE_ROUTE: AtomicBool = AtomicBool::new(false);
 static TARGET: Mutex<Option<Arc<DecoderTarget>>> = Mutex::new(None);
 static QUEUE: OnceLock<Mutex<DecodeQueue>> = OnceLock::new();
 static QUEUE_INIT: Mutex<()> = Mutex::new(());
-/// FIFO of submission timestamps into MediaCodec so `nativeNotifyFrameRendered`
-/// can compute exact wall-clock hardware decode latency (`Decode 5.50ms`).
-static IN_FLIGHT_DECODES: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
-
 struct DecoderTarget {
     vm: Arc<JavaVM>,
     class: GlobalRef,
@@ -81,7 +81,6 @@ impl DecodeQueue {
         self.queued_since_render = 0;
         self.backlog_since_render = 0;
         self.render_baseline = RENDERED_FRAMES.load(Ordering::Acquire);
-        lock(&IN_FLIGHT_DECODES).clear();
     }
 
     fn observe_output(&mut self, now: Instant, count_submission: bool) -> bool {
@@ -137,9 +136,28 @@ pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeSetDecoderC
     CODECS.store(codecs as u32, Ordering::Release);
 }
 
-/// Decoded buffers released to the Android Surface.
+/// Decoded buffers reported rendered by MediaCodec.
 pub fn rendered_frames() -> u64 {
     RENDERED_FRAMES.load(Ordering::Acquire)
+}
+
+#[derive(Clone, Copy)]
+pub struct PlaybackTiming {
+    pub decoded: u64,
+    pub decode_us: u64,
+    pub decode_samples: u64,
+    pub render_us: u64,
+    pub render_samples: u64,
+}
+
+pub fn playback_timing() -> PlaybackTiming {
+    PlaybackTiming {
+        decoded: DECODED_FRAMES.load(Ordering::Relaxed),
+        decode_us: DECODE_US.load(Ordering::Relaxed),
+        decode_samples: DECODE_SAMPLES.load(Ordering::Relaxed),
+        render_us: RENDER_US.load(Ordering::Relaxed),
+        render_samples: RENDER_SAMPLES.load(Ordering::Relaxed),
+    }
 }
 
 pub fn backlog_drops() -> u64 {
@@ -170,12 +188,15 @@ pub fn layout_surface(
 ) -> Result<(), String> {
     let result = (|| {
         let class_name = env.new_string(DECODER_CLASS.replace('/', "."))?;
-        let class = JClass::from(env.call_method(
-            activity,
-            "getAppClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[JValue::Object(&class_name)],
-        )?.l()?);
+        let class = JClass::from(
+            env.call_method(
+                activity,
+                "getAppClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&class_name)],
+            )?
+            .l()?,
+        );
         let picture = layout.picture;
         env.call_static_method(
             class,
@@ -317,7 +338,6 @@ pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeSetDecoderA
     if active == JNI_FALSE {
         DECODER_ACTIVE.store(false, Ordering::Release);
         NATIVE_ROUTE.store(false, Ordering::Relaxed);
-        lock(&IN_FLIGHT_DECODES).clear();
         return;
     }
 
@@ -355,7 +375,6 @@ pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeNotifyDecod
         // Keep the watchdog's progress across repeated MediaCodec resets.
         // A codec that repeatedly fails must still fall back to WebCodecs.
     }
-    lock(&IN_FLIGHT_DECODES).clear();
     NEEDS_KEYFRAME.store(true, Ordering::Release);
 }
 
@@ -370,33 +389,32 @@ pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeReportVideo
     VIDEO_HEIGHT.store(height.max(0) as u32, Ordering::Relaxed);
 }
 
-/// Called by Kotlin after `releaseOutputBuffer(index, true)` hands a decoded
-/// buffer to the Surface. Measures exact wall-clock MediaCodec decode latency.
+/// Called by MediaCodec's frame-rendered listener after Surface presentation.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeNotifyFrameRendered(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
+    render_us: jint,
 ) {
-    RENDERED_FRAMES.fetch_add(1, Ordering::Relaxed);
-    if let Some(submitted_at) = lock(&IN_FLIGHT_DECODES).pop_front() {
-        let decode_us = submitted_at.elapsed().as_micros() as u32;
-        if (100..=250_000).contains(&decode_us) {
-            crate::capture::record_decode_latency_us(decode_us);
-        }
+    if render_us > 0 {
+        RENDER_US.fetch_add(render_us as u64, Ordering::Relaxed);
+        RENDER_SAMPLES.fetch_add(1, Ordering::Relaxed);
     }
+    RENDERED_FRAMES.fetch_add(1, Ordering::Release);
 }
 
-/// Optional direct JNI hook if Kotlin measures `System.nanoTime()` around
-/// `queueInputBuffer` -> `dequeueOutputBuffer` and reports microseconds directly.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeReportDecodeLatencyUs(
+pub extern "system" fn Java_com_vmax_app_VmaxLowLatencyDecoder_nativeReportDecoded(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
     decode_us: jint,
 ) {
     if decode_us > 0 {
+        DECODE_US.fetch_add(decode_us as u64, Ordering::Relaxed);
+        DECODE_SAMPLES.fetch_add(1, Ordering::Relaxed);
         crate::capture::record_decode_latency_us(decode_us as u32);
     }
+    DECODED_FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 
 fn register_target(env: &mut JNIEnv<'_>) -> Result<Arc<DecoderTarget>, String> {
@@ -534,13 +552,6 @@ fn deliver_frame(
     class: &GlobalRef,
     frame: &BufferedFrame,
 ) -> Result<(), jni::errors::Error> {
-    {
-        let mut inflight = lock(&IN_FLIGHT_DECODES);
-        if inflight.len() >= 32 {
-            inflight.pop_front();
-        }
-        inflight.push_back(Instant::now());
-    }
     let bytes = env.byte_array_from_slice(&frame.payload)?;
     let timestamp_us = frame.timestamp_us.min(i64::MAX as u64) as i64;
     let result = env.call_static_method(

@@ -35,6 +35,8 @@ object VmaxLowLatencyDecoder {
     private var failures = 0
     private var outputDeadline = 0L
     private var pollScheduled = false
+    private val submitted = LinkedHashMap<Long, Long>()
+    private val released = LinkedHashMap<Long, Long>()
     private val hardwareDecoders by lazy {
         MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter {
             !it.isEncoder && if (Build.VERSION.SDK_INT >= 29) {
@@ -50,7 +52,8 @@ object VmaxLowLatencyDecoder {
     @JvmStatic private external fun nativeSetDecoderCapabilities(codecs: Int)
     @JvmStatic private external fun nativeNotifyDecoderReset()
     @JvmStatic private external fun nativeReportVideoSize(width: Int, height: Int)
-    @JvmStatic private external fun nativeNotifyFrameRendered()
+    @JvmStatic private external fun nativeReportDecoded(decodeUs: Int)
+    @JvmStatic private external fun nativeNotifyFrameRendered(renderUs: Int)
 
     private fun attach(activity: Activity, web: WebView) {
         if (webView === web || activity.isDestroyed || !web.isAttachedToWindow) return
@@ -169,6 +172,8 @@ object VmaxLowLatencyDecoder {
             val index = active.dequeueInputBuffer(2_000)
             if (index < 0) {
                 active.flush()
+                submitted.clear()
+                released.clear()
                 waitingForKeyframe = true
                 nativeNotifyDecoderReset()
                 return
@@ -176,6 +181,7 @@ object VmaxLowLatencyDecoder {
             val input = checkNotNull(active.getInputBuffer(index))
             input.clear()
             input.put(bytes)
+            remember(submitted, timestampUs)
             active.queueInputBuffer(index, 0, bytes.size, timestampUs, if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
             waitingForKeyframe = false
             drain(active)
@@ -187,21 +193,41 @@ object VmaxLowLatencyDecoder {
     }
 
     private fun start(stream: Format, target: Surface) {
-        val settings = MediaFormat.createVideoFormat(stream.mime, stream.width, stream.height)
-        if (stream.profile != 0) settings.setInteger(MediaFormat.KEY_PROFILE, stream.profile)
-        if (Build.VERSION.SDK_INT >= 30) settings.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        fun baseFormat() = MediaFormat.createVideoFormat(stream.mime, stream.width, stream.height).apply {
+            if (stream.profile != 0) setInteger(MediaFormat.KEY_PROFILE, stream.profile)
+            if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        }
+        val settings = baseFormat()
         val codec = hardwareDecoders.firstOrNull { info ->
             info.supportedTypes.any { it.equals(stream.mime, ignoreCase = true) } &&
                 info.getCapabilitiesForType(stream.mime).isFormatSupported(settings)
         } ?: throw IllegalStateException("Hardware decoder unavailable")
-        val active = MediaCodec.createByCodecName(codec.name)
+        val operatingRate = runCatching {
+            codec.getCapabilitiesForType(stream.mime).videoCapabilities
+                ?.getSupportedFrameRatesFor(stream.width, stream.height)?.upper?.toFloat()
+        }.getOrNull()
+        if (operatingRate != null && operatingRate.isFinite() && operatingRate > 0f) {
+            settings.setFloat(MediaFormat.KEY_OPERATING_RATE, operatingRate)
+        }
+        var active = MediaCodec.createByCodecName(codec.name)
         decoder = active
-        active.configure(settings, target, null, 0)
-        active.setOnFrameRenderedListener({ source, _, _ ->
+        try {
+            active.configure(settings, target, null, 0)
+        } catch (error: RuntimeException) {
+            if (!settings.containsKey(MediaFormat.KEY_OPERATING_RATE)) throw error
+            release()
+            // Some vendor decoders reject the advertised operating rate.
+            active = MediaCodec.createByCodecName(codec.name)
+            decoder = active
+            active.configure(baseFormat(), target, null, 0)
+        }
+        active.setOnFrameRenderedListener({ source, pts, renderTime ->
             synchronized(this) {
-                if (source === decoder) nativeNotifyFrameRendered()
+                if (source === decoder) {
+                    nativeNotifyFrameRendered(elapsedUs(released.remove(pts), renderTime))
+                }
             }
-        }, ui)
+        }, outputHandler)
         active.start()
         format = stream
         nativeReportVideoSize(stream.width, stream.height)
@@ -247,18 +273,38 @@ object VmaxLowLatencyDecoder {
     private fun drain(active: MediaCodec) {
         val info = MediaCodec.BufferInfo()
         var newest = -1
+        var newestPts = 0L
         for (attempt in 0 until 8) {
             val index = active.dequeueOutputBuffer(info, 0)
             when {
                 index >= 0 -> {
+                    if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        active.releaseOutputBuffer(index, false)
+                        continue
+                    }
+                    val pts = info.presentationTimeUs
+                    nativeReportDecoded(elapsedUs(submitted.remove(pts), System.nanoTime()))
                     if (newest >= 0) active.releaseOutputBuffer(newest, false)
                     newest = index
+                    newestPts = pts
                 }
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
                 else -> break
             }
         }
-        if (newest >= 0) active.releaseOutputBuffer(newest, true)
+        if (newest >= 0) {
+            remember(released, newestPts)
+            active.releaseOutputBuffer(newest, true)
+        }
+    }
+
+    private fun remember(timestamps: LinkedHashMap<Long, Long>, pts: Long) {
+        if (timestamps.size >= 32) timestamps.remove(timestamps.keys.first())
+        timestamps[pts] = System.nanoTime()
+    }
+
+    private fun elapsedUs(start: Long?, end: Long): Int {
+        return if (start == null) 0 else ((end - start) / 1_000L).coerceIn(0, 250_000).toInt()
     }
 
     private fun recover(error: RuntimeException) {
@@ -273,6 +319,8 @@ object VmaxLowLatencyDecoder {
         decoder = null
         format = null
         waitingForKeyframe = true
+        submitted.clear()
+        released.clear()
         try {
             active?.release()
         } catch (error: IllegalStateException) {

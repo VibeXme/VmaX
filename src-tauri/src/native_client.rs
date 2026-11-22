@@ -32,6 +32,9 @@ use windows::Win32::{
 };
 use windows_core::{Interface, w};
 
+#[path = "native_client/cas.rs"]
+mod cas;
+
 use crate::native_d3d11::SurfaceLayout;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -40,6 +43,9 @@ pub struct Playback {
     pub decoded: u64,
     pub presented: u64,
     pub dropped: u64,
+    pub decode_us: u64,
+    pub render_submit_us: u64,
+    pub render_attempts: u64,
     pub failed: bool,
     pub needs_keyframe: bool,
 }
@@ -49,6 +55,7 @@ struct Pending {
     frame: Option<ReassembledFrame>,
     stopped: bool,
     visible: bool,
+    sharpness: u8,
     playback: Playback,
 }
 
@@ -86,7 +93,11 @@ impl Viewer {
         let picture = layout.picture;
         unsafe {
             let visible = layout.visible && picture.width > 0 && picture.height > 0;
-            self.pending.0.lock().unwrap().visible = visible;
+            {
+                let mut pending = self.pending.0.lock().unwrap();
+                pending.visible = visible;
+                pending.sharpness = layout.sharpness.min(100);
+            }
             if !visible || self.playback().failed {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 return Ok(());
@@ -259,7 +270,7 @@ fn play(hwnd: HWND, input: &(Mutex<Pending>, Condvar)) -> Result<(), String> {
     let mut decode_stalled = None;
     let mut presentation_stalled = None;
     loop {
-        let frame = {
+        let (frame, sharpness) = {
             let mut pending = input
                 .1
                 .wait_while(input.0.lock().unwrap(), |pending| {
@@ -269,7 +280,7 @@ fn play(hwnd: HWND, input: &(Mutex<Pending>, Condvar)) -> Result<(), String> {
             if pending.stopped {
                 return Ok(());
             }
-            pending.frame.take().unwrap()
+            (pending.frame.take().unwrap(), pending.sharpness)
         };
         let format = Format {
             codec: VideoCodec::from_u8(frame.codec).ok_or("Unknown video codec")?,
@@ -317,10 +328,16 @@ fn play(hwnd: HWND, input: &(Mutex<Pending>, Condvar)) -> Result<(), String> {
             continue;
         };
         decode_stalled = None;
-        crate::capture::record_decode_latency_us(started.elapsed().as_micros() as u32);
-        let displayed = output.present(&sample, format)?;
+        let decode_us = started.elapsed().as_micros() as u64;
+        crate::capture::record_decode_latency_us(decode_us.min(u64::from(u32::MAX)) as u32);
+        let render_started = Instant::now();
+        let displayed = output.present(&sample, format, sharpness)?;
+        let render_submit_us = render_started.elapsed().as_micros() as u64;
         let mut state = input.0.lock().unwrap();
         state.playback.decoded += 1;
+        state.playback.decode_us += decode_us;
+        state.playback.render_submit_us += render_submit_us;
+        state.playback.render_attempts += 1;
         state.playback.size = Some((format.width, format.height));
         if displayed {
             state.playback.presented += 1;
@@ -511,7 +528,9 @@ struct Renderer {
     ready: HANDLE,
     flags: DXGI_SWAP_CHAIN_FLAG,
     present_flags: DXGI_PRESENT,
-    converter: Option<(Format, VideoScaler)>,
+    converter: Option<(Format, VideoScaler, Option<u8>)>,
+    cas_shaders: Option<cas::Shaders>,
+    cas_pass: Option<cas::Pass>,
 }
 
 impl Renderer {
@@ -575,6 +594,9 @@ impl Renderer {
             if ready.is_invalid() {
                 return Err(windows_core::Error::from_thread());
             }
+            let cas_shaders = cas::Shaders::new(&device)
+                .map_err(|error| tracing::warn!(%error, "Native CAS shader unavailable"))
+                .ok();
             Ok(Self {
                 device,
                 context,
@@ -583,11 +605,18 @@ impl Renderer {
                 flags,
                 present_flags,
                 converter: None,
+                cas_shaders,
+                cas_pass: None,
             })
         }
     }
 
-    fn present(&mut self, sample: &IMFSample, format: Format) -> Result<bool, String> {
+    fn present(
+        &mut self,
+        sample: &IMFSample,
+        format: Format,
+        sharpness: u8,
+    ) -> Result<bool, String> {
         unsafe {
             if WaitForSingleObject(self.ready, 0) != WAIT_OBJECT_0 {
                 return Ok(false);
@@ -611,9 +640,10 @@ impl Renderer {
             if self
                 .converter
                 .as_ref()
-                .is_none_or(|(current, _)| *current != format)
+                .is_none_or(|(current, _, _)| *current != format)
             {
                 self.converter = None;
+                self.cas_pass = None;
                 self.context.ClearState();
                 self.swap_chain
                     .ResizeBuffers(
@@ -625,23 +655,33 @@ impl Renderer {
                     )
                     .map_err(|e| e.to_string())?;
                 let target = self.swap_chain.GetBuffer(0).map_err(|e| e.to_string())?;
+                self.cas_pass = self.cas_shaders.as_ref().and_then(|_| {
+                    cas::Pass::new(&self.device, &target, format.width, format.height)
+                        .map_err(|error| tracing::warn!(%error, "Native CAS surface unavailable"))
+                        .ok()
+                });
+                let video_target = self.cas_pass.as_ref().map_or(&target, |pass| &pass.input);
                 let converter = VideoScaler::new(
                     &self.device,
                     &self.context,
-                    &target,
+                    video_target,
                     format.width,
                     format.height,
                     format.width,
                     format.height,
                 )?;
                 converter.set_yuv_input(format.full_range)?;
-                self.converter = Some((format, converter));
+                self.converter = Some((format, converter, None));
             }
-            self.converter
-                .as_ref()
-                .unwrap()
-                .1
-                .scale_slice(&texture, slice)?;
+            let (_, converter, applied_sharpness) = self.converter.as_mut().unwrap();
+            if self.cas_pass.is_none() && *applied_sharpness != Some(sharpness) {
+                converter.set_sharpness(sharpness);
+                *applied_sharpness = Some(sharpness);
+            }
+            converter.scale_slice(&texture, slice)?;
+            if let (Some(pass), Some(shaders)) = (&mut self.cas_pass, &self.cas_shaders) {
+                pass.draw(&self.context, shaders, sharpness);
+            }
             let status = self.swap_chain.Present(
                 crate::native_d3d11::PRESENT_SYNC_INTERVAL,
                 self.present_flags,

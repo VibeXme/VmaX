@@ -42,6 +42,7 @@ pub(super) struct RawLink {
     assembly: BTreeMap<u32, Assembly>,
     packets: u64,
     sent_packets: u64,
+    traffic_class: Option<u32>,
     last_completed: Option<u32>,
     loss: f64,
 }
@@ -90,6 +91,7 @@ impl RawLink {
             assembly: BTreeMap::new(),
             packets: 0,
             sent_packets: 0,
+            traffic_class: None,
             last_completed: None,
             loss: 0.0,
         };
@@ -104,6 +106,16 @@ impl RawLink {
     }
 
     async fn packet(&mut self, bytes: &[u8]) -> Result<()> {
+        use crate::wan_transport::{DSCP_AF41, DSCP_EF, mark_traffic_class};
+        let class = if bytes.first() == Some(&(ChannelId::Video as u8)) {
+            DSCP_AF41
+        } else {
+            DSCP_EF
+        };
+        if self.traffic_class != Some(class) {
+            mark_traffic_class(&socket2::SockRef::from(&self.socket), class);
+            self.traffic_class = Some(class);
+        }
         let sealed = self.cipher.seal(bytes)?;
         match self.socket.send(&sealed).await {
             Ok(_) => Ok(()),
@@ -252,6 +264,10 @@ impl RawLink {
 }
 
 impl StreamTransport for RawLink {
+    fn supports_main10(&self) -> bool {
+        true
+    }
+
     fn path(&self) -> Path {
         let rtt = self
             .peer

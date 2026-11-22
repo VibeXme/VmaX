@@ -20,6 +20,8 @@ for (const [name, descriptor] of [
   ["onNativeVideoFrame", "([BJIIIZ)V"],
   ["layoutSurface", "(Landroid/app/Activity;Landroid/webkit/WebView;IIIIZ)V"],
   ["resetSession", "()V"],
+  ["nativeReportDecoded", "(I)V"],
+  ["nativeNotifyFrameRendered", "(I)V"],
 ]) {
   if (methods.get(name) !== descriptor) {
     throw new Error(`Release APK is missing the JNI entry point ${name}${descriptor}`);
