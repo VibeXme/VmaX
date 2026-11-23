@@ -117,6 +117,7 @@ impl CaptureWorker {
                 .spawn(move || {
                     let _timer = super::super::WindowsTimerPeriod::new();
                     let mut previous_sharpness = None;
+                    let mut previous_pointer_overlay = None;
                     let mut last_published: Option<Instant> = None;
                     while !stop.load(Ordering::Acquire) {
                         if !connected.load(Ordering::Relaxed) {
@@ -129,7 +130,11 @@ impl CaptureWorker {
                             source.set_sharpness(level);
                             previous_sharpness = Some(level);
                         }
-                        source.set_pointer_overlay(pointer.load(Ordering::Relaxed));
+                        let pointer_overlay = pointer.load(Ordering::Relaxed);
+                        if previous_pointer_overlay != Some(pointer_overlay) {
+                            source.set_pointer_overlay(pointer_overlay);
+                            previous_pointer_overlay = Some(pointer_overlay);
+                        }
                         // DXGI wakes for a desktop present. Shorter waits keep
                         // the static-screen path responsive above 60 Hz.
                         let target_fps = fps.load(Ordering::Relaxed).max(1);

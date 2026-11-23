@@ -77,6 +77,8 @@ export class CasRenderer {
   private readonly sharpness: WebGLUniformLocation | null;
   private width = 0;
   private height = 0;
+  private viewportWidth = 0;
+  private viewportHeight = 0;
 
   /** Returns null when WebGL2 is unavailable, so the caller can fall back. */
   static create(canvas: HTMLCanvasElement): CasRenderer | null {
@@ -197,18 +199,27 @@ export class CasRenderer {
       return false;
     }
 
-    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    // The canvas backing store normally stays fixed for many frames. Avoid
+    // reissuing viewport state and uniform updates when the compositor has not
+    // resized it; on WebViews this otherwise shows up as measurable driver
+    // overhead at 60 FPS.
+    const viewportWidth = gl.drawingBufferWidth;
+    const viewportHeight = gl.drawingBufferHeight;
     gl.useProgram(this.program);
-    gl.uniform2f(
-      this.outTexel,
-      1 / Math.max(1, gl.drawingBufferWidth),
-      1 / Math.max(1, gl.drawingBufferHeight),
-    );
+    if (this.viewportWidth !== viewportWidth || this.viewportHeight !== viewportHeight) {
+      this.viewportWidth = viewportWidth;
+      this.viewportHeight = viewportHeight;
+      gl.viewport(0, 0, viewportWidth, viewportHeight);
+      gl.uniform2f(
+        this.outTexel,
+        1 / Math.max(1, viewportWidth),
+        1 / Math.max(1, viewportHeight),
+      );
+    }
     gl.uniform1f(this.sharpness, sharpness);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    // Submit the command buffer now instead of waiting for the next event-loop
-    // turn: one less chance for the driver to hold a finished frame back.
-    gl.flush();
+    // Chromium already submits at the compositor boundary. Forcing a flush
+    // here serializes CPU and GPU work and can reduce 60 FPS throughput.
     return true;
   }
 }
