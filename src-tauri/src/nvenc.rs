@@ -38,11 +38,11 @@ pub struct NvencSettings {
 impl Default for NvencSettings {
     fn default() -> Self {
         Self {
-            preset: 4,
+            preset: 3,
             vbr: false,
             vbv_frames: 1,
             aq_strength: 8,
-            min_qp: 5,
+            min_qp: 17,
             quarter_pass: true,
             intra_refresh: true,
             // One refreshing row per frame: the intra band is thin enough to
@@ -59,7 +59,7 @@ impl Default for NvencSettings {
 
 impl NvencSettings {
     pub fn vbv_bits(self, bitrate_bps: u32, fps: u32) -> u32 {
-        (bitrate_bps / fps.max(1)).max(1)
+        (bitrate_bps / fps.max(1)).max(1).saturating_mul(u32::from(self.vbv_frames.clamp(1, 2)))
     }
 }
 
@@ -252,13 +252,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_vbv_settings_use_one_frame() {
+    fn vbv_settings_are_bounded_to_one_or_two_frames() {
         let settings = NvencSettings {
             vbv_frames: 4,
             ..Default::default()
         };
-        assert_eq!(settings.vbv_bits(24_000_000, 60), 400_000);
-        assert_eq!(settings.vbv_bits(12_000_000, 120), 100_000);
+        assert_eq!(settings.vbv_bits(24_000_000, 60), 800_000);
+        assert_eq!(settings.vbv_bits(12_000_000, 120), 200_000);
+        assert_eq!(NvencSettings::default().vbv_bits(24_000_000, 60), 400_000);
     }
 
     #[test]

@@ -1094,9 +1094,9 @@ pub mod win {
                 Ok(()) => {
                     self.acquired_frame = Some(FrameReleaseGuard(dupl.clone()));
                     self.update_pointer(&dupl, &frame_info);
-                    let desktop_changed = frame_info.AccumulatedFrames > 0
-                        || frame_info.TotalMetadataBufferSize > 0
-                        || frame_info.LastPresentTime != 0
+                    // DXGI includes dirty and move rects in the metadata size.
+                    // A present timestamp alone does not imply changed pixels.
+                    let desktop_changed = frame_info.TotalMetadataBufferSize > 0
                         || !self.has_valid_frame;
                     let Some(res) = desktop_res else {
                         return Ok(self.should_emit_static_frame(force_frame));

@@ -848,6 +848,10 @@ export function App() {
             packetLossPct={telemetry.peer_packet_loss_pct ?? undefined}
             videoPacketsReceived={telemetry.video_packets_rx ?? 0}
             droppedFrames={telemetry.video_frames_dropped}
+            fecRecoveredShards={telemetry.fec_recovered_shards}
+            udpReceiveRingDrops={telemetry.udp_receive_ring_drops ?? 0}
+            udpMissingDataPackets={telemetry.udp_missing_data_packets ?? 0}
+            networkBitrateMbps={telemetry.media_bitrate_mbps}
             hardwareCursor={config.network.hardwareCursor}
             nativeFps={hardware.fps}
             viewerSharpness={config.video.viewerSharpness}

@@ -48,12 +48,15 @@ export interface NetworkTelemetry {
   packet_loss_pct: number;
   peer_packet_loss_pct?: number | null;
   target_bitrate_bps: number;
+  media_bitrate_mbps?: number;
   congestion_state: CongestionState;
   video_frames_tx: number;
   video_frames_rx: number;
   video_packets_rx?: number;
   video_frames_dropped: number;
   fec_recovered_shards: number;
+  udp_receive_ring_drops?: number;
+  udp_missing_data_packets?: number;
   audio_packets_tx: number;
   audio_packets_rx: number;
   input_events_tx: number;

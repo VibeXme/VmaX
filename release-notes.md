@@ -1,14 +1,9 @@
-## VmaX 6.0.3
-- Direct Raw UDP requests 8 MiB media socket buffers and drains queued datagrams in bounded bursts to reduce receive overflow during high-bitrate bursts.
-- Pending stale delta frames are replaced by the newest delta while in-flight keyframes remain protected for decoder recovery.
+## VmaX 6.0.4
 
-- Best Connection keeps the selected FPS as the host target and reuses the last valid capture on static screens. Actual playback depends on the encoder, viewer, and link.
-- Direct Raw UDP gives recovery keyframes time to finish at the current link rate. The sender retains shards during socket backpressure and keeps an in-flight keyframe through repeated recovery requests. Small frames can use up to 1 ms of pacing credit.
-- WebRTC sizes media packets for the underlying carrier, preserves pending recovery keyframes, and sends keyframe requests over the reliable control channel alongside RTP feedback.
-- The Best Connection bitrate display measures received video traffic during frame recovery.
-
-- Best Connection batches Direct Raw UDP packet sends and waits for the active frame before submitting the next one. This reduces timer overhead and avoids unnecessary keyframe recovery at high bitrates.
-- Best Connection uses single-pass NVENC, and WebView playback overlaps frame delivery with decoding.
+- Best Connection defaults to 1440p HEVC 4:2:0 at 60 FPS with a 24 Mbps cap. The Windows host uses GPU-only NVIDIA NVENC in this mode. Constant FPS and encoder tuning remain configurable. Legacy protocols still support Media Foundation hosting.
+- Raw UDP drains packets on a dedicated receive thread, repairs single-packet loss locally, and sends deltas in shorter paced bursts on healthy LAN connections.
+- Android uses asynchronous MediaCodec callbacks and presents directly to a SurfaceView. Windows native playback uses matching BT.709 range metadata. WebView fallback continues accepting frames while the decoder works.
+- The telemetry overlay reports estimated one-way network time, bitrate, frame and packet drops, and FEC recoveries.
 
 ### Downloads
 
@@ -16,6 +11,6 @@
 - `VmaX-Android-arm64.apk` for Android ARM64
 - `VmaX-Relay-Linux-x86_64.tar.gz` for a self-hosted Linux signaling relay
 
-Android may require a clean install if your existing build uses a different signing certificate. Uninstalling removes local app data.
+Android may require a clean install if the APK signing certificate differs from your installed version. Uninstalling removes local app data.
 
-See the [regional relay guide](https://github.com/VibeXme/VmaX/blob/v6.0.3/deploy/server/README.md) for self-hosting.
+See the [regional relay guide](https://github.com/VibeXme/VmaX/blob/v6.0.4/deploy/server/README.md) for self-hosting.

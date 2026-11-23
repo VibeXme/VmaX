@@ -57,6 +57,8 @@ interface SettingsModalProps {
 }
 
 const NVENC_NUMBER_OPTIONS = [
+  { key: "minQp", label: "Minimum QP", hint: "Bounds encoder quality and bitrate on simple content.", min: 0, max: 51 },
+  { key: "vbvFrames", label: "VBV buffer in frames", hint: "One frame minimizes rate-control buffering.", min: 1, max: 2 },
   { key: "aqStrength", label: "Adaptive quantization strength", hint: "Shift bits toward detail. Set to 0 to disable.", min: 0, max: 15 },
   { key: "refreshPeriod", label: "Intra refresh period in frames", hint: "Frames between refresh waves.", min: 2, max: 600 },
   { key: "refreshFrames", label: "Intra refresh length in frames", hint: "Frames over which each refresh wave is spread.", min: 1, max: 60 },
@@ -262,12 +264,12 @@ function NvencControls({ settings, onChange }: { settings: NvencSettings; onChan
       <summary className="cursor-pointer text-sm font-semibold text-white">NVIDIA NVENC tuning</summary>
       <p className="my-2 text-xs text-zinc-400">Applies when the next hosted stream starts. Supported settings vary by GPU and driver.</p>
       <div className="space-y-2">
-        <SettingRow title="NVENC preset" hint="P4 prioritizes quality. P3 lowers encoder load.">
+        <SettingRow title="NVENC preset" hint="P3 is the default. P4 increases quality and P2 lowers encoder load.">
           <SelectControl id="vmax-nvenc-preset" ariaLabel="NVENC preset" value={String(settings.preset)}
-            options={[{ value: "4", label: "P4" }, { value: "3", label: "P3" }]}
+            options={[{ value: "3", label: "P3" }, { value: "4", label: "P4" }, { value: "2", label: "P2" }]}
             onChangeValue={(value) => onChange({ ...settings, preset: Number(value) })} />
         </SettingRow>
-        <SettingRow title="Encoder rate control" hint="CBR with a single-frame buffer and minimum QP 5."><span>CBR</span></SettingRow>
+        <SettingRow title="Encoder rate control" hint="CBR without filler data."><span>CBR</span></SettingRow>
         <SettingRow title="Quarter-resolution multipass" hint="Run an additional low-resolution pass to improve bit allocation.">
           <ToggleSwitch ariaLabel="Quarter-resolution multipass" checked={settings.quarterPass}
             onToggle={() => onChange({ ...settings, quarterPass: !settings.quarterPass })} />

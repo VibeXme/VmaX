@@ -269,6 +269,7 @@ pub mod win {
                 hevc.maxNumRefFramesInDPB = 1;
                 hevc.numRefL0 = NV_ENC_NUM_REF_FRAMES::REF_1;
                 hevc.numRefL1 = NV_ENC_NUM_REF_FRAMES::REF_1;
+                hevc.set_enableFillerDataInsertion(0);
                 hevc.set_repeatSPSPPS(u32::from(plan.repeat_sps_pps));
                 hevc.hevcVUIParameters = vui_params(vui);
                 if codec == VideoCodec::Hevc444 {
@@ -280,6 +281,7 @@ pub mod win {
                 h264.maxNumRefFrames = 1;
                 h264.numRefL0 = NV_ENC_NUM_REF_FRAMES::REF_1;
                 h264.numRefL1 = NV_ENC_NUM_REF_FRAMES::REF_1;
+                h264.set_enableFillerDataInsertion(0);
                 h264.set_repeatSPSPPS(u32::from(plan.repeat_sps_pps));
                 h264.h264VUIParameters = vui_params(vui);
             }
@@ -288,6 +290,7 @@ pub mod win {
                 av1.maxNumRefFramesInDPB = 1;
                 av1.numFwdRefs = NV_ENC_NUM_REF_FRAMES::REF_1;
                 av1.numBwdRefs = NV_ENC_NUM_REF_FRAMES::REF_1;
+                av1.set_enableBitstreamPadding(0);
                 av1.set_repeatSeqHdr(u32::from(plan.repeat_sps_pps));
                 // AV1 signals colour on the config, not through a VUI struct.
                 av1.colorPrimaries = NV_ENC_VUI_COLOR_PRIMARIES(i32::from(vui.colour_primaries));
@@ -357,6 +360,7 @@ pub mod win {
         bitrate_bps: u32,
         frame_pacing: FramePacing,
         nvenc: crate::nvenc::NvencSettings,
+        require_zero_copy: bool,
     ) -> Result<Box<dyn WinVideoEncoder>, String> {
         let codecs = if preferred_codecs.is_empty() {
             vec![VideoCodec::Hevc, VideoCodec::H264]
@@ -365,12 +369,12 @@ pub mod win {
         };
         let quality_first = frame_pacing == FramePacing::Detail;
 
-        if mode == EncoderModePreference::Hardware {
+        if require_zero_copy || mode == EncoderModePreference::Hardware {
             let p4 = preset_p4_guid();
-            let presets = if nvenc.preset == 3 {
-                [NV_ENC_PRESET_P3_GUID, p4, NV_ENC_PRESET_P2_GUID]
-            } else {
-                [p4, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P2_GUID]
+            let presets = match nvenc.preset {
+                2 => [NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID, p4],
+                4 => [p4, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P2_GUID],
+                _ => [NV_ENC_PRESET_P3_GUID, p4, NV_ENC_PRESET_P2_GUID],
             };
             for &codec in &codecs {
                 for preset in presets {
@@ -381,6 +385,9 @@ pub mod win {
                         }
                     }
                 }
+            }
+            if require_zero_copy {
+                return Err("Best Connection requires a working NVIDIA DXGI/NVENC encoder. Select a legacy protocol to use Media Foundation.".into());
             }
             for &codec in &codecs {
                 match MftVideoEncoder::new(
@@ -882,8 +889,8 @@ pub mod win {
             plan.rate_control.vbr = false;
             plan.rate_control.vbv_bits = frame_bits;
             plan.rate_control.aq_strength = settings.aq_strength.min(15);
-            plan.rate_control.min_qp_intra = 5;
-            plan.rate_control.min_qp_inter_p = 5;
+            plan.rate_control.min_qp_intra = settings.min_qp.min(51);
+            plan.rate_control.min_qp_inter_p = settings.min_qp.min(51);
             plan.rate_control.multi_pass_quarter_res = settings.quarter_pass;
             plan.intra_refresh.enabled = intra_refresh.enabled;
             plan.intra_refresh.period = intra_refresh.period_frames;

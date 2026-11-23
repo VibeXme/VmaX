@@ -7,10 +7,16 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io,
     net::SocketAddr,
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::net::UdpSocket;
+use tokio::{
+    net::UdpSocket,
+    sync::{Notify, oneshot},
+};
 
 use super::{Incoming, Path, StreamTransport};
 use crate::{
@@ -28,16 +34,98 @@ const GROUP: usize = 16;
 const MAX_SHARDS: usize = 4096;
 const KEYFRAME_AGE: Duration = Duration::from_secs(5);
 const KEYFRAME_PACING_MARGIN: Duration = Duration::from_millis(350);
-const DELTA_AGE: Duration = Duration::from_millis(35);
+// This is a recovery cutoff, not a playout buffer. Complete frames are
+// handed off immediately. Allow a scheduling hiccup to finish a reference.
+const DELTA_AGE: Duration = Duration::from_millis(60);
 const TICK: Duration = Duration::from_millis(3);
 // Batch sub-millisecond packet slots into one wake while bounding the burst.
 const VIDEO_PACING_WINDOW: Duration = Duration::from_millis(2);
 const MAX_PACED_BATCH: usize = 64;
+const LAN_DELTA_WIRE_RATE: u32 = 160_000_000;
 const VIDEO_RECEIVE_BUFFER: usize = 8 * 1024 * 1024;
-const RECEIVE_DRAIN_LIMIT: usize = 256;
+const RECEIVE_DRAIN_LIMIT: usize = 32;
+const RECEIVE_RING_CAPACITY: usize = 2048;
+
+struct Datagram {
+    bytes: [u8; 1500],
+    len: usize,
+}
+
+struct ReceiveRing {
+    packets: concurrent_queue::ConcurrentQueue<Datagram>,
+    ready: Notify,
+    drops: AtomicU64,
+}
+
+impl ReceiveRing {
+    fn spawn(socket: &UdpSocket) -> io::Result<(Arc<Self>, oneshot::Sender<()>)> {
+        let ring = Arc::new(Self {
+            packets: concurrent_queue::ConcurrentQueue::bounded(RECEIVE_RING_CAPACITY),
+            ready: Notify::new(),
+            drops: AtomicU64::new(0),
+        });
+        let (stop, mut stopped) = oneshot::channel();
+        let socket: std::net::UdpSocket = socket2::SockRef::from(socket).try_clone()?.into();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_io().build()?;
+        let worker_ring = Arc::clone(&ring);
+        std::thread::Builder::new().name("vmax-udp-recv".into()).spawn(move || {
+            prioritize_receive_thread();
+            runtime.block_on(async {
+                let Ok(socket) = UdpSocket::from_std(socket) else { return };
+                loop {
+                    let mut bytes = [0; 1500];
+                    let result = tokio::select! {
+                        biased;
+                        _ = &mut stopped => break,
+                        result = socket.recv(&mut bytes) => result,
+                    };
+                    match result {
+                        Ok(len) => {
+                            if worker_ring.packets.push(Datagram { bytes, len }).is_err() {
+                                worker_ring.drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                            worker_ring.ready.notify_one();
+                        }
+                        Err(error) if transient_socket_error(&error) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+            worker_ring.packets.close();
+            worker_ring.ready.notify_one();
+        })?;
+        Ok((ring, stop))
+    }
+
+    async fn wait(&self) {
+        if self.packets.is_empty() && !self.packets.is_closed() {
+            self.ready.notified().await;
+        }
+    }
+}
+
+fn transient_socket_error(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset)
+}
+
+fn prioritize_receive_thread() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    #[cfg(target_os = "android")]
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, 0, -4);
+    }
+}
 
 pub(super) struct RawLink {
     socket: UdpSocket,
+    receive: Arc<ReceiveRing>,
+    _stop_receive: oneshot::Sender<()>,
     peer_addr: SocketAddr,
     enet: Host<EnetSocket>,
     peer: Option<PeerID>,
@@ -49,9 +137,11 @@ pub(super) struct RawLink {
     packets: u64,
     received_video_bytes: u64,
     sent_packets: u64,
+    missing_packets: u64,
     traffic_class: Option<u32>,
     last_completed: Option<u32>,
     loss: f64,
+    remote_loss: Option<f64>,
 }
 
 struct Pending {
@@ -94,8 +184,11 @@ impl RawLink {
             enet.connect(peer_addr, 2, 0)
                 .map_err(|e| anyhow::anyhow!("ENet connect: {e:?}"))?;
         }
+        let (receive, stop_receive) = ReceiveRing::spawn(&socket)?;
         let mut link = Self {
             socket,
+            receive,
+            _stop_receive: stop_receive,
             peer_addr,
             enet,
             peer: None,
@@ -107,9 +200,11 @@ impl RawLink {
             packets: 0,
             received_video_bytes: 0,
             sent_packets: 0,
+            missing_packets: 0,
             traffic_class: None,
             last_completed: None,
             loss: 0.0,
+            remote_loss: None,
         };
         tokio::time::timeout(Duration::from_secs(2), async {
             while link.peer.is_none() {
@@ -154,7 +249,6 @@ impl RawLink {
     fn send_due_video(&mut self) -> Result<()> {
         let now = Instant::now();
         let horizon = now + VIDEO_PACING_WINDOW;
-        let oldest_slot = now - VIDEO_PACING_WINDOW;
         for _ in 0..MAX_PACED_BATCH {
             let now = Instant::now();
             let Some(video) = self
@@ -186,11 +280,8 @@ impl RawLink {
                 Err(error) => return Err(error.into()),
             }
             video.shards.next();
-            // Recovery frames must keep their original send schedule across
-            // late wakes. Short-lived deltas cap how far they can catch up.
-            if !video.keyframe {
-                video.next = video.next.max(oldest_slot);
-            }
+            // Carry the slot across timer overshoot. Per-batch, per-frame,
+            // and deadline bounds cap catch-up without losing send capacity.
             video.next += video.spacing;
             self.next_video_slot = video.next;
             if video.shards.len() == 0 {
@@ -232,7 +323,6 @@ impl RawLink {
             return Ok(());
         }
 
-        let mut buffer = [0; 1500];
         let next = self.video.as_ref().map_or(Instant::now() + TICK, |video| {
             video.next.max(video.blocked_until).min(Instant::now() + TICK)
         });
@@ -244,26 +334,20 @@ impl RawLink {
                     .map(|(&id, _)| id).collect();
                 for id in expired {
                     if let Some(item) = self.assembly.remove(&id) {
-                        let sample = 100.0 * item.missing() as f64 / item.data as f64;
+                        let missing = item.missing();
+                        self.missing_packets += missing as u64;
+                        let sample = 100.0 * missing as f64 / item.data as f64;
                         self.loss = self.loss * 0.8 + sample * 0.2;
                         self.input.push_back(Incoming::Keyframe);
                     }
                 }
             }
-            result = self.socket.recv(&mut buffer) => {
-                let len = match result {
-                    Ok(len) => len,
-                    Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset) => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                };
-                self.consume_datagram(&mut buffer[..len])?;
-                // A paced keyframe can still arrive as a short burst after the
-                // task wakes. Drain what is already available before returning
-                // to Tokio so the kernel queue cannot overflow between wakes.
+            _ = self.receive.wait() => {
                 for _ in 0..RECEIVE_DRAIN_LIMIT {
-                    let Ok(len) = self.socket.try_recv(&mut buffer) else { break };
-                    self.consume_datagram(&mut buffer[..len])?;
+                    let Ok(mut packet) = self.receive.packets.pop() else { break };
+                    self.consume_datagram(&mut packet.bytes[..packet.len])?;
                 }
+                ensure!(!self.receive.packets.is_closed(), "Raw UDP receive worker stopped");
             }
         }
         Ok(())
@@ -313,7 +397,9 @@ impl RawLink {
             return Ok(None);
         }
         if self.assembly.len() >= 2 && !self.assembly.contains_key(&frame) {
-            self.assembly.pop_first();
+            if let Some((_, abandoned)) = self.assembly.pop_first() {
+                self.missing_packets += abandoned.missing() as u64;
+            }
             self.input.push_back(Incoming::Keyframe);
         }
         let buffer = self
@@ -328,8 +414,13 @@ impl RawLink {
             return Ok(None);
         }
         let finished = self.assembly.remove(&frame).unwrap();
-        self.assembly
-            .retain(|&id, _| (id.wrapping_sub(frame) as i32) > 0);
+        self.assembly.retain(|&id, item| {
+            let keep = (id.wrapping_sub(frame) as i32) > 0;
+            if !keep {
+                self.missing_packets += item.missing() as u64;
+            }
+            keep
+        });
         self.last_completed = Some(frame);
         self.loss = self.loss * 0.8 + (100.0 * finished.recovered as f64 / data as f64) * 0.2;
         finished.frame(frame)
@@ -369,22 +460,35 @@ impl StreamTransport for RawLink {
         }
     }
 
+    fn update_remote_loss(&mut self, loss: f64) {
+        self.remote_loss = Some(loss);
+    }
+
     fn can_accept_video(&self) -> bool {
         self.video.is_none()
     }
 
     async fn video(&mut self, frame: OutboundVideoFrame, rate: u32) -> Result<bool> {
         self.send_due_video()?;
-        if frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
+        // The room's watch channel retains the newest waiting access unit
+        // while this slot drains. Replacing partially sent references is unsafe.
+        if self.video.is_some() || frame.payload.len() + FRAME_INFO > BODY * MAX_SHARDS {
             return Ok(false);
         }
-        // Keep one pending access unit, but replace stale deltas instead of
-        // rejecting the newest frame. Never replace an in-flight keyframe: a
-        // decoder without a clean reference would otherwise need an IDR.
-        if self.video.as_ref().is_some_and(|pending| pending.keyframe && !frame.is_keyframe) {
-            return Ok(false);
+        let overhead = if frame.is_keyframe { 125 } else { 63 };
+        let mut wire_rate = crate::transport::paced_wire_rate(rate, overhead).max(1);
+        let path = self.path();
+        if !frame.is_keyframe
+            && matches!(path.kind, ConnectionPath::LanRawUdp)
+            && !path.rtt.is_zero()
+            && path.rtt <= Duration::from_millis(6)
+            && self.remote_loss.is_some_and(|loss| loss <= 1.0)
+        {
+            // The encoder sets the average bitrate. On a healthy LAN, deliver
+            // one access unit quickly instead of spending a full frame period
+            // pacing it at the encoder's average rate.
+            wire_rate = wire_rate.max(LAN_DELTA_WIRE_RATE);
         }
-        let wire_rate = crate::transport::paced_wire_rate(rate, 125).max(1);
         let spacing = Duration::from_secs_f64(1160.0 * 8.0 / f64::from(wire_rate));
         let keyframe = frame.is_keyframe;
         let shards = shards(frame)?;
@@ -463,6 +567,13 @@ impl StreamTransport for RawLink {
     fn take_video_packets(&mut self) -> u64 {
         std::mem::take(&mut self.packets)
     }
+    fn take_receive_drops(&mut self) -> (u64, u64) {
+        (
+            self.receive.drops.swap(0, Ordering::Relaxed),
+            std::mem::take(&mut self.missing_packets),
+        )
+    }
+
     fn take_sent_packets(&mut self) -> u64 {
         std::mem::take(&mut self.sent_packets)
     }
@@ -566,10 +677,11 @@ fn parity(data: usize) -> usize {
     data.div_ceil(8)
 }
 
-fn coder(data: usize) -> &'static ReedSolomon {
-    static CODECS: OnceLock<[ReedSolomon; GROUP]> = OnceLock::new();
-    &CODECS.get_or_init(|| {
-        std::array::from_fn(|index| ReedSolomon::new(index + 1, parity(index + 1)).unwrap())
+fn coder(data: usize, parity_shards: usize) -> &'static ReedSolomon {
+    static CODECS: [OnceLock<[ReedSolomon; GROUP]>; 2] =
+        [OnceLock::new(), OnceLock::new()];
+    &CODECS[parity_shards - 1].get_or_init(|| {
+        std::array::from_fn(|index| ReedSolomon::new(index + 1, parity_shards).unwrap())
     })[data - 1]
 }
 
@@ -582,12 +694,16 @@ fn shards(frame: OutboundVideoFrame) -> Result<Vec<Bytes>> {
     frame.meta.encode(&mut padded);
     padded.extend_from_slice(&frame.payload);
     padded.resize(data * BODY, 0);
-    let mut output = Vec::with_capacity(data + parity(data));
+    let groups = data.div_ceil(GROUP);
+    let mut output = Vec::with_capacity(data + groups * if frame.is_keyframe { 2 } else { 1 });
     for (group, chunk) in padded.chunks(GROUP * BODY).enumerate() {
         let count = chunk.len() / BODY;
         let mut pieces: Vec<_> = chunk.chunks(BODY).map(<[u8]>::to_vec).collect();
-        pieces.resize_with(count + parity(count), || vec![0; BODY]);
-        coder(count).encode(&mut pieces)?;
+        // Reed-Solomon's first parity row is the same with one or two
+        // parity shards, so existing receivers can repair these deltas.
+        let parity_shards = if frame.is_keyframe { parity(count) } else { 1 };
+        pieces.resize_with(count + parity_shards, || vec![0; BODY]);
+        coder(count, parity_shards).encode(&mut pieces)?;
         for (index, piece) in pieces.iter().enumerate() {
             let mut bytes = BytesMut::with_capacity(HEADER + BODY);
             bytes.put_u8(ChannelId::Video as u8);
@@ -617,17 +733,116 @@ mod tests {
     use super::*;
     use crate::protocol::VideoCodec;
 
-    #[tokio::test]
-    async fn paced_join_keyframe_survives_an_encoder_stall_and_a_slow_link() -> Result<()> {
+    async fn loopback_pair() -> Result<(RawLink, RawLink)> {
         let sender = UdpSocket::bind("127.0.0.1:0").await?;
         let receiver = UdpSocket::bind("127.0.0.1:0").await?;
         let sender_addr = sender.local_addr()?;
         let receiver_addr = receiver.local_addr()?;
-        let (host, viewer) = tokio::try_join!(
+        tokio::try_join!(
             RawLink::new(sender, receiver_addr, [1; 32], [2; 32], true),
             RawLink::new(receiver, sender_addr, [2; 32], [1; 32], false),
-        )?;
-        let (mut host, mut viewer) = (host, viewer);
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sustained_1440p_sized_video_has_no_udp_drops() -> Result<()> {
+        let (mut host, mut viewer) = loopback_pair().await?;
+        let total = 360;
+        let payload = Bytes::from(vec![0x65; 41_667]);
+        let send_payload = payload.clone();
+        let sender = tokio::spawn(async move {
+            let mut frames = tokio::time::interval(Duration::from_micros(16_667));
+            frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut next = 1;
+            while next <= total || !host.can_accept_video() {
+                tokio::select! {
+                    _ = frames.tick(), if next <= total && host.can_accept_video() => {
+                        ensure!(host.video(OutboundVideoFrame {
+                            meta: FrameTelemetry::full_range_hardware(1, 2560, 1440),
+                            codec: VideoCodec::Hevc,
+                            frame_id: next,
+                            timestamp_us: u64::from(next) * 16_667,
+                            captured_at: Instant::now(),
+                            fps: 60,
+                            is_keyframe: next == 1,
+                            payload: send_payload.clone(),
+                        }, 25_000_000).await?, "sender rejected frame {next}");
+                        next += 1;
+                    }
+                    event = host.next() => {
+                        ensure!(!matches!(event?, Incoming::Keyframe), "sender expired frame {}", next - 1);
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let receiver = async {
+            let mut received = 0;
+            while received < total {
+                match viewer.next().await? {
+                    Incoming::Video(frame) => {
+                        received += 1;
+                        assert_eq!(frame.frame_id, received);
+                        assert_eq!(frame.payload, payload);
+                    }
+                    Incoming::Keyframe => bail!("viewer expired frame {}", received + 1),
+                    _ => {}
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::try_join!(async { sender.await? }, receiver)
+        }).await??;
+        assert_eq!(viewer.take_receive_drops(), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_parity_delta_recovers_one_missing_packet_per_group() -> Result<()> {
+        let payload = Bytes::from(vec![0x55; BODY * 32 - FRAME_INFO]);
+        let frame = OutboundVideoFrame {
+            meta: FrameTelemetry::full_range_hardware(1, 2560, 1440),
+            codec: VideoCodec::Hevc,
+            frame_id: 2,
+            timestamp_us: 16_667,
+            captured_at: Instant::now(),
+            fps: 60,
+            is_keyframe: false,
+            payload: payload.clone(),
+        };
+        let packets = shards(frame)?;
+        assert_eq!(packets.len(), 34);
+        let (mut host, mut viewer) = loopback_pair().await?;
+        let send = async {
+            for packet in packets {
+                let shard = u16::from_be_bytes(packet[8..10].try_into()?);
+                if shard != 3 {
+                    host.packet(&packet).await?;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let receive = async {
+            loop {
+                match viewer.next().await? {
+                    Incoming::Video(frame) => return Ok::<_, anyhow::Error>(frame),
+                    Incoming::Keyframe => bail!("viewer expired an FEC-repairable frame"),
+                    _ => {}
+                }
+            }
+        };
+        let (_, frame) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::try_join!(send, receive)
+        }).await??;
+        assert_eq!(frame.fec_recovered_shards, 2);
+        assert_eq!(frame.payload, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paced_join_keyframe_survives_an_encoder_stall_and_a_slow_link() -> Result<()> {
+        let (mut host, mut viewer) = loopback_pair().await?;
         let payload = Bytes::from(vec![0x65; 450_000]);
         let frame = OutboundVideoFrame {
             meta: FrameTelemetry::full_range_hardware(2, 1920, 1080),
@@ -660,14 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn high_bitrate_delta_drains_and_wakes_the_host() -> Result<()> {
-        let sender = UdpSocket::bind("127.0.0.1:0").await?;
-        let receiver = UdpSocket::bind("127.0.0.1:0").await?;
-        let sender_addr = sender.local_addr()?;
-        let receiver_addr = receiver.local_addr()?;
-        let (mut host, mut viewer) = tokio::try_join!(
-            RawLink::new(sender, receiver_addr, [1; 32], [2; 32], true),
-            RawLink::new(receiver, sender_addr, [2; 32], [1; 32], false),
-        )?;
+        let (mut host, mut viewer) = loopback_pair().await?;
         let payload = Bytes::from(vec![0x41; 180_000]);
         let frame = OutboundVideoFrame {
             meta: FrameTelemetry::full_range_hardware(2, 1920, 1080),
@@ -795,7 +1003,7 @@ impl Assembly {
                 .filter(|piece| piece.is_none())
                 .count();
             if missing > 0 {
-                coder(count).reconstruct_data(parts)?;
+                coder(count, parity(count)).reconstruct_data(parts)?;
             }
             self.recovered += missing as u32;
             self.groups_remaining -= 1;

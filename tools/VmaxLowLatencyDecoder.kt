@@ -10,7 +10,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
-import android.os.SystemClock
 import android.view.Gravity
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -25,7 +24,6 @@ object VmaxLowLatencyDecoder {
     private val outputHandler by lazy {
         Handler(HandlerThread("vmax-mediacodec-output").apply { start() }.looper)
     }
-    private val outputPoll = Runnable { pollOutput() }
     private var view: SurfaceView? = null
     private var webView: WebView? = null
     private var surface: Surface? = null
@@ -33,8 +31,39 @@ object VmaxLowLatencyDecoder {
     private var format: Format? = null
     private var waitingForKeyframe = true
     private var failures = 0
-    private var outputDeadline = 0L
-    private var pollScheduled = false
+    private data class AccessUnit(val bytes: ByteArray, val pts: Long, val format: Format, val keyframe: Boolean)
+    private data class Output(val index: Int, val pts: Long)
+
+    private val inputs = ArrayDeque<Int>()
+    private var pending: AccessUnit? = null
+    private var inputPosted = false
+    private var pendingReferenceGap = false
+    private var output: Output? = null
+    private val submitPending = Runnable {
+        synchronized(this) {
+            inputPosted = false
+            try {
+                submit()
+            } catch (error: RuntimeException) {
+                recover(error)
+            }
+        }
+    }
+    private val renderPending = Runnable {
+        synchronized(this) {
+            val frame = output
+            output = null
+            val active = decoder
+            if (frame != null && active != null) {
+                try {
+                    remember(released, frame.pts)
+                    active.releaseOutputBuffer(frame.index, true)
+                } catch (error: RuntimeException) {
+                    recover(error)
+                }
+            }
+        }
+    }
     private val submitted = LinkedHashMap<Long, Long>()
     private val released = LinkedHashMap<Long, Long>()
     private val hardwareDecoders by lazy {
@@ -151,8 +180,7 @@ object VmaxLowLatencyDecoder {
     @JvmStatic
     @Synchronized
     fun onNativeVideoFrame(bytes: ByteArray, timestampUs: Long, codec: Int, width: Int, height: Int, keyframe: Boolean) {
-        val target = surface ?: return
-        if (failures >= 3 || width !in 16..8192 || height !in 16..8192) return
+        if (surface == null || failures >= 3 || width !in 16..8192 || height !in 16..8192) return
         val stream = when (codec) {
             1 -> Format(MediaFormat.MIMETYPE_VIDEO_HEVC, width, height, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
             2 -> Format(MediaFormat.MIMETYPE_VIDEO_AVC, width, height, 0)
@@ -160,41 +188,53 @@ object VmaxLowLatencyDecoder {
             5 -> Format(MediaFormat.MIMETYPE_VIDEO_AV1, width, height, 0)
             else -> return
         }
-        try {
-            if (stream != format) {
-                release()
-                if (!keyframe) return
-                start(stream, target)
-            }
-            if (waitingForKeyframe && !keyframe) return
-            val active = decoder ?: return
-            drain(active)
-            val index = active.dequeueInputBuffer(2_000)
-            if (index < 0) {
-                active.flush()
-                submitted.clear()
-                released.clear()
+        if (!keyframe) {
+            if (pending != null) {
+                // The new delta references an access unit we couldn't submit.
+                // Keep a pending IDR if present and wait for clean recovery.
+                if (waitingForKeyframe && pendingReferenceGap) return
+                if (pending?.keyframe == true) pendingReferenceGap = true else pending = null
                 waitingForKeyframe = true
                 nativeNotifyDecoderReset()
                 return
             }
-            val input = checkNotNull(active.getInputBuffer(index))
-            input.clear()
-            input.put(bytes)
-            remember(submitted, timestampUs)
-            active.queueInputBuffer(index, 0, bytes.size, timestampUs, if (keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
-            waitingForKeyframe = false
-            drain(active)
-            outputDeadline = SystemClock.uptimeMillis() + 100
-            scheduleOutputPoll()
-        } catch (error: RuntimeException) {
-            recover(error)
+            if (waitingForKeyframe || stream != format) return
         }
+        pending = AccessUnit(bytes, timestampUs, stream, keyframe)
+        pendingReferenceGap = false
+        if (!inputPosted) inputPosted = outputHandler.post(submitPending)
+    }
+
+    private fun submit() {
+        val frame = pending ?: return
+        val target = surface ?: return
+        if (frame.format != format) {
+            if (!frame.keyframe) return
+            val gap = pendingReferenceGap
+            release()
+            pending = frame
+            pendingReferenceGap = gap
+            start(frame.format, target)
+        }
+        val active = decoder ?: return
+        val index = inputs.removeFirstOrNull() ?: return
+        pending = null
+        val input = checkNotNull(active.getInputBuffer(index))
+        input.clear()
+        input.put(frame.bytes)
+        remember(submitted, frame.pts)
+        active.queueInputBuffer(
+            index, 0, frame.bytes.size, frame.pts,
+            if (frame.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0,
+        )
+        waitingForKeyframe = pendingReferenceGap
+        pendingReferenceGap = false
     }
 
     private fun start(stream: Format, target: Surface) {
         fun baseFormat() = MediaFormat.createVideoFormat(stream.mime, stream.width, stream.height).apply {
             if (stream.profile != 0) setInteger(MediaFormat.KEY_PROFILE, stream.profile)
+            setInteger(MediaFormat.KEY_PRIORITY, 0)
             if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
         val settings = baseFormat()
@@ -202,24 +242,64 @@ object VmaxLowLatencyDecoder {
             info.supportedTypes.any { it.equals(stream.mime, ignoreCase = true) } &&
                 info.getCapabilitiesForType(stream.mime).isFormatSupported(settings)
         } ?: throw IllegalStateException("Hardware decoder unavailable")
-        val operatingRate = runCatching {
-            codec.getCapabilitiesForType(stream.mime).videoCapabilities
-                ?.getSupportedFrameRatesFor(stream.width, stream.height)?.upper?.toFloat()
-        }.getOrNull()
-        if (operatingRate != null && operatingRate.isFinite() && operatingRate > 0f) {
-            settings.setFloat(MediaFormat.KEY_OPERATING_RATE, operatingRate)
-        }
-        var active = MediaCodec.createByCodecName(codec.name)
-        decoder = active
-        try {
-            active.configure(settings, target, null, 0)
-        } catch (error: RuntimeException) {
-            if (!settings.containsKey(MediaFormat.KEY_OPERATING_RATE)) throw error
-            release()
-            // Some vendor decoders reject the advertised operating rate.
-            active = MediaCodec.createByCodecName(codec.name)
+        settings.setFloat(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toFloat())
+        fun configure(format: MediaFormat): MediaCodec {
+            val active = MediaCodec.createByCodecName(codec.name)
             decoder = active
-            active.configure(baseFormat(), target, null, 0)
+            active.setCallback(object : MediaCodec.Callback() {
+                override fun onInputBufferAvailable(source: MediaCodec, index: Int) {
+                    synchronized(this@VmaxLowLatencyDecoder) {
+                        if (source !== decoder) return
+                        inputs.addLast(index)
+                        try {
+                            submit()
+                        } catch (error: RuntimeException) {
+                            recover(error)
+                        }
+                    }
+                }
+
+                override fun onOutputBufferAvailable(source: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+                    synchronized(this@VmaxLowLatencyDecoder) {
+                        if (source !== decoder) return
+                        try {
+                            if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                                source.releaseOutputBuffer(index, false)
+                                return
+                            }
+                            val pts = info.presentationTimeUs
+                            nativeReportDecoded(elapsedUs(submitted.remove(pts), System.nanoTime()))
+                            val previous = output
+                            if (previous != null) source.releaseOutputBuffer(previous.index, false)
+                            output = Output(index, pts)
+                            if (previous == null) outputHandler.post(renderPending)
+                        } catch (error: RuntimeException) {
+                            recover(error)
+                        }
+                    }
+                }
+
+                override fun onOutputFormatChanged(source: MediaCodec, format: MediaFormat) = Unit
+
+                override fun onError(source: MediaCodec, error: MediaCodec.CodecException) {
+                    synchronized(this@VmaxLowLatencyDecoder) {
+                        if (source === decoder) recover(error)
+                    }
+                }
+            }, outputHandler)
+            active.configure(format, target, null, 0)
+            return active
+        }
+        val active = try {
+            configure(settings)
+        } catch (error: RuntimeException) {
+            // Some vendor codecs reject the operating-rate hint.
+            val frame = pending
+            val gap = pendingReferenceGap
+            release()
+            pending = frame
+            pendingReferenceGap = gap
+            configure(baseFormat())
         }
         active.setOnFrameRenderedListener({ source, pts, renderTime ->
             synchronized(this) {
@@ -253,51 +333,6 @@ object VmaxLowLatencyDecoder {
         return codecs
     }
 
-    @Synchronized
-    private fun pollOutput() {
-        pollScheduled = false
-        val active = decoder ?: return
-        if (waitingForKeyframe) return
-        try {
-            drain(active)
-            if (SystemClock.uptimeMillis() < outputDeadline) scheduleOutputPoll()
-        } catch (error: RuntimeException) {
-            recover(error)
-        }
-    }
-
-    private fun scheduleOutputPoll() {
-        if (!pollScheduled) pollScheduled = outputHandler.postDelayed(outputPoll, 3)
-    }
-
-    private fun drain(active: MediaCodec) {
-        val info = MediaCodec.BufferInfo()
-        var newest = -1
-        var newestPts = 0L
-        for (attempt in 0 until 8) {
-            val index = active.dequeueOutputBuffer(info, 0)
-            when {
-                index >= 0 -> {
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        active.releaseOutputBuffer(index, false)
-                        continue
-                    }
-                    val pts = info.presentationTimeUs
-                    nativeReportDecoded(elapsedUs(submitted.remove(pts), System.nanoTime()))
-                    if (newest >= 0) active.releaseOutputBuffer(newest, false)
-                    newest = index
-                    newestPts = pts
-                }
-                index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Unit
-                else -> break
-            }
-        }
-        if (newest >= 0) {
-            remember(released, newestPts)
-            active.releaseOutputBuffer(newest, true)
-        }
-    }
-
     private fun remember(timestamps: LinkedHashMap<Long, Long>, pts: Long) {
         if (timestamps.size >= 32) timestamps.remove(timestamps.keys.first())
         timestamps[pts] = System.nanoTime()
@@ -319,6 +354,13 @@ object VmaxLowLatencyDecoder {
         decoder = null
         format = null
         waitingForKeyframe = true
+        pending = null
+        pendingReferenceGap = false
+        inputs.clear()
+        output = null
+        inputPosted = false
+        outputHandler.removeCallbacks(submitPending)
+        outputHandler.removeCallbacks(renderPending)
         submitted.clear()
         released.clear()
         try {

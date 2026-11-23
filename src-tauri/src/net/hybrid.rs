@@ -39,7 +39,6 @@ const ALPN: &[u8] = b"vmax/hybrid/1";
 const BANDWIDTH_CODE: u32 = 429;
 const INVITE_PATH: &str = "/auto";
 const PLI_INTERVAL: Duration = Duration::from_millis(200);
-const VIDEO_SILENCE: Duration = Duration::from_secs(1);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const BUFFER: usize = 32;
 
@@ -72,6 +71,7 @@ trait StreamTransport: Send {
     fn keyframe_in_flight(&self) -> bool {
         false
     }
+    fn update_remote_loss(&mut self, _loss: f64) {}
     fn can_accept_video(&self) -> bool {
         true
     }
@@ -85,6 +85,9 @@ trait StreamTransport: Send {
     fn take_video_packets(&mut self) -> u64;
     fn take_video_bytes(&mut self) -> u64;
     fn take_sent_packets(&mut self) -> u64;
+    fn take_receive_drops(&mut self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 #[derive(Clone)]
@@ -510,6 +513,7 @@ impl Room {
                 ControlMessage::TelemetryFeedback { loss_pct, .. }
                     if (0.0..=100.0).contains(&loss_pct) =>
                 {
+                    link.update_remote_loss(loss_pct);
                     let mut slots = self.state.0.slots.lock().unwrap();
                     slots[slot].as_mut().unwrap().remote_loss = loss_pct;
                 }
@@ -877,7 +881,6 @@ async fn client_stream<T: StreamTransport>(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_seen = Instant::now();
-    let mut last_video = last_seen;
     let mut last_pli = last_seen;
     let mut latest_frame = None;
     let mut waiting = true;
@@ -910,7 +913,6 @@ async fn client_stream<T: StreamTransport>(
                     waiting = overflow && !keyframe;
                     if !waiting {
                         latest_frame = Some(id);
-                        last_video = last_seen;
                         frames += 1;
                         recovered += u64::from(repaired);
                     }
@@ -971,9 +973,7 @@ async fn client_stream<T: StreamTransport>(
             }
             _ = tick.tick() => {
                 ensure!(last_seen.elapsed() < IDLE_TIMEOUT, "Host stopped responding");
-                if last_video.elapsed() >= VIDEO_SILENCE {
-                    waiting = true;
-                }
+                let (ring_drops, missing_packets) = link.take_receive_drops();
                 packets += link.take_video_packets();
                 window_bytes += link.take_video_bytes();
                 let path = link.path();
@@ -988,6 +988,8 @@ async fn client_stream<T: StreamTransport>(
                 snapshot.video_frames_rx = frames;
                 snapshot.video_frames_dropped = dropped;
                 snapshot.fec_recovered_shards = recovered;
+                snapshot.udp_receive_ring_drops += ring_drops;
+                snapshot.udp_missing_data_packets += missing_packets;
                 snapshot.audio_packets_rx = audio;
                 if window_start.elapsed() >= Duration::from_secs(1) {
                     snapshot.media_bitrate_mbps = (window_bytes as f64 * 8e-6 / window_start.elapsed().as_secs_f64()) as f32;

@@ -31,11 +31,11 @@ export const MAX_STREAM_BITRATE_MBPS = 200;
 export const STREAM_FRAMERATES = [30, 60, 90, 120, 144] as const;
 
 const DEFAULT_NVENC: NvencSettings = {
-  preset: 4,
+  preset: 3,
   vbr: false,
   vbvFrames: 1,
   aqStrength: 8,
-  minQp: 5,
+  minQp: 17,
   quarterPass: true,
   intraRefresh: true,
   refreshPeriod: 120,
@@ -44,7 +44,7 @@ const DEFAULT_NVENC: NvencSettings = {
 
 export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
   video: {
-    resolution: "1080p",
+    resolution: "1440p",
     framerate: 60,
     bitrateMbps: 24,
     hostUploadMbps: 30,
@@ -58,7 +58,7 @@ export const DEFAULT_VMAX_CONFIG: VmaXConfig = {
     upscaling: "off",
     renderer: "auto",
     lockResolution: true,
-    constantFps: true,
+    constantFps: false,
     unlimitedBitrate: false,
     nvenc: DEFAULT_NVENC,
   },
@@ -228,6 +228,20 @@ function migrateToGamingBaseline(config: VmaXConfig): VmaXConfig {
     v.lockResolution && v.constantFps && !v.unlimitedBitrate &&
     n.fecRedundancyPct === 5 && n.packetWindowMs === 16 &&
     n.congestionSensitivity === "low_latency";
+  const previousBestConnectionBaseline =
+    n.protocol === "auto" && v.resolution === "1080p" && v.framerate === 60 &&
+    v.bitrateMbps === 24 && v.hostUploadMbps === 30 && !v.strictQuality &&
+    v.encoder === "hardware" && v.codec === "hevc" && v.chroma === "420" &&
+    v.framePacing === "motion" && v.sharpness === 30 && v.viewerSharpness === 45 &&
+    v.upscaling === "off" && v.renderer === "auto" && v.lockResolution &&
+    v.constantFps && !v.unlimitedBitrate &&
+    v.nvenc.preset === 4 && v.nvenc.minQp === 5 &&
+    v.nvenc.vbvFrames === 1 && v.nvenc.aqStrength === 8 &&
+    v.nvenc.quarterPass && v.nvenc.intraRefresh &&
+    v.nvenc.refreshPeriod === 120 && v.nvenc.refreshFrames === 1;
+  if (previousBestConnectionBaseline) {
+    return { ...config, video: { ...v, ...DEFAULT_VMAX_CONFIG.video } };
+  }
   if (!untouchedNativeBaseline && !previousGamingBaseline) {
     return config;
   }
@@ -293,11 +307,11 @@ function loadSavedConfig(): VmaXConfig {
         constantFps: asBoolean(v.constantFps, DEFAULT_VMAX_CONFIG.video.constantFps),
         unlimitedBitrate: asBoolean(v.unlimitedBitrate, DEFAULT_VMAX_CONFIG.video.unlimitedBitrate),
         nvenc: {
-          preset: nvenc.preset === 3 ? 3 : 4,
+          preset: nvenc.preset === 2 || nvenc.preset === 3 || nvenc.preset === 4 ? nvenc.preset : DEFAULT_NVENC.preset,
           vbr: false,
-          vbvFrames: 1,
+          vbvFrames: Math.round(asClampedNumber(nvenc.vbvFrames, 1, 2, DEFAULT_NVENC.vbvFrames)),
           aqStrength: Math.round(asClampedNumber(nvenc.aqStrength, 0, 15, DEFAULT_NVENC.aqStrength)),
-          minQp: 5,
+          minQp: Math.round(asClampedNumber(nvenc.minQp, 0, 51, DEFAULT_NVENC.minQp)),
           quarterPass: asBoolean(nvenc.quarterPass, DEFAULT_NVENC.quarterPass),
           intraRefresh: asBoolean(nvenc.intraRefresh, DEFAULT_NVENC.intraRefresh),
           refreshPeriod: migrateRefreshPeriod(nvenc.refreshPeriod),

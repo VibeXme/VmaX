@@ -1,6 +1,6 @@
 [package]
 name = "vmax"
-version = "6.0.3"
+version = "6.0.4"
 description = "VmaX — Ultra-low-latency P2P remote desktop and game streaming"
 authors = ["VmaX Contributors"]
 edition = "2024"
@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["full"] }
 iroh = "1.4"
 iroh-tickets = "1.0"
 rusty_enet = "0.4.1"
+concurrent-queue = "2"
 str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"] }
 quinn = "0.11"
 socket2 = "0.6"

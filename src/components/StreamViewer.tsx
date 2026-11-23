@@ -40,7 +40,7 @@ import {
   type ResolutionOption,
 } from "../types";
 import { FramePresenter } from "../lib/framePresenter";
-import { DecoderHealth, STALL_RESET_MS } from "../lib/decodeHealth";
+import { DecoderHealth } from "../lib/decodeHealth";
 import { buildDiagnosticsReport, copyDiagnostics } from "../lib/diagnostics";
 import { measureRefreshHz } from "../lib/displayRefresh";
 import { MAX_STREAM_BITRATE_MBPS } from "../config/defaults";
@@ -64,6 +64,10 @@ interface StreamViewerProps {
   packetLossPct?: number;
   videoPacketsReceived: number;
   droppedFrames: number;
+  fecRecoveredShards: number;
+  udpReceiveRingDrops: number;
+  udpMissingDataPackets: number;
+  networkBitrateMbps?: number | null;
   hardwareCursor?: boolean;
   nativeFps: number;
   viewerSharpness: number;
@@ -302,6 +306,10 @@ export function StreamViewer({
   packetLossPct,
   videoPacketsReceived,
   droppedFrames,
+  fecRecoveredShards,
+  udpReceiveRingDrops,
+  udpMissingDataPackets,
+  networkBitrateMbps,
   hardwareCursor = true,
   nativeFps,
   viewerSharpness,
@@ -855,7 +863,6 @@ export function StreamViewer({
     let lastPlaybackSample = performance.now();
     let subscribed = false;
     let frameChannelId: number | undefined;
-    let cancelAcknowledgement: (() => void) | undefined;
     let lastCodecLabel = "";
 
     // Vsync-paced presentation: at most one draw per display refresh and the
@@ -1246,45 +1253,15 @@ export function StreamViewer({
         }
       };
 
-      const acknowledge = () => {
-        if (cancelled) return;
-        const sendAck = () => {
-          if (!cancelled) {
-            void invoke("acknowledge_stream_frame", { channelId: onFrame.id }).catch(() => {});
-          }
-        };
-        const active = decoder;
-        // Leave room for one queued access unit so IPC and decoding can overlap.
-        if (!active || active.decodeQueueSize < 2) {
-          sendAck();
-          return;
-        }
-        const cleanup = () => {
-          active.removeEventListener("dequeue", onDequeue);
-          window.clearTimeout(timer);
-          cancelAcknowledgement = undefined;
-        };
-        const onDequeue = () => {
-          if (active.decodeQueueSize >= 2) return;
-          cleanup();
-          sendAck();
-        };
-        const timer = window.setTimeout(() => {
-          cleanup();
-          if (decoder === active && active.decodeQueueSize >= 2) {
-            resetDecoder();
-            requestSyncKeyframe("decode_queue_stalled");
-          }
-          sendAck();
-        }, STALL_RESET_MS);
-        cancelAcknowledgement = cleanup;
-        active.addEventListener("dequeue", onDequeue);
-      };
       onFrame.onmessage = (payload) => {
         try {
           processFrame(payload);
         } finally {
-          acknowledge();
+          // IPC delivery and the decoder run independently. DecoderHealth
+          // bounds the fallback queue and requests a fresh reference on stalls.
+          if (!cancelled) {
+            void invoke("acknowledge_stream_frame", { channelId: onFrame.id }).catch(() => {});
+          }
         }
       };
 
@@ -1304,7 +1281,6 @@ export function StreamViewer({
 
     return () => {
       cancelled = true;
-      cancelAcknowledgement?.();
       if (frameChannelId !== undefined) {
         void invoke("unsubscribe_stream_frames", { channelId: frameChannelId }).catch(() => {});
       }
@@ -1641,7 +1617,7 @@ export function StreamViewer({
 
   // Parsec-exact 2-decimal-place telemetry calculations
   const displayDecodeMs =
-    playback?.decodeMs ?? (parsecTelemetry && parsecTelemetry.decodeMs > 0 ? parsecTelemetry.decodeMs : null);
+    (nativeVideo ? null : playback?.decodeMs) ?? (parsecTelemetry && parsecTelemetry.decodeMs > 0 ? parsecTelemetry.decodeMs : null);
   const displayEncodeMs =
     hostEncodeMs ?? (parsecTelemetry && parsecTelemetry.encodeMs > 0 ? parsecTelemetry.encodeMs : null);
   const displayNetworkMs =
@@ -1650,16 +1626,15 @@ export function StreamViewer({
       : pingMs > 0
         ? pingMs / 2.0
         : null;
-  // Everything VmaX itself controls on the way to the glass: host encode, the
-  // one-way trip, and client decode.  Propagation and display refresh are not
-  // in here because no encoder setting can shorten them.
+  // The network term is estimated from RTT. This sum excludes capture wait
+  // and display scanout, so it is a pipeline estimate rather than glass latency.
   const displayPipelineMs =
     displayEncodeMs !== null && displayDecodeMs !== null && displayNetworkMs !== null
       ? displayEncodeMs + displayDecodeMs + displayNetworkMs
       : null;
   const displayFps = nativeVideo ? nativeFps : playback?.fps;
   const displayBitrateMbps =
-    parsecTelemetry?.bitrateMbps ?? playback?.videoMbps ?? 0;
+    networkBitrateMbps ?? parsecTelemetry?.bitrateMbps ?? playback?.videoMbps ?? 0;
   const displayWidth = streamSize?.w ?? dims.width;
   const displayHeight = streamSize?.h ?? dims.height;
   const parsecFormatString =
@@ -2000,9 +1975,13 @@ export function StreamViewer({
                 <dd className="tabular-nums font-semibold text-white">
                   {pingMs > 0 ? `${pingMs.toFixed(1)} ms` : "—"}
                 </dd>
-                <dt className="text-zinc-500">Pipeline</dt>
+                <dt className="text-zinc-500">Network (estimated)</dt>
+                <dd className="tabular-nums font-semibold text-white">
+                  {displayNetworkMs !== null ? `${displayNetworkMs.toFixed(2)} ms` : "—"}
+                </dd>
+                <dt className="text-zinc-500">Pipeline estimate</dt>
                 <dd
-                  title="Encode + one-way network + decode. Everything VmaX controls; display refresh and propagation are extra"
+                  title="Encode + estimated one-way network + decode. Excludes capture wait and display scanout."
                   className={`tabular-nums font-semibold ${displayPipelineMs !== null && displayPipelineMs <= 20 ? "text-emerald-300" : "text-white"}`}
                 >
                   {displayPipelineMs !== null ? `${displayPipelineMs.toFixed(2)} ms` : "—"}
@@ -2017,6 +1996,14 @@ export function StreamViewer({
                 <dd className="tabular-nums text-zinc-200">{nativeVideo ? nativeFps : playback?.decodeFps ?? "—"}</dd>
                 <dt className="text-zinc-500">Receive drops / s</dt>
                 <dd className="tabular-nums text-zinc-200">{connected ? dropsPerSecond : "—"}</dd>
+                <dt className="text-zinc-500">FEC-recovered shards</dt>
+                <dd className="tabular-nums text-zinc-200">{connected ? fecRecoveredShards : "—"}</dd>
+                {(connectionPath === "lan_raw_udp" || connectionPath === "direct_raw_udp") && <>
+                  <dt className="text-zinc-500">UDP ring drops</dt>
+                  <dd className="tabular-nums text-zinc-200">{udpReceiveRingDrops}</dd>
+                  <dt className="text-zinc-500">Missing UDP data shards</dt>
+                  <dd className="tabular-nums text-zinc-200">{udpMissingDataPackets}</dd>
+                </>}
                 <dt className="text-zinc-500">Viewer drops / s</dt>
                 <dd className="tabular-nums text-zinc-200">
                   {connected && decoderDropsPerSecond !== null

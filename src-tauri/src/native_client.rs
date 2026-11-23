@@ -444,6 +444,19 @@ impl Decoder {
                 (u64::from(format.width) << 32) | u64::from(format.height),
             )?;
             input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            let nominal_range = if format.full_range {
+                MFNominalRange_0_255
+            } else {
+                MFNominalRange_16_235
+            };
+            for (attribute, value) in [
+                (MF_MT_VIDEO_NOMINAL_RANGE, nominal_range.0),
+                (MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0),
+                (MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0),
+                (MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0),
+            ] {
+                input.SetUINT32(&attribute, value as u32)?;
+            }
             transform.SetInputType(0, &input, 0)?;
             Self::select_output(&transform, output_type)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;

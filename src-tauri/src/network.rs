@@ -371,9 +371,13 @@ pub struct NetworkTelemetry {
     pub video_packets_rx: u64,
     pub video_frames_dropped: u64,
     pub fec_recovered_shards: u64,
+    #[serde(default)]
+    pub udp_receive_ring_drops: u64,
+    #[serde(default)]
+    pub udp_missing_data_packets: u64,
     pub audio_packets_tx: u64,
     pub audio_packets_rx: u64,
-    #[serde(skip)]
+    #[serde(default)]
     pub(crate) media_bitrate_mbps: f32,
     pub input_events_tx: u64,
     pub input_events_rx: u64,
@@ -409,6 +413,8 @@ impl Default for NetworkTelemetry {
             video_packets_rx: 0,
             video_frames_dropped: 0,
             fec_recovered_shards: 0,
+            udp_receive_ring_drops: 0,
+            udp_missing_data_packets: 0,
             audio_packets_tx: 0,
             audio_packets_rx: 0,
             media_bitrate_mbps: 0.0,

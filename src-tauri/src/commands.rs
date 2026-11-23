@@ -65,7 +65,7 @@ const ENCODE_FPS_SCALE_STEP: f32 = 0.15;
 fn default_upload_mbps() -> u32 { 30 }
 
 fn default_resolution() -> String {
-    "1080p".into()
+    "1440p".into()
 }
 
 fn default_framerate() -> u16 {
@@ -165,7 +165,7 @@ pub struct StartSessionParams {
     #[serde(default = "default_true")]
     pub lock_resolution: bool,
     /// Keep emitting frames when the desktop is static.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub constant_fps: bool,
     /// Ignore congestion-driven bitrate reductions and use the whole link.
     ///
@@ -233,7 +233,7 @@ pub struct VideoSettingsPayload {
     #[serde(default = "default_true")]
     pub lock_resolution: bool,
     /// Constant FPS: keep sending frames even when the desktop is static.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub constant_fps: bool,
     /// Use the full configured bitrate and ignore congestion back-off.
     ///
@@ -282,7 +282,7 @@ impl Default for VmaXSettingsPayload {
     fn default() -> Self {
         Self {
             video: VideoSettingsPayload {
-                resolution: "1080p".into(),
+                resolution: "1440p".into(),
                 framerate: 60,
                 bitrate_mbps: 24,
                 host_upload_mbps: default_upload_mbps(),
@@ -295,7 +295,7 @@ impl Default for VmaXSettingsPayload {
                 renderer: "auto".to_string(),
                 frame_pacing: FramePacing::Motion,
                 lock_resolution: true,
-                constant_fps: true,
+                constant_fps: false,
                 // Adaptive by default: the ceiling is still the user's value,
                 // but congestion feedback may lower it so a weak link stutters
                 // less instead of drowning in retransmission-free datagram loss.
@@ -690,10 +690,7 @@ async fn spawn_host_capture_thread(
     let mut target_fps = controls.desired_fps.load(Ordering::Relaxed).clamp(30, 144);
     let frame_pacing = params.frame_pacing;
     let best_connection = parse_transport_protocol(&params.protocol) == TransportProtocol::Auto;
-    let nvenc = crate::nvenc::NvencSettings {
-        quarter_pass: params.nvenc.quarter_pass && !best_connection,
-        ..params.nvenc
-    };
+    let nvenc = params.nvenc;
     let preferred_codec = match params.codec.as_str() {
         "h264" => Some(VideoCodec::H264),
         "hevc" => Some(VideoCodec::Hevc),
@@ -783,6 +780,7 @@ async fn spawn_host_capture_thread(
                         current_bitrate,
                         frame_pacing,
                         nvenc,
+                        best_connection,
                     ) {
                         Ok(enc) => enc,
                         Err(err) => {
@@ -937,7 +935,7 @@ async fn spawn_host_capture_thread(
                 let max_w = controls.desired_max_w.load(Ordering::Relaxed);
                 let max_h = controls.desired_max_h.load(Ordering::Relaxed);
                 let max_fps = controls.desired_fps.load(Ordering::Relaxed).clamp(30, 144);
-                let constant_fps = best_connection || crate::capture::is_constant_fps();
+                let constant_fps = crate::capture::is_constant_fps();
                 let lock_resolution = crate::capture::is_lock_resolution();
                 let next_fps = if constant_fps {
                     max_fps
@@ -1106,6 +1104,7 @@ async fn spawn_host_capture_thread(
                                 current_bitrate,
                                 frame_pacing,
                                 nvenc,
+                                best_connection,
                             ) {
                                 Ok(mut new_enc) => {
                                     new_enc.force_keyframe();
@@ -1171,6 +1170,7 @@ async fn spawn_host_capture_thread(
                             current_bitrate,
                             frame_pacing,
                             nvenc,
+                            best_connection,
                         ) {
                             Ok(mut new_enc) => {
                                 new_enc.force_keyframe();
