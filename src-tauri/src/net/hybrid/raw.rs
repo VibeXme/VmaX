@@ -746,6 +746,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sustained_1440p_sized_video_has_no_udp_drops() -> Result<()> {
+        // Match the timer resolution enabled by the Windows capture worker.
+        #[cfg(target_os = "windows")]
+        let _timer = crate::capture::WindowsTimerPeriod::new();
         let (mut host, mut viewer) = loopback_pair().await?;
         let total = 360;
         let payload = Bytes::from(vec![0x65; 41_667]);
